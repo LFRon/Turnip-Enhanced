@@ -3021,6 +3021,17 @@ copy_compressed(VkFormat format,
       *height = DIV_ROUND_UP(*height, block_height);
 }
 
+/* It seems we can't use the 2d path to blit to YUV-related formats.
+ */
+static bool
+is_3d_only_format(enum pipe_format format)
+{
+   /* note: could use "R8_UNORM" when no UBWC */
+   return format == PIPE_FORMAT_Y8_UNORM ||
+          format == PIPE_FORMAT_X6R10_UNORM ||
+          format == PIPE_FORMAT_X6R10X6G10_UNORM;
+}
+
 template <chip CHIP>
 static void
 tu_copy_buffer_to_image(struct tu_cmd_buffer *cmd,
@@ -3044,12 +3055,11 @@ tu_copy_buffer_to_image(struct tu_cmd_buffer *cmd,
       src_format = PIPE_FORMAT_S8_UINT;
    }
 
-   /* note: could use "R8_UNORM" when no UBWC */
    bool has_unaligned = CHIP >= A7XX; /* If unaligned buffer copies are supported. */
    if (TU_DEBUG(COPY_SLOW))
       has_unaligned = false;
    unsigned blit_param = 0;
-   if (src_format == PIPE_FORMAT_Y8_UNORM) {
+   if (is_3d_only_format(dst_format)) {
       ops = &r3d_ops<CHIP>;
       blit_param = R3D_COPY;
       has_unaligned = false;
@@ -3497,9 +3507,8 @@ tu_copy_image_to_buffer(struct tu_cmd_buffer *cmd,
       dst_format = PIPE_FORMAT_S8_UINT;
    }
 
-   /* note: could use "R8_UNORM" when no UBWC */
    unsigned blit_param = 0;
-   if (dst_format == PIPE_FORMAT_Y8_UNORM) {
+   if (is_3d_only_format(dst_format)) {
       ops = &r3d_ops<CHIP>;
       blit_param = R3D_COPY;
    }
@@ -3766,10 +3775,8 @@ tu_copy_image_to_image(struct tu_cmd_buffer *cmd,
    enum pipe_format dst_format = copy_format(dst_image->vk.format, info->dstSubresource.aspectMask);
    enum pipe_format src_format = copy_format(src_image->vk.format, info->srcSubresource.aspectMask);
 
-   /* note: could use "R8_UNORM" when no UBWC */
    unsigned blit_param = 0;
-   if (dst_format == PIPE_FORMAT_Y8_UNORM ||
-       src_format == PIPE_FORMAT_Y8_UNORM ||
+   if (is_3d_only_format(dst_format) || is_3d_only_format(src_format) ||
        (is_msaa && (util_format_is_float16(src_format) ||
                     util_format_is_float16(dst_format)))) {
       ops = &r3d_ops<CHIP>;
@@ -4812,16 +4819,18 @@ clear_image_cp_blit(struct tu_cmd_buffer *cmd,
       assert(range->baseArrayLayer == 0);
    }
 
-   const struct blit_ops *ops = image->layout[0].nr_samples > 1 ? &r3d_ops<CHIP> : &r2d_ops<CHIP>;
+   enum pipe_format format = tu_aspects_to_plane(image->vk.format, aspect_mask);
+
+   const struct blit_ops *ops =
+      image->layout[0].nr_samples > 1 || is_3d_only_format(format) ?
+      &r3d_ops<CHIP> : &r2d_ops<CHIP>;
+
    const bool e5b9g9r9_as_u32 =
       image->vk.format == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 &&
       ops == &r2d_ops<CHIP>;
 
-   enum pipe_format format;
    if (e5b9g9r9_as_u32) {
       format = PIPE_FORMAT_R32_UINT;
-   } else {
-      format = tu_aspects_to_plane(image->vk.format, aspect_mask);
    }
    if (format == PIPE_FORMAT_R64_SINT || format == PIPE_FORMAT_R64_UINT) {
       format = PIPE_FORMAT_R32G32_UINT;
@@ -4947,6 +4956,7 @@ use_generic_clear_for_image_clear(struct tu_cmd_buffer *cmd,
 {
    const struct fd_dev_info *info = cmd->device->physical_device->info;
    return info->props.has_generic_clear &&
+          !is_3d_only_format(vk_format_to_pipe_format(image->vk.format)) &&
           /* Clearing VK_FORMAT_R8G8_* with fast-clear value, certain
            * dimensions (e.g. 960x540), and having GMEM renderpass afterwards
            * may lead to a GPU fault on A7XX.

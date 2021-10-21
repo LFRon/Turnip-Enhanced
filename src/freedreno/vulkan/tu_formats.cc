@@ -212,6 +212,13 @@ tu_physical_device_get_format_properties(
    if (msrtss_out)
       msrtss_out->optimal = true;
 
+   /* MSAA rendering with these formats hangs the GPU, and Vulkan doesn't allow
+    * exposing these as single-sample-only color attachments.
+    */
+   if (format == PIPE_FORMAT_X6R10_UNORM ||
+       format == PIPE_FORMAT_X6R10X6G10_UNORM)
+      supported_color = false;
+
    if (supported_vtx)
       buffer |= VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT;
 
