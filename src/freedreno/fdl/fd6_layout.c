@@ -36,6 +36,12 @@ fdl6_get_ubwc_blockwidth(const struct fdl_layout *layout,
 
    unsigned num_planes = util_format_get_num_planes(layout->format);
 
+   if (layout->format == PIPE_FORMAT_X6R10_UNORM) {
+      *blockwidth = 32;
+      *blockheight = 4;
+      return;
+   }
+
    /* special case for r8g8 and UV plane (plane 1) of 2-plane YUV formats */
    if (fdl6_is_r8g8_layout(layout) || (num_planes == 2 && layout->plane == 1)) {
       *blockwidth = 16;
