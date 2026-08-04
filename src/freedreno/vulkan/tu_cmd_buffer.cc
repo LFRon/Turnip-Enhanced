@@ -1378,6 +1378,15 @@ use_sysmem_rendering(struct tu_cmd_buffer *cmd,
       return true;
    }
 
+   /* The first external-format resolve implementation writes each YCbCr
+    * plane with R3D after sysmem rendering.  GMEM needs a separate per-tile
+    * path so it cannot be selected yet, even via TU_DEBUG(GMEM).
+    */
+   if (cmd->state.pass->has_external_format_resolve) {
+      cmd->state.rp.force_render_mode_reason = "Uses external-format resolve";
+      return true;
+   }
+
    /* can't fit attachments into gmem */
    if (!cmd->state.tiling->possible) {
       cmd->state.rp.force_render_mode_reason = "Can't fit attachments into gmem";
@@ -1858,9 +1867,24 @@ tu6_emit_sysmem_resolve(struct tu_cmd_buffer *cmd,
    const struct tu_image_view *dst = cmd->state.attachments[a];
    const struct tu_image_view *src = cmd->state.attachments[gmem_a];
 
-   tu_resolve_sysmem<CHIP>(cmd, cs, src, dst, layer_mask, fb->layers,
-                           cmd->state.per_layer_render_area,
-                           cmd->state.render_areas);
+   if (cmd->state.pass->attachments[a].external_format_resolve) {
+      const enum tu_external_format_resolve_source resolve_source =
+         cmd->state.pass->has_direct_external_format_resolve ?
+         TU_EXTERNAL_FORMAT_RESOLVE_SOURCE_QTI_LEGACY :
+         TU_EXTERNAL_FORMAT_RESOLVE_SOURCE_STANDARD;
+
+      if (cmd->state.pass->has_direct_external_format_resolve) {
+         mesa_logi_once("Executing lowered direct external-format resolve "
+                        "with QTI component order R=Y, G=Cb, B=Cr");
+      }
+      tu_resolve_external_format_sysmem<CHIP>(
+         cmd, cs, src, dst, resolve_source, layer_mask, fb->layers,
+         cmd->state.per_layer_render_area, cmd->state.render_areas);
+   } else {
+      tu_resolve_sysmem<CHIP>(cmd, cs, src, dst, layer_mask, fb->layers,
+                              cmd->state.per_layer_render_area,
+                              cmd->state.render_areas);
+   }
 }
 
 template <chip CHIP>
@@ -1886,10 +1910,8 @@ tu6_emit_sysmem_resolves(struct tu_cmd_buffer *cmd,
        *    attachment is also used in a different subpass, an explicit
        *    dependency is needed.
        *
-       * We use the CP_BLIT path for sysmem resolves, which is really a
-       * transfer command, so we have to manually flush similar to the gmem
-       * resolve case. However, a flush afterwards isn't needed because of the
-       * last sentence and the fact that we're in sysmem mode.
+       * Normal resolves use CP_BLIT while external-format resolves use R3D,
+       * so both need the source color writes made visible before resolving.
        */
       tu_emit_event_write<CHIP>(cmd, cs, FD_CCU_CLEAN_COLOR);
       if (subpass->resolve_depth_stencil)
@@ -1897,9 +1919,10 @@ tu6_emit_sysmem_resolves(struct tu_cmd_buffer *cmd,
 
       tu_emit_event_write<CHIP>(cmd, cs, FD_CACHE_INVALIDATE);
 
-      /* Wait for the flushes to land before using the 2D engine */
+      /* Wait for the flushes to land before starting the resolve operation. */
       tu_cs_emit_wfi(cs);
 
+      bool has_external_format_resolve = false;
       for (unsigned i = 0; i < subpass->resolve_count; i++) {
          uint32_t a = subpass->resolve_attachments[i].attachment;
          if (a == VK_ATTACHMENT_UNUSED)
@@ -1908,6 +1931,17 @@ tu6_emit_sysmem_resolves(struct tu_cmd_buffer *cmd,
          uint32_t gmem_a = tu_subpass_get_attachment_to_resolve(subpass, i);
 
          tu6_emit_sysmem_resolve<CHIP>(cmd, cs, subpass->multiview_mask, a, gmem_a);
+         has_external_format_resolve |=
+            cmd->state.pass->attachments[a].external_format_resolve;
+      }
+
+      /* R3D writes through the color CCU.  Unlike CP_BLIT, those writes must
+       * be cleaned explicitly before a later subpass or an external consumer
+       * can access the resolved AHB.
+       */
+      if (has_external_format_resolve) {
+         tu_emit_event_write<CHIP>(cmd, cs, FD_CCU_CLEAN_COLOR);
+         tu_cs_emit_wfi(cs);
       }
    }
 }
@@ -7082,8 +7116,8 @@ tu_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
 
    for (unsigned i = 0; i < pass->attachment_count - pass->user_attachment_count; i++) {
       /* With imageless attachments, the only attachments in the framebuffer
-       * are MSRTSS attachments. Without imageless attachments, they are after
-       * the user's attachments.
+       * are driver-internal attachments. Without imageless attachments, they
+       * are after the user's attachments.
        */
       unsigned fb_idx = i + (pAttachmentInfo ? 0 : pass->user_attachment_count);
       cmd->state.attachments[i + pass->user_attachment_count] =
