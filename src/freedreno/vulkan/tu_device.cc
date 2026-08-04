@@ -38,6 +38,7 @@
 #include "tu_cs.h"
 #include "tu_descriptor_set.h"
 #include "tu_dynamic_rendering.h"
+#include "tu_formats.h"
 #include "tu_image.h"
 #include "tu_pass.h"
 #include "tu_query_pool.h"
@@ -210,6 +211,14 @@ get_device_extensions(const struct tu_physical_device *device,
                       struct vk_device_extension_table *ext)
 {
    bool has_gralloc = vk_android_get_ugralloc() != NULL;
+   /* A fallback gralloc object is non-NULL even when it cannot decode camera
+    * YUV buffers.  External-format resolve requires authoritative FourCC,
+    * modifier, and plane-layout metadata in addition to GPU format support.
+    */
+   bool has_external_format_resolve =
+      has_gralloc && vk_android_gralloc_supports_explicit_yuv_layout() &&
+      tu_external_format_resolve_supported(
+         device->info, VK_FORMAT_G8_B8R8_2PLANE_420_UNORM, TILE6_LINEAR);
    /* device->has_raytracing contains the value of the SW fuse. If the
     * device doesn't have a fuse (i.e. a740), we have to ignore it because
     * kgsl returns false. If it does have a fuse, enable raytracing if the
@@ -415,6 +424,7 @@ get_device_extensions(const struct tu_physical_device *device,
 
       /* For Graphics Flight Recorder (GFR) */
       .AMD_buffer_marker = true,
+      .ANDROID_external_format_resolve = has_external_format_resolve,
       .ANDROID_external_memory_android_hardware_buffer = has_gralloc,
       .ANDROID_native_buffer = has_gralloc,
       .ARM_rasterization_order_attachment_access = true,
@@ -938,6 +948,10 @@ tu_get_features(struct tu_physical_device *pdevice,
 
    /* VK_EXT_custom_resolve */
    features->customResolve = true;
+
+   /* VK_ANDROID_external_format_resolve */
+   features->externalFormatResolve =
+      pdevice->vk.supported_extensions.ANDROID_external_format_resolve;
 
    /* QCOM_multiview_per_view_viewports */
    features->multiviewPerViewViewports = true;
@@ -1663,7 +1677,116 @@ tu_get_properties(struct tu_physical_device *pdevice,
 
    /* VK_ANDROID_native_buffer */
    props->sharedImage = vk_android_get_front_buffer_usage() != 0;
+
+#if DETECT_OS_ANDROID
+   /* VK_ANDROID_external_format_resolve */
+   props->nullColorAttachmentWithExternalFormatResolve = VK_FALSE;
+   props->externalFormatResolveChromaOffsetX = VK_CHROMA_LOCATION_MIDPOINT;
+   props->externalFormatResolveChromaOffsetY = VK_CHROMA_LOCATION_MIDPOINT;
+#endif
 }
+
+#if DETECT_OS_ANDROID
+static bool
+tu_ahb_external_format_resolve_supported(
+   struct tu_device *device,
+   const struct AHardwareBuffer *buffer,
+   VkFormat format)
+{
+   const struct vk_format_ycbcr_info *ycbcr_info =
+      vk_format_get_ycbcr_info(format);
+   if (!ycbcr_info)
+      return false;
+
+   VkImageDrmFormatModifierExplicitCreateInfoEXT modifier_info;
+   VkSubresourceLayout plane_layouts[TU_MAX_PLANE_COUNT];
+   VkResult result = vk_android_get_ahb_layout(
+      const_cast<struct AHardwareBuffer *>(buffer), &modifier_info,
+      plane_layouts, TU_MAX_PLANE_COUNT);
+   if (result != VK_SUCCESS ||
+       modifier_info.drmFormatModifierPlaneCount != ycbcr_info->n_planes)
+      return false;
+
+   enum a6xx_tile_mode tile_mode;
+   switch (modifier_info.drmFormatModifier) {
+   case DRM_FORMAT_MOD_LINEAR:
+      tile_mode = TILE6_LINEAR;
+      break;
+   case DRM_FORMAT_MOD_QCOM_COMPRESSED:
+      tile_mode = TILE6_3;
+      if (!ubwc_possible(
+             device, format, VK_IMAGE_TYPE_2D, 0,
+             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                VK_IMAGE_USAGE_SAMPLED_BIT,
+             0, device->physical_device->info, VK_SAMPLE_COUNT_1_BIT, 1,
+             device->use_z24uint_s8uint))
+         return false;
+      break;
+   default:
+      return false;
+   }
+
+   return tu_external_format_resolve_supported(
+      device->physical_device->info, format, tile_mode);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+tu_GetAndroidHardwareBufferPropertiesANDROID(
+   VkDevice _device,
+   const struct AHardwareBuffer *buffer,
+   VkAndroidHardwareBufferPropertiesANDROID *pProperties)
+{
+   VK_FROM_HANDLE(tu_device, device, _device);
+
+   VkAndroidHardwareBufferFormatResolvePropertiesANDROID *format_resolve =
+      vk_find_struct(pProperties->pNext,
+                     ANDROID_HARDWARE_BUFFER_FORMAT_RESOLVE_PROPERTIES_ANDROID);
+   if (!format_resolve) {
+      return vk_common_GetAndroidHardwareBufferPropertiesANDROID(
+         _device, buffer, pProperties);
+   }
+
+   VkAndroidHardwareBufferFormatProperties2ANDROID *format_prop2 =
+      vk_find_struct(pProperties->pNext,
+                     ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_2_ANDROID);
+   VkAndroidHardwareBufferFormatPropertiesANDROID *format_prop =
+      vk_find_struct(pProperties->pNext,
+                     ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID);
+
+   /* The common implementation may use a private temporary when the caller
+    * only asks for resolve properties.  Inject our own temporary so Turnip
+    * can apply its per-format and per-modifier capability check afterwards.
+    */
+   void *original_pnext = pProperties->pNext;
+   VkAndroidHardwareBufferFormatProperties2ANDROID local_prop2 = {
+      .sType =
+         VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_2_ANDROID,
+      .pNext = original_pnext,
+   };
+   if (!format_prop2) {
+      format_prop2 = &local_prop2;
+      pProperties->pNext = format_prop2;
+   }
+
+   VkResult result = vk_common_GetAndroidHardwareBufferPropertiesANDROID(
+      _device, buffer, pProperties);
+   pProperties->pNext = original_pnext;
+   if (result != VK_SUCCESS)
+      return result;
+
+   if (format_resolve->colorAttachmentFormat != VK_FORMAT_UNDEFINED &&
+       !tu_ahb_external_format_resolve_supported(
+          device, buffer, (VkFormat) format_prop2->externalFormat)) {
+      format_resolve->colorAttachmentFormat = VK_FORMAT_UNDEFINED;
+      format_prop2->formatFeatures &=
+         ~VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT;
+      if (format_prop)
+         format_prop->formatFeatures &= ~VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
+   }
+
+   return VK_SUCCESS;
+}
+#endif
 
 static const struct vk_pipeline_cache_object_ops *const cache_import_ops[] = {
    &tu_shader_ops,
@@ -3801,11 +3924,20 @@ tu_AllocateMemory(VkDevice _device,
        vk_image_is_android_hardware_buffer(&mem->image->vk)) {
       VkImageDrmFormatModifierExplicitCreateInfoEXT eci;
       VkSubresourceLayout a_plane_layouts[TU_MAX_PLANE_COUNT];
-      result = vk_android_get_ahb_layout(mem->vk.ahardware_buffer, &eci,
-                                         a_plane_layouts, TU_MAX_PLANE_COUNT);
+      struct vk_android_modifier_plane_layout
+         a_modifier_plane_layouts[TU_MAX_PLANE_COUNT];
+      result = vk_android_get_ahb_layout_with_modifier_info(
+         mem->vk.ahardware_buffer, &eci, a_plane_layouts,
+         a_modifier_plane_layouts, TU_MAX_PLANE_COUNT);
       if (result != VK_SUCCESS) {
          vk_device_memory_destroy(&device->vk, pAllocator, &mem->vk);
          return result;
+      }
+
+      if (eci.drmFormatModifierPlaneCount !=
+          tu6_plane_count(mem->image->vk.format)) {
+         vk_device_memory_destroy(&device->vk, pAllocator, &mem->vk);
+         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
       }
 
       assert(mem->image->vk.android_deferred_create_info);
@@ -3821,7 +3953,8 @@ tu_AllocateMemory(VkDevice _device,
 
       result = TU_CALLX(device, tu_image_init)(
          device, mem->image, mem->image->vk.android_deferred_create_info,
-         eci.drmFormatModifier, a_plane_layouts, TU_IMAGE_ID_ASSIGN);
+         eci.drmFormatModifier, a_plane_layouts, a_modifier_plane_layouts,
+         TU_IMAGE_ID_ASSIGN);
       if (result != VK_SUCCESS) {
          vk_device_memory_destroy(&device->vk, pAllocator, &mem->vk);
          return result;
@@ -4032,23 +4165,26 @@ tu_get_msrtss_temporary(struct tu_device *dev,
    return VK_SUCCESS;
 }
 
-/* Allocate lazy memory and setup images for transient attachments that are
- * implicitly created by MSRTSS. The lifetime of these are tied to the
- * framebuffer with render passes or the command buffer with dynamic
- * rendering.
+/* Allocate memory and setup images for driver-internal attachments.  MSRTSS
+ * color images use the existing lazy temporary allocation.  Direct external
+ * format resolve sources need real, framebuffer-private storage because they
+ * are sampled from sysmem and multiple video buffers can be in flight.
  */
 static VkResult
-tu_init_msrtss_attachments(struct tu_device *device,
-                           const struct tu_render_pass *pass,
-                           const struct tu_framebuffer *fb,
-                           const struct VkFramebufferAttachmentImageInfo *attachment_info,
-                           const struct tu_image_view **attachments,
-                           struct tu_image *images,
-                           struct tu_image_view *iviews,
-                           struct tu_device_memory **depth_mem_out,
-                           struct tu_device_memory **color_mem_out)
+tu_init_internal_attachments(struct tu_device *device,
+                             const struct tu_render_pass *pass,
+                             const struct tu_framebuffer *fb,
+                             const struct VkFramebufferAttachmentImageInfo *attachment_info,
+                             const struct tu_image_view **attachments,
+                             struct tu_image *images,
+                             struct tu_image_view *iviews,
+                             struct tu_device_memory **depth_mem_out,
+                             struct tu_device_memory **color_mem_out)
 {
+   assert(!pass->has_direct_external_format_resolve || !pass->has_msrtss);
+
    uint64_t depth_size = 0, color_size = 0;
+   VkResult result = VK_SUCCESS;
 
    /* First, create images and calculate size requirement. */
    for (unsigned i = 0; i < pass->attachment_count - pass->user_attachment_count; i++) {
@@ -4072,8 +4208,11 @@ tu_init_msrtss_attachments(struct tu_device *device,
          .samples = att->samples,
          .tiling = VK_IMAGE_TILING_OPTIMAL,
          .usage = is_ds ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT :
-            (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-             VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT),
+            pass->has_direct_external_format_resolve ?
+               (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                VK_IMAGE_USAGE_SAMPLED_BIT) :
+               (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT),
       };
 
       /* In case we're using dynamic rendering, reset the image struct from
@@ -4087,8 +4226,11 @@ tu_init_msrtss_attachments(struct tu_device *device,
        */
       vk_image_init(&device->vk, &images[i].vk, &image_info);
 
-      TU_CALLX(device, tu_image_init)(device, &images[i], &image_info, DRM_FORMAT_MOD_INVALID, NULL,
-                                      TU_IMAGE_ID_INTERNAL);
+      result = TU_CALLX(device, tu_image_init)(
+         device, &images[i], &image_info, DRM_FORMAT_MOD_INVALID, NULL, NULL,
+         TU_IMAGE_ID_INTERNAL);
+      if (result != VK_SUCCESS)
+         return result;
 
       if (is_ds) {
          depth_size = align64(depth_size, images[i].layout[0].base_align);
@@ -4105,8 +4247,6 @@ tu_init_msrtss_attachments(struct tu_device *device,
     * separate allocations for depth and color. For now this at least avoids
     * allocating memory for color attachments.
     */
-   VkResult result = VK_SUCCESS;
-
    struct tu_device_memory *depth_mem = NULL, *color_mem = NULL;
    if (depth_size != 0) {
       result =
@@ -4116,8 +4256,14 @@ tu_init_msrtss_attachments(struct tu_device *device,
    }
 
    if (color_size != 0) {
-      result =
-         tu_get_msrtss_temporary(device, &color_mem, color_size, false);
+      if (pass->has_direct_external_format_resolve) {
+         result = tu_create_memory(device, &color_mem, 0,
+                                   TU_BO_ALLOC_INTERNAL_RESOURCE, color_size,
+                                   "Direct external format resolve");
+      } else {
+         result =
+            tu_get_msrtss_temporary(device, &color_mem, color_size, false);
+      }
       if (result != VK_SUCCESS) {
          if (depth_size != 0)
             tu_destroy_memory(device, depth_mem);
@@ -4180,6 +4326,66 @@ tu_init_msrtss_attachments(struct tu_device *device,
    return VK_SUCCESS;
 }
 
+static bool
+tu_direct_external_format_framebuffer_supported(
+   struct tu_device *device,
+   const struct tu_render_pass *pass,
+   const struct tu_framebuffer *fb)
+{
+   if (!pass->has_direct_external_format_resolve)
+      return true;
+
+   if (pass->user_attachment_count != 1 || fb->layers != 1 ||
+       !fb->attachments[0])
+      return false;
+
+   const struct tu_render_pass_attachment *att = &pass->attachments[0];
+   const struct tu_image_view *view = fb->attachments[0];
+   struct tu_image *image = view->image;
+   const VkFormat format = static_cast<VkFormat>(att->external_format);
+   const struct vk_format_ycbcr_info *ycbcr_info =
+      vk_format_get_ycbcr_info(format);
+
+   if (!ycbcr_info || ycbcr_info->n_planes > TU_MAX_PLANE_COUNT ||
+       view->vk.format != format || image->vk.format != format ||
+       !vk_image_is_android_hardware_buffer(&image->vk) ||
+       !(image->vk.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) ||
+       !image->mem || !image->mem->bo ||
+       image->vk.samples != VK_SAMPLE_COUNT_1_BIT ||
+       image->vk.mip_levels != 1 || image->vk.array_layers != 1 ||
+       view->vk.view_type != VK_IMAGE_VIEW_TYPE_2D ||
+       view->vk.base_mip_level != 0 || view->vk.level_count != 1 ||
+       view->vk.base_array_layer != 0 || view->vk.layer_count != 1 ||
+       view->vk.extent.width != fb->width ||
+       view->vk.extent.height != fb->height ||
+       view->vk.extent.depth != 1)
+      return false;
+
+   const enum a6xx_tile_mode tile_mode =
+      static_cast<enum a6xx_tile_mode>(image->layout[0].tile_mode);
+   if (!tu_external_format_resolve_supported(
+          device->physical_device->info, format, tile_mode))
+      return false;
+
+   if (image->layout[0].ubwc &&
+       !ubwc_possible(device, format, VK_IMAGE_TYPE_2D, 0,
+                      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                         VK_IMAGE_USAGE_SAMPLED_BIT,
+                      0, device->physical_device->info,
+                      VK_SAMPLE_COUNT_1_BIT, 1,
+                      device->use_z24uint_s8uint))
+      return false;
+
+   for (uint32_t i = 0; i < ycbcr_info->n_planes; i++) {
+      if (image->layout[i].nr_samples != 1 ||
+          image->layout[i].tile_mode != image->layout[0].tile_mode ||
+          image->layout[i].ubwc != image->layout[0].ubwc)
+         return false;
+   }
+
+   return true;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 tu_CreateFramebuffer(VkDevice _device,
                      const VkFramebufferCreateInfo *pCreateInfo,
@@ -4199,7 +4405,7 @@ tu_CreateFramebuffer(VkDevice _device,
 
    bool imageless = pCreateInfo->flags & VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT;
 
-   uint32_t msrtss_attachment_count = pass->attachment_count -
+   uint32_t internal_attachment_count = pass->attachment_count -
       pass->user_attachment_count;
    struct tu_image_view **attachments;
    struct tu_image *images;
@@ -4208,12 +4414,12 @@ tu_CreateFramebuffer(VkDevice _device,
    vk_multialloc_add(&ma, &framebuffer, struct tu_framebuffer, 1);
    vk_multialloc_add(&ma, &attachments, struct tu_image_view *,
                      (imageless ? 0 : pCreateInfo->attachmentCount) +
-                     msrtss_attachment_count);
-   if (msrtss_attachment_count) {
+                     internal_attachment_count);
+   if (internal_attachment_count) {
       vk_multialloc_add(&ma, &images, struct tu_image,
-                        msrtss_attachment_count);
+                        internal_attachment_count);
       vk_multialloc_add(&ma, &iviews, struct tu_image_view,
-                        msrtss_attachment_count);
+                        internal_attachment_count);
    }
    if (!vk_object_multizalloc(
       &device->vk, &ma, pAllocator, VK_OBJECT_TYPE_FRAMEBUFFER))
@@ -4232,6 +4438,28 @@ tu_CreateFramebuffer(VkDevice _device,
          struct tu_image_view *iview = tu_image_view_from_handle(_iview);
          framebuffer->attachments[i] = iview;
       }
+   }
+
+   if (pass->has_direct_external_format_resolve &&
+       (imageless || pCreateInfo->attachmentCount !=
+                       pass->user_attachment_count ||
+        !tu_direct_external_format_framebuffer_supported(
+           device, pass, framebuffer))) {
+      mesa_loge_once("Rejecting unsupported direct external-format "
+                     "framebuffer; no GPU commands were emitted");
+      vk_object_free(&device->vk, pAllocator, framebuffer);
+      return vk_error(device, VK_ERROR_UNKNOWN);
+   }
+
+   if (pass->has_direct_external_format_resolve) {
+      const struct tu_image *image = framebuffer->attachments[0]->image;
+      mesa_logi_once("Lowering direct external-format color attachment to "
+                     "RGBA8 plus external resolve (%ux%u, format=%u, "
+                     "tile=%u, ubwc=%u)",
+                     framebuffer->width, framebuffer->height,
+                     static_cast<uint32_t>(image->vk.format),
+                     static_cast<uint32_t>(image->layout[0].tile_mode),
+                     static_cast<uint32_t>(image->layout[0].ubwc));
    }
 
    if (pass->has_fdm) {
@@ -4276,30 +4504,30 @@ tu_CreateFramebuffer(VkDevice _device,
 
    tu_framebuffer_init_tiling_config(framebuffer, device, pass);
 
-   /* For MSRTSS, allocate extra images that are tied to the VkFramebuffer */
-   if (msrtss_attachment_count > 0) {
+   /* Allocate extra images that are tied to the VkFramebuffer. */
+   if (internal_attachment_count > 0) {
       const VkFramebufferAttachmentsCreateInfo *fb_att_info =
          vk_find_struct_const(pCreateInfo->pNext,
                               FRAMEBUFFER_ATTACHMENTS_CREATE_INFO);
       VkResult result =
-         tu_init_msrtss_attachments(device,
-                                    pass, framebuffer,
-                                    imageless ? fb_att_info->pAttachmentImageInfos : NULL,
-                                    imageless ? NULL :
-                                    framebuffer->attachments,
-                                    images, iviews,
-                                    &framebuffer->depth_mem,
-                                    &framebuffer->color_mem);
+         tu_init_internal_attachments(device,
+                                      pass, framebuffer,
+                                      imageless ? fb_att_info->pAttachmentImageInfos : NULL,
+                                      imageless ? NULL :
+                                      framebuffer->attachments,
+                                      images, iviews,
+                                      &framebuffer->depth_mem,
+                                      &framebuffer->color_mem);
       if (result != VK_SUCCESS) {
          vk_object_free(&device->vk, pAllocator, framebuffer);
          return vk_error(device, result);
       }
 
       /* With imageless attachments, the only attachments in the framebuffer
-       * are MSRTSS attachments. Without imageless attachments, they are after
-       * the user's attachments.
+       * are driver-internal attachments. Without imageless attachments, they
+       * are after the user's attachments.
        */
-      for (uint32_t i = 0; i < msrtss_attachment_count; i++) {
+      for (uint32_t i = 0; i < internal_attachment_count; i++) {
          uint32_t fb_idx = i + (imageless ? 0 : pCreateInfo->attachmentCount);
          framebuffer->attachments[fb_idx] = &iviews[i];
       }
@@ -4349,12 +4577,12 @@ tu_setup_dynamic_msrtss(struct tu_cmd_buffer *cmd_buffer)
       struct tu_device_memory *depth_mem = NULL, *color_mem = NULL;
 
       VkResult result =
-         tu_init_msrtss_attachments(cmd_buffer->device,
-                                    pass, framebuffer, NULL,
-                                    cmd_buffer->dynamic_attachments,
-                                    cmd_buffer->dynamic_msrtss_images,
-                                    cmd_buffer->dynamic_msrtss_iviews,
-                                    &depth_mem, &color_mem);
+         tu_init_internal_attachments(cmd_buffer->device,
+                                      pass, framebuffer, NULL,
+                                      cmd_buffer->dynamic_attachments,
+                                      cmd_buffer->dynamic_msrtss_images,
+                                      cmd_buffer->dynamic_msrtss_iviews,
+                                      &depth_mem, &color_mem);
 
       if (result != VK_SUCCESS) {
          return vk_error(cmd_buffer, result);

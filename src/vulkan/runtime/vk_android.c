@@ -69,6 +69,16 @@ vk_android_get_ugralloc(void)
    return _gralloc;
 }
 
+bool
+vk_android_gralloc_supports_explicit_yuv_layout(void)
+{
+   struct u_gralloc *gralloc = vk_android_get_ugralloc();
+
+   return gralloc &&
+          (u_gralloc_get_capabilities(gralloc) &
+           U_GRALLOC_CAP_EXPLICIT_YUV_LAYOUT);
+}
+
 static int vk_android_hal_open(const struct hw_module_t *mod, const char *id,
                                struct hw_device_t **dev);
 
@@ -140,7 +150,9 @@ static VkResult
 vk_gralloc_to_drm_explicit_layout(
    struct u_gralloc_buffer_handle *in_hnd,
    VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
-   VkSubresourceLayout *out_layouts, int max_planes)
+   VkSubresourceLayout *out_layouts,
+   struct vk_android_modifier_plane_layout *out_modifier_plane_layouts,
+   int max_planes)
 {
    struct u_gralloc_buffer_basic_info info;
    struct u_gralloc *u_gralloc = vk_android_get_ugralloc();
@@ -149,8 +161,13 @@ vk_gralloc_to_drm_explicit_layout(
    if (u_gralloc_get_buffer_basic_info(u_gralloc, in_hnd, &info) != 0)
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
 
-   if (info.num_planes > max_planes)
+   if (info.num_planes <= 0 || info.num_planes > max_planes)
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
+   for (int i = 0; i < info.num_planes; i++) {
+      if (info.offsets[i] < 0 || info.strides[i] <= 0)
+         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }
 
    bool is_disjoint = false;
    for (size_t i = 1; i < info.num_planes; i++) {
@@ -167,6 +184,12 @@ vk_gralloc_to_drm_explicit_layout(
 
    memset(out, 0, sizeof(*out));
    memset(out_layouts, 0, sizeof(*out_layouts) * max_planes);
+   if (out_modifier_plane_layouts) {
+      memset(out_modifier_plane_layouts, 0,
+             sizeof(*out_modifier_plane_layouts) * max_planes);
+      for (int i = 0; i < max_planes; i++)
+         out_modifier_plane_layouts[i].data_offset = UINT64_MAX;
+   }
 
    out->sType =
       VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT;
@@ -177,6 +200,16 @@ vk_gralloc_to_drm_explicit_layout(
    for (size_t i = 0; i < info.num_planes; i++) {
       out_layouts[i].offset = info.offsets[i];
       out_layouts[i].rowPitch = info.strides[i];
+      if (out_modifier_plane_layouts && info.has_explicit_modifier_layout) {
+         out_modifier_plane_layouts[i] =
+            (struct vk_android_modifier_plane_layout) {
+               .data_offset = info.modifier_plane_layouts[i].data_offset,
+               .data_size = info.modifier_plane_layouts[i].data_size,
+               .metadata_size = info.modifier_plane_layouts[i].metadata_size,
+               .metadata_row_pitch =
+                  info.modifier_plane_layouts[i].metadata_row_pitch,
+            };
+      }
    }
 
    /* Compute arrayPitch for multi-layer buffers. The gralloc HAL does not
@@ -191,11 +224,20 @@ vk_gralloc_to_drm_explicit_layout(
    }
 
    if (info.drm_fourcc == DRM_FORMAT_YVU420) {
+      if (info.num_planes != 3)
+         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
       /* Swap the U and V planes to match the
        * VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM */
       VkSubresourceLayout tmp = out_layouts[1];
       out_layouts[1] = out_layouts[2];
       out_layouts[2] = tmp;
+      if (out_modifier_plane_layouts) {
+         struct vk_android_modifier_plane_layout modifier_plane_layout =
+            out_modifier_plane_layouts[1];
+         out_modifier_plane_layouts[1] = out_modifier_plane_layouts[2];
+         out_modifier_plane_layouts[2] = modifier_plane_layout;
+      }
    }
 
    return VK_SUCCESS;
@@ -295,6 +337,18 @@ vk_android_get_anb_layout(
    VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
    VkSubresourceLayout *out_layouts, int max_planes)
 {
+   return vk_android_get_anb_layout_with_modifier_info(
+      pCreateInfo, out, out_layouts, NULL, max_planes);
+}
+
+VkResult
+vk_android_get_anb_layout_with_modifier_info(
+   const VkImageCreateInfo *pCreateInfo,
+   VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
+   VkSubresourceLayout *out_layouts,
+   struct vk_android_modifier_plane_layout *out_modifier_plane_layouts,
+   int max_planes)
+{
    const VkNativeBufferANDROID *native_buffer =
       vk_find_struct_const(pCreateInfo->pNext, NATIVE_BUFFER_ANDROID);
 
@@ -304,8 +358,8 @@ vk_android_get_anb_layout(
       .pixel_stride = native_buffer->stride,
    };
 
-   return vk_gralloc_to_drm_explicit_layout(&gr_handle, out,
-                                            out_layouts, max_planes);
+   return vk_gralloc_to_drm_explicit_layout(
+      &gr_handle, out, out_layouts, out_modifier_plane_layouts, max_planes);
 }
 
 VkResult
@@ -659,6 +713,18 @@ vk_android_get_ahb_layout(
    VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
    VkSubresourceLayout *out_layouts, int max_planes)
 {
+   return vk_android_get_ahb_layout_with_modifier_info(
+      ahardware_buffer, out, out_layouts, NULL, max_planes);
+}
+
+VkResult
+vk_android_get_ahb_layout_with_modifier_info(
+   struct AHardwareBuffer *ahardware_buffer,
+   VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
+   VkSubresourceLayout *out_layouts,
+   struct vk_android_modifier_plane_layout *out_modifier_plane_layouts,
+   int max_planes)
+{
    AHardwareBuffer_Desc description;
    const native_handle_t *handle =
       AHardwareBuffer_getNativeHandle(ahardware_buffer);
@@ -671,8 +737,8 @@ vk_android_get_ahb_layout(
       .hal_format = description.format,
    };
 
-   return vk_gralloc_to_drm_explicit_layout(&gr_handle, out,
-                                            out_layouts, max_planes);
+   return vk_gralloc_to_drm_explicit_layout(
+      &gr_handle, out, out_layouts, out_modifier_plane_layouts, max_planes);
 }
 
 /* From the Android hardware_buffer.h header:
@@ -1185,11 +1251,15 @@ vk_common_GetAndroidHardwareBufferPropertiesANDROID(
    if (format_resolve) {
       if (device->enabled_extensions.ANDROID_external_format_resolve) {
          assert(format_prop2->externalFormat != VK_FORMAT_UNDEFINED);
-         const uint32_t num_bits = vk_format_get_component_bits(
-            format_prop2->externalFormat, UTIL_FORMAT_COLORSPACE_RGB, 1);
+         /* Multiplanar format descriptions do not model conventional RGBA
+          * component indices.  Querying component 1 would therefore
+          * misclassify 8-bit NV12 as a higher-bit-depth format.
+          */
+         const uint32_t bpc =
+            vk_format_get_bpc(format_prop2->externalFormat);
          format_resolve->colorAttachmentFormat =
-            num_bits == 8 ? VK_FORMAT_R8G8B8A8_UNORM
-                          : VK_FORMAT_R16G16B16A16_UNORM;
+            bpc == 8 ? VK_FORMAT_R8G8B8A8_UNORM
+                     : VK_FORMAT_R16G16B16A16_UNORM;
 
          format_prop2->formatFeatures |= VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT;
          if (format_prop) {
@@ -1314,14 +1384,34 @@ vk_android_get_ahb_buffer_properties(
    };
 }
 
-bool vk_android_rp_attachment_has_external_format(
+uint64_t
+vk_android_rp_attachment_external_format(
    const VkAttachmentDescription2 *desc)
 {
    const VkExternalFormatANDROID *format_info =
       vk_find_struct_const(desc->pNext,
                            EXTERNAL_FORMAT_ANDROID);
-   return (desc->format == VK_FORMAT_UNDEFINED) &&
-          (format_info != NULL);
+   return desc->format == VK_FORMAT_UNDEFINED && format_info
+      ? format_info->externalFormat : 0;
+}
+
+bool
+vk_android_rp_attachment_has_external_format(
+   const VkAttachmentDescription2 *desc)
+{
+   return vk_android_rp_attachment_external_format(desc) != 0;
+}
+
+bool
+vk_android_rp_attachment_has_only_external_format(
+   const VkAttachmentDescription2 *desc)
+{
+   const VkExternalFormatANDROID *format_info =
+      vk_find_struct_const(desc->pNext,
+                           EXTERNAL_FORMAT_ANDROID);
+   return desc->format == VK_FORMAT_UNDEFINED && format_info &&
+          desc->pNext == format_info && format_info->pNext == NULL &&
+          format_info->externalFormat != 0;
 }
 
 #endif /* ANDROID_API_LEVEL >= 26 */

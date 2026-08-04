@@ -70,11 +70,14 @@ enum tu_image_id_mode {
 
 #define TU_IMAGE_ID_INTERNAL_ID UINT64_MAX
 
+struct vk_android_modifier_plane_layout;
+
 template <chip CHIP>
 VkResult
 tu_image_init(struct tu_device *device, struct tu_image *image,
               const VkImageCreateInfo *pCreateInfo, uint64_t modifier,
               const VkSubresourceLayout *plane_layouts,
+              const struct vk_android_modifier_plane_layout *modifier_plane_layouts,
               enum tu_image_id_mode id_mode);
 
 struct tu_image_view

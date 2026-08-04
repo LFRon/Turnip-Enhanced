@@ -9,6 +9,8 @@
 
 #include "tu_image.h"
 
+#include <inttypes.h>
+
 #include "drm-uapi/drm_fourcc.h"
 
 #include "util/format/u_format.h"
@@ -523,6 +525,7 @@ VkResult
 tu_image_init(struct tu_device *device, struct tu_image *image,
               const VkImageCreateInfo *pCreateInfo, uint64_t modifier,
               const VkSubresourceLayout *plane_layouts,
+              const struct vk_android_modifier_plane_layout *modifier_plane_layouts,
               enum tu_image_id_mode id_mode)
 {
    switch (id_mode) {
@@ -806,6 +809,51 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
          return vk_error(device, VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT);
       }
 
+      /* Gralloc reports QCOM UBWC metadata and primary-data regions
+       * independently.  The Vulkan modifier plane begins at the metadata,
+       * while fdl6_layout_image() derives both regions.  Refuse the import
+       * before any GPU access unless every authoritative value agrees.
+       */
+      const struct vk_android_modifier_plane_layout *gralloc_layout =
+         modifier_plane_layouts ? &modifier_plane_layouts[i] : NULL;
+      if (gralloc_layout && gralloc_layout->data_offset != UINT64_MAX) {
+         const uint64_t data_size =
+            layout->size >= layout->slices[0].offset
+               ? layout->size - layout->slices[0].offset
+               : UINT64_MAX;
+         const bool mismatch =
+            !plane_layouts || !layout->ubwc ||
+            layout->ubwc_slices[0].offset != plane_layouts[i].offset ||
+            layout->ubwc_slices[0].size0 != gralloc_layout->metadata_size ||
+            layout->slices[0].offset != gralloc_layout->data_offset ||
+            data_size != gralloc_layout->data_size ||
+            (gralloc_layout->metadata_row_pitch != 0 &&
+             fdl_ubwc_pitch(layout, 0) !=
+                gralloc_layout->metadata_row_pitch);
+         if (mismatch) {
+            mesa_loge("gralloc/Turnip modifier layout mismatch for plane %u: "
+                      "mapper metadata(offset=%" PRIu64
+                      ", pitch=%u, size=%" PRIu64
+                      "), data(offset=%" PRIu64 ", size=%" PRIu64
+                      "); Turnip metadata(offset=%" PRIu64
+                      ", pitch=%u, size=%" PRIu64
+                      "), data(offset=%" PRIu64 ", size=%" PRIu64 ")",
+                      i,
+                      plane_layouts ? plane_layouts[i].offset : UINT64_MAX,
+                      gralloc_layout->metadata_row_pitch,
+                      gralloc_layout->metadata_size,
+                      gralloc_layout->data_offset, gralloc_layout->data_size,
+                      static_cast<uint64_t>(layout->ubwc_slices[0].offset),
+                      layout->ubwc ? fdl_ubwc_pitch(layout, 0) : 0,
+                      static_cast<uint64_t>(layout->ubwc_slices[0].size0),
+                      static_cast<uint64_t>(layout->slices[0].offset),
+                      data_size);
+            return vk_error(
+               device,
+               VK_ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT);
+         }
+      }
+
       if (TU_DEBUG(LAYOUT))
          fdl_dump_layout(layout);
 
@@ -894,11 +942,17 @@ tu_android_get_wsi_memory(struct tu_device *dev,
 
    VkImageDrmFormatModifierExplicitCreateInfoEXT eci;
    VkSubresourceLayout a_plane_layouts[TU_MAX_PLANE_COUNT];
-   result = vk_android_get_anb_layout(img->vk.android_deferred_create_info,
-                                      &eci, a_plane_layouts,
-                                      TU_MAX_PLANE_COUNT);
+   struct vk_android_modifier_plane_layout
+      a_modifier_plane_layouts[TU_MAX_PLANE_COUNT];
+   result = vk_android_get_anb_layout_with_modifier_info(
+      img->vk.android_deferred_create_info, &eci, a_plane_layouts,
+      a_modifier_plane_layouts, TU_MAX_PLANE_COUNT);
    if (result != VK_SUCCESS)
       return result;
+
+   if (eci.drmFormatModifierPlaneCount !=
+       tu6_plane_count(img->vk.android_deferred_create_info->format))
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
 
    VkExternalMemoryImageCreateInfo external_info = {
       .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
@@ -909,7 +963,8 @@ tu_android_get_wsi_memory(struct tu_device *dev,
 
    result = TU_CALLX(dev, tu_image_init)(
       dev, img, img->vk.android_deferred_create_info,
-      eci.drmFormatModifier, a_plane_layouts, TU_IMAGE_ID_ASSIGN);
+      eci.drmFormatModifier, a_plane_layouts, a_modifier_plane_layouts,
+      TU_IMAGE_ID_ASSIGN);
    if (result != VK_SUCCESS)
       return result;
 
@@ -932,6 +987,7 @@ tu_CreateImage(VkDevice _device,
 {
    uint64_t modifier = DRM_FORMAT_MOD_INVALID;
    const VkSubresourceLayout *plane_layouts = NULL;
+   const struct vk_android_modifier_plane_layout *modifier_plane_layouts = NULL;
    VkResult result;
 
    VK_FROM_HANDLE(tu_device, device, _device);
@@ -1003,18 +1059,29 @@ tu_CreateImage(VkDevice _device,
    /* This section is removed by the optimizer for non-ANDROID builds */
    VkImageDrmFormatModifierExplicitCreateInfoEXT eci;
    VkSubresourceLayout a_plane_layouts[TU_MAX_PLANE_COUNT];
+   struct vk_android_modifier_plane_layout
+      a_modifier_plane_layouts[TU_MAX_PLANE_COUNT];
    if (vk_image_is_android_native_buffer(&image->vk)) {
-      result = vk_android_get_anb_layout(
-         pCreateInfo, &eci, a_plane_layouts, TU_MAX_PLANE_COUNT);
+      result = vk_android_get_anb_layout_with_modifier_info(
+         pCreateInfo, &eci, a_plane_layouts, a_modifier_plane_layouts,
+         TU_MAX_PLANE_COUNT);
       if (result != VK_SUCCESS)
          goto fail;
 
+      if (eci.drmFormatModifierPlaneCount !=
+          tu6_plane_count(pCreateInfo->format)) {
+         result = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+         goto fail;
+      }
+
       plane_layouts = a_plane_layouts;
+      modifier_plane_layouts = a_modifier_plane_layouts;
       modifier = eci.drmFormatModifier;
    }
 
    result = TU_CALLX(device, tu_image_init)(device, image, pCreateInfo,
                                              modifier, plane_layouts,
+                                             modifier_plane_layouts,
                                              TU_IMAGE_ID_ASSIGN);
    if (result != VK_SUCCESS)
       goto fail;
@@ -1415,7 +1482,9 @@ tu_GetDeviceImageMemoryRequirements(
    struct tu_image image = {0};
 
    vk_image_init(&device->vk, &image.vk, pInfo->pCreateInfo);
-   TU_CALLX(device, tu_image_init)(device, &image, pInfo->pCreateInfo, DRM_FORMAT_MOD_INVALID, NULL, TU_IMAGE_ID_NONE);
+   TU_CALLX(device, tu_image_init)(device, &image, pInfo->pCreateInfo,
+                                   DRM_FORMAT_MOD_INVALID, NULL, NULL,
+                                   TU_IMAGE_ID_NONE);
 
    tu_get_image_memory_requirements(device, &image, pMemoryRequirements);
 }
@@ -1432,7 +1501,9 @@ tu_GetDeviceImageSparseMemoryRequirements(
    struct tu_image image = {0};
 
    vk_image_init(&device->vk, &image.vk, pInfo->pCreateInfo);
-   TU_CALLX(device, tu_image_init)(device, &image, pInfo->pCreateInfo, DRM_FORMAT_MOD_INVALID, NULL, TU_IMAGE_ID_NONE);
+   TU_CALLX(device, tu_image_init)(device, &image, pInfo->pCreateInfo,
+                                   DRM_FORMAT_MOD_INVALID, NULL, NULL,
+                                   TU_IMAGE_ID_NONE);
 
    tu_get_image_sparse_memory_requirements(device, &image,
                                            pSparseMemoryRequirementCount,
@@ -1521,7 +1592,9 @@ tu_GetDeviceImageSubresourceLayoutKHR(VkDevice _device,
    struct tu_image image = {0};
 
    vk_image_init(&device->vk, &image.vk, pInfo->pCreateInfo);
-   TU_CALLX(device, tu_image_init)(device, &image, pInfo->pCreateInfo, DRM_FORMAT_MOD_INVALID, NULL, TU_IMAGE_ID_NONE);
+   TU_CALLX(device, tu_image_init)(device, &image, pInfo->pCreateInfo,
+                                   DRM_FORMAT_MOD_INVALID, NULL, NULL,
+                                   TU_IMAGE_ID_NONE);
 
    tu_get_image_subresource_layout(&image, pInfo->pSubresource, pLayout);
 }
@@ -1752,4 +1825,3 @@ tu_bind_sparse_image(struct tu_device *device, void *submit,
                          prev_bo_offset, bind_range);
    }
 }
-

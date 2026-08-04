@@ -3911,6 +3911,193 @@ tu_resolve_sysmem(struct tu_cmd_buffer *cmd,
 }
 TU_GENX(tu_resolve_sysmem);
 
+static uint8_t
+external_format_resolve_swizzle(uint8_t swizzle)
+{
+   switch ((VkComponentSwizzle) swizzle) {
+   case VK_COMPONENT_SWIZZLE_R:
+      return PIPE_SWIZZLE_X;
+   case VK_COMPONENT_SWIZZLE_G:
+      return PIPE_SWIZZLE_Y;
+   case VK_COMPONENT_SWIZZLE_B:
+      return PIPE_SWIZZLE_Z;
+   case VK_COMPONENT_SWIZZLE_A:
+      return PIPE_SWIZZLE_W;
+   case VK_COMPONENT_SWIZZLE_ZERO:
+   case VK_COMPONENT_SWIZZLE_IDENTITY:
+      return PIPE_SWIZZLE_0;
+   case VK_COMPONENT_SWIZZLE_ONE:
+      return PIPE_SWIZZLE_1;
+   default:
+      UNREACHABLE("invalid external-format resolve swizzle");
+   }
+}
+
+template <chip CHIP>
+void
+tu_resolve_external_format_sysmem(struct tu_cmd_buffer *cmd,
+                                  struct tu_cs *cs,
+                                  const struct tu_image_view *src,
+                                  const struct tu_image_view *dst,
+                                  enum tu_external_format_resolve_source source,
+                                  uint32_t layer_mask,
+                                  uint32_t layers,
+                                  bool per_layer_rect,
+                                  const VkRect2D *rect)
+{
+   if (!src || !dst || !rect) {
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_UNKNOWN);
+      return;
+   }
+
+   const struct vk_format_ycbcr_info *ycbcr_info =
+      vk_format_get_ycbcr_info(dst->vk.format);
+   const enum a6xx_tile_mode dst_tile_mode =
+      static_cast<enum a6xx_tile_mode>(dst->image->layout[0].tile_mode);
+   const bool standard_source =
+      source == TU_EXTERNAL_FORMAT_RESOLVE_SOURCE_STANDARD;
+   const bool qti_legacy_source =
+      source == TU_EXTERNAL_FORMAT_RESOLVE_SOURCE_QTI_LEGACY &&
+      dst->vk.format == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM &&
+      ycbcr_info && ycbcr_info->n_planes == 2;
+   const bool rect_in_bounds =
+      rect->offset.x >= 0 && rect->offset.y >= 0 &&
+      (uint64_t) rect->offset.x + rect->extent.width <= src->vk.extent.width &&
+      (uint64_t) rect->offset.y + rect->extent.height <= src->vk.extent.height &&
+      (uint64_t) rect->offset.x + rect->extent.width <= dst->vk.extent.width &&
+      (uint64_t) rect->offset.y + rect->extent.height <= dst->vk.extent.height;
+
+   /* VK_ANDROID_external_format_resolve requires one non-multiview layer and
+    * the colorAttachmentFormat returned for this implementation is RGBA8.
+    * Keep release builds safe as well as documenting those assumptions.
+    */
+   bool supported =
+      ycbcr_info && (standard_source || qti_legacy_source) &&
+      src->vk.format == VK_FORMAT_R8G8B8A8_UNORM &&
+      src->image->layout[0].nr_samples == 1 &&
+      dst->image->layout[0].nr_samples == 1 && layer_mask == 0 && layers == 1 &&
+      !per_layer_rect && src->vk.layer_count == 1 && dst->vk.layer_count == 1 &&
+      src->vk.level_count == 1 && dst->vk.level_count == 1 &&
+      src->vk.view_type != VK_IMAGE_VIEW_TYPE_3D &&
+      dst->vk.view_type != VK_IMAGE_VIEW_TYPE_3D && rect_in_bounds &&
+      tu_external_format_resolve_supported(
+         cmd->device->physical_device->info, dst->vk.format, dst_tile_mode);
+
+   if (supported && dst->image->layout[0].ubwc) {
+      supported = ubwc_possible(
+         cmd->device, dst->vk.format, VK_IMAGE_TYPE_2D, 0,
+         VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, 0,
+         cmd->device->physical_device->info, VK_SAMPLE_COUNT_1_BIT, 1,
+         cmd->device->use_z24uint_s8uint);
+   }
+
+   if (supported) {
+      for (uint32_t i = 1; i < ycbcr_info->n_planes; i++) {
+         supported &=
+            dst->image->layout[i].tile_mode ==
+               dst->image->layout[0].tile_mode &&
+            dst->image->layout[i].ubwc == dst->image->layout[0].ubwc;
+      }
+   }
+
+   if (!supported) {
+      /* The format query should make this unreachable for valid usage.  Do
+       * not emit unsafe GPU commands if an imported layout nevertheless
+       * disagrees with what was queried.  VK_ERROR_UNKNOWN is a permitted
+       * vkEndCommandBuffer error, unlike VK_ERROR_FORMAT_NOT_SUPPORTED.
+       */
+      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_UNKNOWN);
+      return;
+   }
+
+   if (rect->extent.width == 0 || rect->extent.height == 0)
+      return;
+
+   static const VkImageAspectFlags plane_aspects[] = {
+      VK_IMAGE_ASPECT_PLANE_0_BIT,
+      VK_IMAGE_ASPECT_PLANE_1_BIT,
+      VK_IMAGE_ASPECT_PLANE_2_BIT,
+   };
+   static const uint8_t qti_legacy_nv12_swizzles[2][4] = {
+      {
+         VK_COMPONENT_SWIZZLE_R,
+         VK_COMPONENT_SWIZZLE_ZERO,
+         VK_COMPONENT_SWIZZLE_ZERO,
+         VK_COMPONENT_SWIZZLE_ZERO,
+      },
+      {
+         VK_COMPONENT_SWIZZLE_G,
+         VK_COMPONENT_SWIZZLE_B,
+         VK_COMPONENT_SWIZZLE_ZERO,
+         VK_COMPONENT_SWIZZLE_ZERO,
+      },
+   };
+
+   const enum pipe_format src_format =
+      vk_format_to_pipe_format(src->vk.format);
+   const struct fdl6_view *src_fdl_view =
+      tu_image_view_fdl_view(src, false);
+   const int32_t src_x1 = rect->offset.x;
+   const int32_t src_y1 = rect->offset.y;
+   const int32_t src_x2 = rect->offset.x + rect->extent.width;
+   const int32_t src_y2 = rect->offset.y + rect->extent.height;
+
+   trace_start_sysmem_resolve(&cmd->rp_trace, cs, cmd, dst->vk.format);
+
+   for (uint32_t i = 0; i < ycbcr_info->n_planes; i++) {
+      const struct vk_format_ycbcr_plane *plane = &ycbcr_info->planes[i];
+      const enum pipe_format dst_format = tu6_plane_format(dst->vk.format, i);
+      const int32_t dst_x1 =
+         rect->offset.x / plane->denominator_scales[0];
+      const int32_t dst_y1 =
+         rect->offset.y / plane->denominator_scales[1];
+      const int32_t dst_x2 =
+         (rect->offset.x + rect->extent.width) /
+         plane->denominator_scales[0];
+      const int32_t dst_y2 =
+         (rect->offset.y + rect->extent.height) /
+         plane->denominator_scales[1];
+
+      struct fdl6_view src_view = *src_fdl_view;
+      const uint8_t *plane_swizzle =
+         qti_legacy_source ? qti_legacy_nv12_swizzles[i] :
+                             plane->ycbcr_swizzle;
+      uint8_t src_swiz[4];
+      for (uint32_t c = 0; c < ARRAY_SIZE(src_swiz); c++)
+         src_swiz[c] =
+            external_format_resolve_swizzle(plane_swizzle[c]);
+      tu_desc_set_swiz<CHIP>(src_view.descriptor, src_swiz);
+
+      const VkImageSubresourceLayers dst_subresource = {
+         .aspectMask = plane_aspects[i],
+         .mipLevel = dst->vk.base_mip_level,
+         .baseArrayLayer = dst->vk.base_array_layer,
+         .layerCount = 1,
+      };
+      struct fdl6_view dst_view;
+      tu_image_view_copy_blit<CHIP>(&dst_view, dst->image, dst_format,
+                                    &dst_subresource, 0, false);
+
+      r3d_setup<CHIP>(cmd, cs, src_format, dst_format,
+                      VK_IMAGE_ASPECT_COLOR_BIT, 0, false,
+                      dst_view.ubwc_enabled, VK_SAMPLE_COUNT_1_BIT,
+                      VK_SAMPLE_COUNT_1_BIT);
+
+      const float coords[] = {
+         (float) dst_x1, (float) dst_y1, (float) src_x1, (float) src_y1,
+         (float) dst_x2, (float) dst_y2, (float) src_x2, (float) src_y2,
+      };
+      r3d_coords_raw(cmd, cs, coords);
+      r3d_src<CHIP>(cmd, cs, &src_view, 0, VK_FILTER_LINEAR, dst_format);
+      r3d_dst<CHIP>(cs, &dst_view, 0, src_format);
+      r3d_run(cmd, cs);
+      r3d_teardown<CHIP>(cmd, cs);
+   }
+
+   trace_end_sysmem_resolve(&cmd->rp_trace, cs);
+}
+TU_GENX(tu_resolve_external_format_sysmem);
+
 template <chip CHIP>
 static uint32_t
 tu_resolve_group_include_buffer(struct tu_resolve_group *resolve_group,

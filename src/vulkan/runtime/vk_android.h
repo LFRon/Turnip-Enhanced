@@ -38,9 +38,18 @@ struct u_gralloc;
 struct vk_device;
 struct vk_image;
 
+struct vk_android_modifier_plane_layout {
+   uint64_t data_offset;
+   uint64_t data_size;
+   uint64_t metadata_size;
+   uint32_t metadata_row_pitch;
+};
+
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
 
 struct u_gralloc *vk_android_get_ugralloc(void);
+
+bool vk_android_gralloc_supports_explicit_yuv_layout(void);
 
 VkResult vk_android_import_anb(struct vk_device *device,
                                const VkImageCreateInfo *pCreateInfo,
@@ -57,6 +66,13 @@ VkResult vk_android_get_anb_layout(
    VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
    VkSubresourceLayout *out_layouts, int max_planes);
 
+VkResult vk_android_get_anb_layout_with_modifier_info(
+   const VkImageCreateInfo *pCreateInfo,
+   VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
+   VkSubresourceLayout *out_layouts,
+   struct vk_android_modifier_plane_layout *out_modifier_plane_layouts,
+   int max_planes);
+
 VkResult vk_android_init_deferred_image(struct vk_device *device,
                                         struct vk_image *image,
                                         const VkImageCreateInfo *pCreateInfo,
@@ -68,6 +84,12 @@ static inline struct u_gralloc *
 vk_android_get_ugralloc(void)
 {
    return NULL;
+}
+
+static inline bool
+vk_android_gralloc_supports_explicit_yuv_layout(void)
+{
+   return false;
 }
 
 static inline VkResult
@@ -84,6 +106,17 @@ vk_android_get_anb_layout(
    const VkImageCreateInfo *pCreateInfo,
    VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
    VkSubresourceLayout *out_layouts, int max_planes)
+{
+   return VK_ERROR_FEATURE_NOT_PRESENT;
+}
+
+static inline VkResult
+vk_android_get_anb_layout_with_modifier_info(
+   const VkImageCreateInfo *pCreateInfo,
+   VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
+   VkSubresourceLayout *out_layouts,
+   struct vk_android_modifier_plane_layout *out_modifier_plane_layouts,
+   int max_planes)
 {
    return VK_ERROR_FEATURE_NOT_PRESENT;
 }
@@ -120,6 +153,13 @@ VkResult vk_android_get_ahb_layout(
    VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
    VkSubresourceLayout *out_layouts, int max_planes);
 
+VkResult vk_android_get_ahb_layout_with_modifier_info(
+   struct AHardwareBuffer *ahardware_buffer,
+   VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
+   VkSubresourceLayout *out_layouts,
+   struct vk_android_modifier_plane_layout *out_modifier_plane_layouts,
+   int max_planes);
+
 VkResult vk_android_get_ahb_image_properties(
    VkPhysicalDevice pdev_handle,
    const VkPhysicalDeviceImageFormatInfo2 *info,
@@ -131,6 +171,12 @@ void vk_android_get_ahb_buffer_properties(
    VkExternalBufferProperties *props);
 
 bool vk_android_rp_attachment_has_external_format(
+   const VkAttachmentDescription2 *desc);
+
+bool vk_android_rp_attachment_has_only_external_format(
+   const VkAttachmentDescription2 *desc);
+
+uint64_t vk_android_rp_attachment_external_format(
    const VkAttachmentDescription2 *desc);
 
 #else /* defined(VK_USE_PLATFORM_ANDROID_KHR) && ANDROID_API_LEVEL >= 26 */
@@ -176,6 +222,17 @@ vk_android_get_ahb_layout(
 }
 
 static inline VkResult
+vk_android_get_ahb_layout_with_modifier_info(
+   struct AHardwareBuffer *ahardware_buffer,
+   VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
+   VkSubresourceLayout *out_layouts,
+   struct vk_android_modifier_plane_layout *out_modifier_plane_layouts,
+   int max_planes)
+{
+   return VK_ERROR_FEATURE_NOT_PRESENT;
+}
+
+static inline VkResult
 vk_android_get_ahb_image_properties(
    VkPhysicalDevice pdev_handle,
    const VkPhysicalDeviceImageFormatInfo2 *info,
@@ -197,6 +254,20 @@ vk_android_rp_attachment_has_external_format(
    const VkAttachmentDescription2 *desc)
 {
    return false;
+}
+
+static inline bool
+vk_android_rp_attachment_has_only_external_format(
+   const VkAttachmentDescription2 *desc)
+{
+   return false;
+}
+
+static inline uint64_t
+vk_android_rp_attachment_external_format(
+   const VkAttachmentDescription2 *desc)
+{
+   return 0;
 }
 
 #endif /* ANDROID_API_LEVEL >= 26 */
