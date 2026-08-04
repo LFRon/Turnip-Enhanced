@@ -16,6 +16,7 @@ extern "C" {
 #include <cutils/native_handle.h>
 
 #include <stdbool.h>
+#include <stdint.h>
 
 #include "util/macros.h"
 #include "gallium/include/mesa_interface.h"
@@ -31,6 +32,13 @@ struct u_gralloc_buffer_handle {
    int pixel_stride;
 };
 
+struct u_gralloc_modifier_plane_layout {
+   uint64_t data_offset;
+   uint64_t data_size;
+   uint64_t metadata_size;
+   uint32_t metadata_row_pitch;
+};
+
 struct u_gralloc_buffer_basic_info {
    uint32_t drm_fourcc;
    uint64_t modifier;
@@ -42,6 +50,16 @@ struct u_gralloc_buffer_basic_info {
 
    uint64_t alloc_size;
    uint64_t layer_count;
+
+   /* For compressed layouts, offsets[] addresses the beginning of the
+    * modifier plane (including auxiliary metadata).  modifier_plane_layouts[]
+    * independently describes its metadata and primary-data regions so a
+    * driver can validate its modifier-specific layout calculation before the
+    * buffer is accessed by the GPU.  A zero metadata_row_pitch means that the
+    * mapper did not expose a separate metadata plane (as with QCOM RGB UBWC).
+    */
+   struct u_gralloc_modifier_plane_layout modifier_plane_layouts[4];
+   bool has_explicit_modifier_layout;
 };
 
 struct u_gralloc_buffer_color_info {
@@ -58,7 +76,19 @@ enum u_gralloc_type {
    U_GRALLOC_TYPE_LIBDRM,
    U_GRALLOC_TYPE_QCOM,
    U_GRALLOC_TYPE_FALLBACK,
+   /* Runtime QTI gralloc plane-metadata bridge.  Keep this after existing
+    * public enum values; backend preference is defined by u_grallocs[].
+    */
+   U_GRALLOC_TYPE_QTI_METADATA,
    U_GRALLOC_TYPE_COUNT,
+};
+
+enum u_gralloc_capability {
+   /* The backend reports an authoritative DRM FourCC, modifier, and explicit
+    * per-plane layout for YUV buffers instead of inferring them from a HAL
+    * format or a private native-handle layout.
+    */
+   U_GRALLOC_CAP_EXPLICIT_YUV_LAYOUT = 1u << 0,
 };
 
 struct u_gralloc *u_gralloc_create(enum u_gralloc_type type);
@@ -79,6 +109,8 @@ int u_gralloc_get_front_rendering_usage(struct u_gralloc *gralloc,
                                         uint64_t *out_usage);
 
 int u_gralloc_get_type(struct u_gralloc *gralloc);
+
+uint32_t u_gralloc_get_capabilities(struct u_gralloc *gralloc);
 
 #ifdef __cplusplus
 }
