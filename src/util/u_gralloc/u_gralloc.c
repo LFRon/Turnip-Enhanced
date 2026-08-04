@@ -22,11 +22,33 @@ static simple_mtx_t u_gralloc_mutex = SIMPLE_MTX_INITIALIZER;
 static const struct u_grallocs {
    enum u_gralloc_type type;
    struct u_gralloc *(*create)();
+   uint32_t capabilities;
 } u_grallocs[] = {
    /* Prefer the CrOS API as it is significantly faster than IMapper4 */
-   {.type = U_GRALLOC_TYPE_CROS, .create = u_gralloc_cros_api_create},
+   {
+      .type = U_GRALLOC_TYPE_CROS,
+      .create = u_gralloc_cros_api_create,
+      .capabilities = U_GRALLOC_CAP_EXPLICIT_YUV_LAYOUT,
+   },
+#ifdef USE_QTI_GRALLOC_METADATA_API
+   /* Prefer the vendor gralloc helper over libui.  It is part of the same
+    * in-process QTI mapper stack and remains reachable when Android SELinux
+    * prevents an application process from opening private libui.so.
+    */
+   {
+      .type = U_GRALLOC_TYPE_QTI_METADATA,
+      .create = u_gralloc_qti_metadata_api_create,
+   },
+#endif /* USE_QTI_GRALLOC_METADATA_API */
 #ifdef USE_IMAPPER4_METADATA_API
-   {.type = U_GRALLOC_TYPE_GRALLOC4, .create = u_gralloc_imapper_api_create},
+   /* IMapper may expose physical UBWC metadata and data planes while Vulkan
+    * consumes logical format planes.  Do not grant a blanket capability here;
+    * a backend may opt in only when it performs and validates that conversion.
+    */
+   {
+      .type = U_GRALLOC_TYPE_GRALLOC4,
+      .create = u_gralloc_imapper_api_create,
+   },
 #endif /* USE_IMAPPER4_METADATA_API */
    {.type = U_GRALLOC_TYPE_LIBDRM, .create = u_gralloc_libdrm_create},
    {.type = U_GRALLOC_TYPE_QCOM, .create = u_gralloc_qcom_create},
@@ -61,6 +83,8 @@ u_gralloc_create(enum u_gralloc_type type)
          assert(u_gralloc_cache[type].u_gralloc->ops.destroy);
 
          u_gralloc_cache[type].u_gralloc->type = u_grallocs[i].type;
+         u_gralloc_cache[type].u_gralloc->capabilities |=
+            u_grallocs[i].capabilities;
          u_gralloc_cache[type].refcount = 1;
 
          out_gralloc = u_gralloc_cache[type].u_gralloc;
@@ -98,7 +122,7 @@ u_gralloc_destroy(struct u_gralloc **gralloc)
 
    simple_mtx_unlock(&u_gralloc_mutex);
 
-   assert(i < ARRAY_SIZE(u_grallocs));
+   assert(i < ARRAY_SIZE(u_gralloc_cache));
 
    *gralloc = NULL;
 }
@@ -153,4 +177,10 @@ int
 u_gralloc_get_type(struct u_gralloc *gralloc)
 {
    return gralloc->type;
+}
+
+uint32_t
+u_gralloc_get_capabilities(struct u_gralloc *gralloc)
+{
+   return gralloc ? gralloc->capabilities : 0;
 }

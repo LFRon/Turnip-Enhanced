@@ -41,6 +41,52 @@ tu6_format_color_supported(const struct fd_dev_info *info, enum pipe_format form
    return fd6_color_format_supported(info, format, TILE6_LINEAR);
 }
 
+bool
+tu_external_format_resolve_supported(const struct fd_dev_info *info,
+                                     VkFormat format,
+                                     enum a6xx_tile_mode tile_mode)
+{
+   const struct vk_format_ycbcr_info *ycbcr_info =
+      vk_format_get_ycbcr_info(format);
+
+   /* The first implementation uses an R8G8B8A8_UNORM intermediate.  Do not
+    * advertise higher bit depths until their packed plane formats can be
+    * written directly by FDL/R3D without changing their bit placement.
+    * Multiplanar format descriptions do not model conventional RGBA component
+    * indices, so use the format-wide BPC helper instead.
+    */
+   if (!ycbcr_info || ycbcr_info->n_planes > TU_MAX_PLANE_COUNT ||
+       vk_format_get_bpc(format) != 8)
+      return false;
+
+   if (tile_mode != TILE6_LINEAR && tile_mode != TILE6_3)
+      return false;
+
+   /* Turnip does not implement tiled, non-UBWC layouts for formats for which
+    * tiling is impossible (notably three-plane 4:2:0).
+    */
+   if (tile_mode != TILE6_LINEAR && !tiling_possible(format))
+      return false;
+
+   const enum pipe_format color_format = PIPE_FORMAT_R8G8B8A8_UNORM;
+   if (!fd6_color_format_supported(info, color_format, TILE6_3) ||
+       !fd6_texture_format_supported(info, color_format, TILE6_3, false))
+      return false;
+
+   for (uint32_t i = 0; i < ycbcr_info->n_planes; i++) {
+      if (!ycbcr_info->planes[i].denominator_scales[0] ||
+          !ycbcr_info->planes[i].denominator_scales[1])
+         return false;
+
+      const enum pipe_format plane_format = tu6_plane_format(format, i);
+      if (!fd6_color_format_supported(info, plane_format, tile_mode) ||
+          !fd6_texture_format_supported(info, plane_format, tile_mode, false))
+         return false;
+   }
+
+   return true;
+}
+
 struct tu_native_format
 tu6_format_color(enum pipe_format format, enum a6xx_tile_mode tile_mode,
                  bool is_mutable)

@@ -9,11 +9,13 @@
 
 #include "tu_pass.h"
 
+#include "vk_android.h"
 #include "vk_render_pass.h"
 #include "vk_util.h"
 
 #include "tu_cmd_buffer.h"
 #include "tu_device.h"
+#include "tu_formats.h"
 #include "tu_image.h"
 
 #define XXH_INLINE_ALL
@@ -1014,6 +1016,7 @@ tu_subpass_resolve_attachment(struct tu_render_pass *pass, int i, uint32_t dst_a
       dst_att->last_subpass_idx = MAX2(i, dst_att->last_subpass_idx);
 
       dst_att->resolve_views |= subpass->multiview_mask;
+      pass->has_external_format_resolve |= dst_att->external_format_resolve;
    }
 }
 
@@ -1025,10 +1028,15 @@ tu_init_renderpass_attachment(struct tu_device *device,
 {
    att->format = pAttachment->format;
    att->samples = samples;
+   att->external_format =
+      vk_android_rp_attachment_external_format(pAttachment);
+   att->external_format_resolve = att->external_format != 0;
    /* for d32s8, cpp is for the depth image, and
     * att->samples will be used as the cpp for the stencil image
     */
-   if (att->format == VK_FORMAT_D32_SFLOAT_S8_UINT)
+   if (att->external_format_resolve)
+      att->cpp = 0;
+   else if (att->format == VK_FORMAT_D32_SFLOAT_S8_UINT)
       att->cpp = 4 * samples;
    else
       att->cpp = vk_format_get_blocksize(att->format) * samples;
@@ -1037,6 +1045,143 @@ tu_init_renderpass_attachment(struct tu_device *device,
 
    att->first_subpass_idx = VK_SUBPASS_EXTERNAL;
    att->last_subpass_idx = 0;
+}
+
+enum tu_direct_external_format_action {
+   TU_DIRECT_EXTERNAL_FORMAT_NONE,
+   TU_DIRECT_EXTERNAL_FORMAT_LOWER_QTI_NV12,
+   TU_DIRECT_EXTERNAL_FORMAT_REJECT,
+};
+
+/* Qualcomm's legacy video transformer uses an external-format image directly
+ * as the sole color attachment.  The standardized Android extension instead
+ * requires a conventional RGBA color attachment and the external image as a
+ * resolve destination.  Keep those two cases distinct: lower only the narrow,
+ * fully-overwriting form used by the verified QTI ABI, and reject every other
+ * direct external-format color attachment before it can enter Turnip's normal
+ * render-pass path as VK_FORMAT_UNDEFINED/cpp=0.
+ */
+static enum tu_direct_external_format_action
+tu_classify_direct_external_format_resolve(
+   const struct tu_device *device,
+   const VkRenderPassCreateInfo2 *info)
+{
+   if ((info->attachmentCount != 0 && info->pAttachments == NULL) ||
+       (info->subpassCount != 0 && info->pSubpasses == NULL))
+      return TU_DIRECT_EXTERNAL_FORMAT_REJECT;
+
+   bool has_direct_external_format = false;
+   for (uint32_t i = 0; i < info->subpassCount; i++) {
+      const VkSubpassDescription2 *subpass = &info->pSubpasses[i];
+      if (subpass->colorAttachmentCount != 0 &&
+          subpass->pColorAttachments == NULL)
+         return TU_DIRECT_EXTERNAL_FORMAT_REJECT;
+
+      for (uint32_t j = 0; j < subpass->colorAttachmentCount; j++) {
+         const uint32_t attachment =
+            subpass->pColorAttachments[j].attachment;
+         if (attachment == VK_ATTACHMENT_UNUSED)
+            continue;
+
+         /* Attachment indices are covered by Vulkan valid usage, but reject
+          * an invalid reference here instead of risking an out-of-bounds
+          * access in either the classifier or normal render-pass setup.
+          */
+         if (attachment >= info->attachmentCount)
+            return TU_DIRECT_EXTERNAL_FORMAT_REJECT;
+
+         has_direct_external_format |=
+            vk_android_rp_attachment_external_format(
+               &info->pAttachments[attachment]) != 0;
+      }
+   }
+
+   if (!has_direct_external_format)
+      return TU_DIRECT_EXTERNAL_FORMAT_NONE;
+
+   if (!device->physical_device->vk.supported_extensions
+           .ANDROID_external_format_resolve ||
+       info->flags != 0 || info->pNext != NULL ||
+       info->attachmentCount != 1 || info->subpassCount != 1 ||
+       info->dependencyCount != 0 || info->correlatedViewMaskCount != 0)
+      return TU_DIRECT_EXTERNAL_FORMAT_REJECT;
+
+   const VkAttachmentDescription2 *att = &info->pAttachments[0];
+   const VkSubpassDescription2 *subpass = &info->pSubpasses[0];
+
+   if (att->sType != VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2 ||
+       att->flags != 0 || att->format != VK_FORMAT_UNDEFINED ||
+       att->samples != VK_SAMPLE_COUNT_1_BIT ||
+       att->loadOp != VK_ATTACHMENT_LOAD_OP_DONT_CARE ||
+       att->storeOp != VK_ATTACHMENT_STORE_OP_STORE ||
+       att->stencilLoadOp != VK_ATTACHMENT_LOAD_OP_DONT_CARE ||
+       att->stencilStoreOp != VK_ATTACHMENT_STORE_OP_DONT_CARE ||
+       att->initialLayout != VK_IMAGE_LAYOUT_GENERAL ||
+       att->finalLayout != VK_IMAGE_LAYOUT_GENERAL)
+      return TU_DIRECT_EXTERNAL_FORMAT_REJECT;
+
+   if (!vk_android_rp_attachment_has_only_external_format(att))
+      return TU_DIRECT_EXTERNAL_FORMAT_REJECT;
+
+   if (subpass->sType != VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2 ||
+       subpass->flags != 0 || subpass->pNext != NULL ||
+       subpass->pipelineBindPoint != VK_PIPELINE_BIND_POINT_GRAPHICS ||
+       subpass->viewMask != 0 || subpass->inputAttachmentCount != 0 ||
+       subpass->colorAttachmentCount != 1 ||
+       subpass->pResolveAttachments != NULL ||
+       subpass->pDepthStencilAttachment != NULL ||
+       subpass->preserveAttachmentCount != 0)
+      return TU_DIRECT_EXTERNAL_FORMAT_REJECT;
+
+   const VkAttachmentReference2 *color = &subpass->pColorAttachments[0];
+   if (color->sType != VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2 ||
+       color->pNext != NULL || color->attachment != 0 ||
+       color->layout != VK_IMAGE_LAYOUT_GENERAL || color->aspectMask != 0)
+      return TU_DIRECT_EXTERNAL_FORMAT_REJECT;
+
+   const uint64_t external_format =
+      vk_android_rp_attachment_external_format(att);
+   /* VideoTxr's R=Y, G=Cb, B=Cr output convention is verified only for its
+    * 8-bit NV12 path.  Other direct external-format attachments must not be
+    * silently interpreted using that proprietary component order.
+    */
+   if (external_format != VK_FORMAT_G8_B8R8_2PLANE_420_UNORM)
+      return TU_DIRECT_EXTERNAL_FORMAT_REJECT;
+
+   if (!tu_external_format_resolve_supported(
+          device->physical_device->info, (VkFormat) external_format,
+          TILE6_LINEAR))
+      return TU_DIRECT_EXTERNAL_FORMAT_REJECT;
+
+   return TU_DIRECT_EXTERNAL_FORMAT_LOWER_QTI_NV12;
+}
+
+static void
+tu_init_direct_external_format_color_attachment(
+   struct tu_device *device,
+   uint32_t user_att_idx,
+   struct tu_render_pass_attachment *att)
+{
+   const VkAttachmentDescription2 desc = {
+      .sType = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2,
+      .format = VK_FORMAT_R8G8B8A8_UNORM,
+      .samples = VK_SAMPLE_COUNT_1_BIT,
+      .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+      .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+      .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+      .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+      .finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+   };
+
+   tu_init_renderpass_attachment(device, &desc, att,
+                                 VK_SAMPLE_COUNT_1_BIT);
+   att->user_att = user_att_idx;
+   attachment_set_ops(device, att,
+                      VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+                      VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+                      VK_ATTACHMENT_STORE_OP_DONT_CARE,
+                      VK_ATTACHMENT_STORE_OP_DONT_CARE);
 }
 
 static void
@@ -1064,17 +1209,43 @@ tu_CreateRenderPass2(VkDevice _device,
 {
    VK_FROM_HANDLE(tu_device, device, _device);
 
-   if (TU_DEBUG(DYNAMIC))
+   assert(pCreateInfo->sType == VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2);
+
+   const enum tu_direct_external_format_action direct_external_format_action =
+      tu_classify_direct_external_format_resolve(device, pCreateInfo);
+
+   if (direct_external_format_action == TU_DIRECT_EXTERNAL_FORMAT_REJECT) {
+      mesa_loge_once("Rejecting unsupported direct external-format color "
+                     "attachment; no GPU commands were emitted");
+      return vk_error(device, VK_ERROR_UNKNOWN);
+   }
+
+   /* The common dynamic-rendering emulation owns a different render-pass
+    * object lifecycle.  Do not mix it with Turnip's private QTI lowering and
+    * its driver-internal framebuffer attachment.  This is a debug-only mode,
+    * so failing closed is preferable to creating mismatched objects.
+    */
+   if (TU_DEBUG(DYNAMIC)) {
+      if (direct_external_format_action ==
+          TU_DIRECT_EXTERNAL_FORMAT_LOWER_QTI_NV12) {
+         mesa_loge_once("Rejecting QTI direct external-format color "
+                        "attachment in dynamic-rendering debug mode");
+         return vk_error(device, VK_ERROR_UNKNOWN);
+      }
+
       return vk_common_CreateRenderPass2(_device, pCreateInfo, pAllocator,
                                          pRenderPass);
+   }
 
    struct tu_render_pass *pass;
    size_t size;
    size_t attachments_offset;
 
-   assert(pCreateInfo->sType == VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2);
-
-   uint32_t attachment_count = pCreateInfo->attachmentCount;
+   const bool lower_direct_external_format_resolve =
+      direct_external_format_action ==
+      TU_DIRECT_EXTERNAL_FORMAT_LOWER_QTI_NV12;
+   uint32_t attachment_count = pCreateInfo->attachmentCount +
+      (lower_direct_external_format_resolve ? 1 : 0);
 
    for (uint32_t i = 0; i < pCreateInfo->subpassCount; i++) {
       const VkSubpassDescription2 *subpass = &pCreateInfo->pSubpasses[i];
@@ -1115,6 +1286,8 @@ tu_CreateRenderPass2(VkDevice _device,
    pass->attachment_count = attachment_count;
    pass->user_attachment_count = pCreateInfo->attachmentCount;
    pass->subpass_count = pCreateInfo->subpassCount;
+   pass->has_direct_external_format_resolve =
+      lower_direct_external_format_resolve;
    pass->attachments =
       (struct tu_render_pass_attachment *) ((char *) pass +
                                             attachments_offset);
@@ -1143,8 +1316,11 @@ tu_CreateRenderPass2(VkDevice _device,
                               MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_INFO_EXT);
       bool msrtss_enabled = msrtss &&
          msrtss->multisampledRenderToSingleSampledEnable;
+      bool direct_external_format_resolve =
+         lower_direct_external_format_resolve && i == 0;
       pass->subpasses[i].resolve_count =
-         ((desc->pResolveAttachments || msrtss_enabled) ? desc->colorAttachmentCount : 0) +
+         ((desc->pResolveAttachments || msrtss_enabled ||
+           direct_external_format_resolve) ? desc->colorAttachmentCount : 0) +
          ((is_depth_stencil_resolve_enabled(ds_resolve) || msrtss_enabled) ? 1 : 0);
       pass->subpasses[i].unresolve_count =
          msrtss_enabled ?
@@ -1188,7 +1364,7 @@ tu_CreateRenderPass2(VkDevice _device,
       pass->has_fdm = true;
 
    p = pass->subpass_attachments;
-   uint32_t msrtss_att_idx = pCreateInfo->attachmentCount;
+   uint32_t internal_att_idx = pCreateInfo->attachmentCount;
    for (uint32_t i = 0; i < pCreateInfo->subpassCount; i++) {
       const VkSubpassDescription2 *desc = &pCreateInfo->pSubpasses[i];
       const VkSubpassDescriptionDepthStencilResolve *ds_resolve =
@@ -1261,17 +1437,30 @@ tu_CreateRenderPass2(VkDevice _device,
             subpass->color_attachments[j].attachment = a;
 
             if (a != VK_ATTACHMENT_UNUSED) {
+               if (pass->has_direct_external_format_resolve) {
+                  const uint32_t dst_a = a;
+                  const uint32_t src_a = internal_att_idx++;
+
+                  tu_init_direct_external_format_color_attachment(
+                     device, dst_a, &pass->attachments[src_a]);
+                  subpass->color_attachments[j].attachment = src_a;
+                  subpass->resolve_attachments[j].attachment = dst_a;
+                  tu_subpass_resolve_attachment(pass, i, dst_a, src_a);
+                  tu_subpass_use_attachment(pass, i, src_a, pCreateInfo);
+                  continue;
+               }
+
                if (msrtss && msrtss->multisampledRenderToSingleSampledEnable &&
                    msrtss->rasterizationSamples !=
                    pCreateInfo->pAttachments[a].samples) {
                   tu_init_msrtss_renderpass_attachment(
                      device, pCreateInfo, a,
-                     &pass->attachments[msrtss_att_idx],
+                     &pass->attachments[internal_att_idx],
                      msrtss->rasterizationSamples);
-                  tu_subpass_resolve_attachment(pass, i, a, msrtss_att_idx);
+                  tu_subpass_resolve_attachment(pass, i, a, internal_att_idx);
                   subpass->resolve_attachments[j].attachment = a;
                   subpass->unresolve_attachments[j].attachment = a;
-                  subpass->color_attachments[j].attachment = a = msrtss_att_idx++;
+                  subpass->color_attachments[j].attachment = a = internal_att_idx++;
                   pass->has_msrtss = true;
                }
 
@@ -1316,12 +1505,12 @@ tu_CreateRenderPass2(VkDevice _device,
              pCreateInfo->pAttachments[a].samples) {
             tu_init_msrtss_renderpass_attachment(
                device, pCreateInfo, a,
-               &pass->attachments[msrtss_att_idx],
+               &pass->attachments[internal_att_idx],
                msrtss->rasterizationSamples);
-            tu_subpass_resolve_attachment(pass, i, a, msrtss_att_idx);
+            tu_subpass_resolve_attachment(pass, i, a, internal_att_idx);
             subpass->resolve_attachments[subpass->resolve_count - 1].attachment = a;
             subpass->unresolve_attachments[subpass->resolve_count - 1].attachment = a;
-            subpass->depth_stencil_attachment.attachment = a = msrtss_att_idx++;
+            subpass->depth_stencil_attachment.attachment = a = internal_att_idx++;
             subpass->resolve_depth_stencil = true;
             pass->has_msrtss = true;
          }
@@ -1343,6 +1532,8 @@ tu_CreateRenderPass2(VkDevice _device,
          subpass->fsr_attachment = VK_ATTACHMENT_UNUSED;
       }
    }
+
+   assert(internal_att_idx == pass->attachment_count);
 
    tu_render_pass_patch_input_gmem(pass);
 
@@ -1557,6 +1748,11 @@ tu_setup_dynamic_render_pass(struct tu_cmd_buffer *cmd_buffer,
             tu_setup_dynamic_attachment(resolve_att, resolve_view,
                                         VK_SAMPLE_COUNT_1_BIT);
             resolve_att->gmem = false;
+            resolve_att->external_format_resolve =
+               att_info->resolveMode ==
+               VK_RESOLVE_MODE_EXTERNAL_FORMAT_DOWNSAMPLE_BIT_ANDROID;
+            pass->has_external_format_resolve |=
+               resolve_att->external_format_resolve;
             attachment_set_ops(
                device, resolve_att, VK_ATTACHMENT_LOAD_OP_NONE,
                VK_ATTACHMENT_LOAD_OP_NONE, VK_ATTACHMENT_STORE_OP_STORE,

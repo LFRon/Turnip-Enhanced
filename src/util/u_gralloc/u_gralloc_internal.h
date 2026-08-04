@@ -29,9 +29,13 @@ struct u_gralloc_ops {
 struct u_gralloc {
    struct u_gralloc_ops ops;
    int type;
+   uint32_t capabilities;
 };
 
 extern struct u_gralloc *u_gralloc_cros_api_create(void);
+#ifdef USE_QTI_GRALLOC_METADATA_API
+extern struct u_gralloc *u_gralloc_qti_metadata_api_create(void);
+#endif
 #ifdef USE_IMAPPER4_METADATA_API
 extern struct u_gralloc *u_gralloc_imapper_api_create(void);
 #endif
