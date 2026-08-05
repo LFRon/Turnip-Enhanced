@@ -136,6 +136,12 @@ struct fd_dev_info {
        */
       bool indirect_draw_wfm_quirk;
 
+      /* A725 exhibits transient corruption even on draws without dirty state
+       * unless preceding ME work is completed before every draw. See
+       * https://gitlab.freedesktop.org/mesa/mesa/-/work_items/15792
+       */
+      bool per_draw_wfm_quirk;
+
       /* On some GPUs, the depth test needs to be enabled when the
        * depth bounds test is enabled and the depth attachment uses UBWC.
        */
