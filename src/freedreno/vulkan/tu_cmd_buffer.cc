@@ -2149,13 +2149,57 @@ tu_disable_draw_states(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
    cmd->state.dirty |= TU_CMD_DIRTY_DRAW_STATE;
 }
 
+/* A7xx static state is emitted at command-buffer start with both CP threads
+ * selected and into separate BR/BV bin-restore preambles.  Keep the original
+ * register order for BR, but never send RB-only state to BV.
+ */
+enum tu_static_reg_thread {
+   TU_STATIC_REG_THREAD_BOTH,
+   TU_STATIC_REG_THREAD_BR,
+   TU_STATIC_REG_THREAD_BV,
+};
+
+static bool
+tu7_reg_is_rb(uint32_t reg)
+{
+   /* Raw magic entries have no block metadata.  The A7xx RB register aperture
+    * starts at RB_CNTL and ends where the VPC aperture starts.
+    */
+   return reg >= REG_A6XX_RB_CNTL && reg < REG_A6XX_VPC_GS_PARAM;
+}
+
+template <chip CHIP>
+static bool
+tu_begin_br_only_static_regs(struct tu_cs *cs, enum tu_static_reg_thread thread)
+{
+   assert(thread == TU_STATIC_REG_THREAD_BOTH || thread == TU_STATIC_REG_THREAD_BR ||
+          thread == TU_STATIC_REG_THREAD_BV);
+
+   if (CHIP != A7XX || thread == TU_STATIC_REG_THREAD_BR)
+      return true;
+
+   if (thread == TU_STATIC_REG_THREAD_BV)
+      return false;
+
+   tu_cond_exec_start(cs, CP_COND_REG_EXEC_0_MODE(THREAD_MODE) | CP_COND_REG_EXEC_0_BR);
+   return true;
+}
+
 template <chip CHIP>
 static void
-tu6_init_static_regs(struct tu_device *dev, struct tu_cs *cs)
+tu_end_br_only_static_regs(struct tu_cs *cs, enum tu_static_reg_thread thread)
+{
+   if (CHIP == A7XX && thread == TU_STATIC_REG_THREAD_BOTH)
+      tu_cond_exec_end(cs);
+}
+
+template <chip CHIP>
+static void
+tu6_init_static_regs(struct tu_device *dev, struct tu_cs *cs, enum tu_static_reg_thread thread)
 {
    const struct tu_physical_device *phys_dev = dev->physical_device;
 
-   if (CHIP == A7XX) {
+   if (CHIP == A7XX && tu_begin_br_only_static_regs<CHIP>(cs, thread)) {
       /* On A7XX, RB_CCU_CNTL was broken into two registers, RB_CCU_CNTL which has
        * static properties that can be set once, this requires a WFI to take effect.
        * While the newly introduced register RB_CCU_CACHE_CNTL has properties that may
@@ -2177,12 +2221,27 @@ tu6_init_static_regs(struct tu_device *dev, struct tu_cs *cs)
          .concurrent_resolve_mode = resolve_mode,
          .concurrent_unresolve_mode = unresolve_mode,
       ));
+      tu_end_br_only_static_regs<CHIP>(cs, thread);
    }
 
+   bool raw_br_cond_open = false;
    for (size_t i = 0; i < ARRAY_SIZE(phys_dev->info->magic_raw); i++) {
       auto magic_reg = phys_dev->info->magic_raw[i];
       if (!magic_reg.reg)
          break;
+
+      const bool br_only = CHIP == A7XX && tu7_reg_is_rb(magic_reg.reg);
+      if (br_only && thread == TU_STATIC_REG_THREAD_BV)
+         continue;
+
+      if (CHIP == A7XX && thread == TU_STATIC_REG_THREAD_BOTH && br_only != raw_br_cond_open) {
+         if (raw_br_cond_open)
+            tu_cond_exec_end(cs);
+         if (br_only) {
+            tu_cond_exec_start(cs, CP_COND_REG_EXEC_0_MODE(THREAD_MODE) | CP_COND_REG_EXEC_0_BR);
+         }
+         raw_br_cond_open = br_only;
+      }
 
       uint32_t value = magic_reg.value;
       switch(magic_reg.reg) {
@@ -2208,6 +2267,8 @@ tu6_init_static_regs(struct tu_device *dev, struct tu_cs *cs)
 
       tu_cs_emit_write_reg(cs, magic_reg.reg, value);
    }
+   if (raw_br_cond_open)
+      tu_cond_exec_end(cs);
 
    if (dev->physical_device->info->props.has_attachment_shading_rate) {
       tu_cs_emit_regs(cs, GRAS_LRZ_QUALITY_LOOKUP_TABLE_REG(CHIP, 0,
@@ -2237,11 +2298,17 @@ tu6_init_static_regs(struct tu_device *dev, struct tu_cs *cs)
                                             .shared_consts_enable = false));
 
    tu_cs_emit_regs(cs, A6XX_VFD_MODE_CNTL(.vertex = true, .instance = true));
-   tu_cs_emit_write_reg(cs, REG_A6XX_RB_MODE_CNTL, 0x00000010);
+   if (tu_begin_br_only_static_regs<CHIP>(cs, thread)) {
+      tu_cs_emit_write_reg(cs, REG_A6XX_RB_MODE_CNTL, 0x00000010);
+      tu_end_br_only_static_regs<CHIP>(cs, thread);
+   }
 
    tu_cs_emit_regs(cs, GRAS_MODE_CNTL(CHIP, CHIP >= A7XX ? 0x2 : 0));
 
-   tu_cs_emit_write_reg(cs, REG_A6XX_RB_UNKNOWN_8818, 0);
+   if (tu_begin_br_only_static_regs<CHIP>(cs, thread)) {
+      tu_cs_emit_write_reg(cs, REG_A6XX_RB_UNKNOWN_8818, 0);
+      tu_end_br_only_static_regs<CHIP>(cs, thread);
+   }
 
    if (CHIP == A6XX) {
       tu_cs_emit_write_reg(cs, REG_A6XX_RB_UNKNOWN_8819, 0);
@@ -2286,7 +2353,11 @@ tu6_init_static_regs(struct tu_device *dev, struct tu_cs *cs)
 
    tu_cs_emit_write_reg(cs, REG_A6XX_VFD_RENDER_MODE, 0x00000000);
 
-   tu_cs_emit_regs(cs, A6XX_RB_ALPHA_TEST_CNTL()); /* always disable alpha test */
+   if (tu_begin_br_only_static_regs<CHIP>(cs, thread)) {
+      /* Always disable alpha test. */
+      tu_cs_emit_regs(cs, A6XX_RB_ALPHA_TEST_CNTL());
+      tu_end_br_only_static_regs<CHIP>(cs, thread);
+   }
    if (CHIP >= A8XX)
       tu_cs_emit_regs(cs, SP_ALPHA_TEST_CNTL(CHIP));
 
@@ -2295,18 +2366,14 @@ tu6_init_static_regs(struct tu_device *dev, struct tu_cs *cs)
 
    /* BR-only registers */
    /* non-ctx regs programmed by KMD (and blocked from UMD) on gen8+ */
-   if (CHIP < A8XX) {
-      if (CHIP == A7XX)
-         tu_cond_exec_start(cs, CP_COND_REG_EXEC_0_MODE(THREAD_MODE) |
-                              CP_COND_REG_EXEC_0_BR);
+   if (CHIP < A8XX && tu_begin_br_only_static_regs<CHIP>(cs, thread)) {
       tu_cs_emit_write_reg(cs, REG_A6XX_RB_DBG_ECO_CNTL,
                            phys_dev->info->magic.RB_DBG_ECO_CNTL);
       tu_cs_emit_write_reg(cs, REG_A6XX_RB_RBP_CNTL,
                            phys_dev->info->magic.RB_RBP_CNTL);
-      if (CHIP == A7XX) {
+      if (CHIP == A7XX)
          tu_cs_emit_regs(cs, RB_UNKNOWN_8E09(CHIP, 0x7));
-         tu_cond_exec_end(cs);
-      }
+      tu_end_br_only_static_regs<CHIP>(cs, thread);
    }
 
    if (CHIP == A7XX) {
@@ -2367,7 +2434,7 @@ template <chip CHIP>
 static void
 tu_emit_bin_preamble(struct tu_device *dev, struct tu_cs *cs, bool bv)
 {
-   tu6_init_static_regs<CHIP>(dev, cs);
+   tu6_init_static_regs<CHIP>(dev, cs, bv ? TU_STATIC_REG_THREAD_BV : TU_STATIC_REG_THREAD_BR);
 
    if (!bv)
       emit_rb_ccu_cntl<CHIP>(cs, dev, true);
@@ -2438,7 +2505,16 @@ tu_init_hw_rp(struct tu_cs *cs)
 {
    if (CHIP >= A7XX) {
       tu_cs_emit_regs(cs, VPC_UNKNOWN_CNTL(CHIP));
+
+      /* This helper is also called from command-buffer start while both A7xx
+       * threads are selected.
+       */
+      if (CHIP == A7XX) {
+         tu_cond_exec_start(cs, CP_COND_REG_EXEC_0_MODE(THREAD_MODE) | CP_COND_REG_EXEC_0_BR);
+      }
       tu_cs_emit_regs(cs, RB_A2D_DEST_BUFFER_ARRAY_PITCH(CHIP));
+      if (CHIP == A7XX)
+         tu_cond_exec_end(cs);
    }
 }
 TU_GENX(tu_init_hw_rp);
@@ -2485,10 +2561,16 @@ tu_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
    cmd->state.cache.pending_flush_bits &=
       ~(TU_CMD_FLAG_WAIT_FOR_IDLE | TU_CMD_FLAG_CACHE_INVALIDATE);
 
-   tu6_init_static_regs<CHIP>(cmd->device, cs);
+   tu6_init_static_regs<CHIP>(cmd->device, cs, CHIP == A6XX ? TU_STATIC_REG_THREAD_BR : TU_STATIC_REG_THREAD_BOTH);
    tu_init_hw_rp<CHIP>(cs);
 
+   /* The initial thread remains BOTH until the patchpoint below. */
+   if (CHIP == A7XX) {
+      tu_cond_exec_start(cs, CP_COND_REG_EXEC_0_MODE(THREAD_MODE) | CP_COND_REG_EXEC_0_BR);
+   }
    emit_rb_ccu_cntl<CHIP>(cs, cmd->device, false);
+   if (CHIP == A7XX)
+      tu_cond_exec_end(cs);
    emit_vpc_attr_buf<CHIP>(cs, cmd->device, false);
    cmd->state.ccu_state = TU_CMD_CCU_SYSMEM;
 
