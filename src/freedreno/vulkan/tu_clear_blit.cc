@@ -1828,9 +1828,17 @@ r3d_setup(struct tu_cmd_buffer *cmd,
    }
 }
 
+static inline void
+r3d_draw_wfm_quirk(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+{
+   if (unlikely(cmd->device->physical_device->info->props.per_draw_wfm_quirk))
+      tu_cs_emit_pkt7(cs, CP_WAIT_FOR_ME, 0);
+}
+
 static void
 r3d_run(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
 {
+   r3d_draw_wfm_quirk(cmd, cs);
    tu_cs_emit_pkt7(cs, CP_DRAW_INDX_OFFSET, 3);
    tu_cs_emit(cs, CP_DRAW_INDX_OFFSET_0_PRIM_TYPE(DI_PT_RECTLIST) |
                   CP_DRAW_INDX_OFFSET_0_SOURCE_SELECT(DI_SRC_SEL_AUTO_INDEX) |
@@ -1842,6 +1850,7 @@ r3d_run(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
 static void
 r3d_run_vis(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
 {
+   r3d_draw_wfm_quirk(cmd, cs);
    tu_cs_emit_pkt7(cs, CP_DRAW_INDX_OFFSET, 3);
    tu_cs_emit(cs, CP_DRAW_INDX_OFFSET_0_PRIM_TYPE(DI_PT_RECTLIST) |
                   CP_DRAW_INDX_OFFSET_0_SOURCE_SELECT(DI_SRC_SEL_AUTO_INDEX) |
@@ -1853,6 +1862,7 @@ r3d_run_vis(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
 static void
 r3d_run_multi(struct tu_cmd_buffer *cmd, struct tu_cs *cs, unsigned count)
 {
+   r3d_draw_wfm_quirk(cmd, cs);
    tu_cs_emit_pkt7(cs, CP_DRAW_INDX_OFFSET, 3);
    tu_cs_emit(cs, CP_DRAW_INDX_OFFSET_0_PRIM_TYPE(DI_PT_RECTLIST) |
                   CP_DRAW_INDX_OFFSET_0_SOURCE_SELECT(DI_SRC_SEL_AUTO_INDEX) |
