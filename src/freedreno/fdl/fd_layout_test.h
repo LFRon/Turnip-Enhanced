@@ -10,6 +10,7 @@ struct testcase {
 
    int array_size; /* Size for array textures, or 0 otherwise. */
    bool is_3d;
+   bool force_ubwc;
 
    /* Partially filled layout of input parameters and expected results. */
    struct {
@@ -26,6 +27,7 @@ struct testcase {
       struct {
          uint32_t offset;
          uint32_t pitch;
+         uint32_t size0;
       } ubwc_slices[FDL_MAX_MIP_LEVELS];
    } layout;
 };
