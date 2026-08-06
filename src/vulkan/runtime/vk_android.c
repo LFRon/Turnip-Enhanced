@@ -79,6 +79,16 @@ vk_android_gralloc_supports_explicit_yuv_layout(void)
            U_GRALLOC_CAP_EXPLICIT_YUV_LAYOUT);
 }
 
+bool
+vk_android_gralloc_supports_qcom_swapchain_ubwc(void)
+{
+   struct u_gralloc *gralloc = vk_android_get_ugralloc();
+
+   return gralloc &&
+          (u_gralloc_get_capabilities(gralloc) &
+           U_GRALLOC_CAP_QCOM_SWAPCHAIN_UBWC);
+}
+
 static int vk_android_hal_open(const struct hw_module_t *mod, const char *id,
                                struct hw_device_t **dev);
 

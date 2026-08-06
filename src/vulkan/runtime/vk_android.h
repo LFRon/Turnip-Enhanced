@@ -51,6 +51,8 @@ struct u_gralloc *vk_android_get_ugralloc(void);
 
 bool vk_android_gralloc_supports_explicit_yuv_layout(void);
 
+bool vk_android_gralloc_supports_qcom_swapchain_ubwc(void);
+
 VkResult vk_android_import_anb(struct vk_device *device,
                                const VkImageCreateInfo *pCreateInfo,
                                const VkAllocationCallbacks *alloc,
@@ -88,6 +90,12 @@ vk_android_get_ugralloc(void)
 
 static inline bool
 vk_android_gralloc_supports_explicit_yuv_layout(void)
+{
+   return false;
+}
+
+static inline bool
+vk_android_gralloc_supports_qcom_swapchain_ubwc(void)
 {
    return false;
 }

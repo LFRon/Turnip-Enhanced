@@ -52,6 +52,10 @@
 #endif
 
 #if DETECT_OS_ANDROID
+#include <hardware/gralloc.h>
+#if ANDROID_API_LEVEL >= 26
+#include <hardware/gralloc1.h>
+#endif
 #include <vndk/hardware_buffer.h>
 #endif
 
@@ -1691,6 +1695,61 @@ tu_get_properties(struct tu_physical_device *pdevice,
 }
 
 #if DETECT_OS_ANDROID
+static bool
+tu_android_swapchain_ubwc_possible(struct tu_device *device,
+                                   VkFormat format,
+                                   VkImageUsageFlags image_usage)
+{
+   const VkPhysicalDeviceImageFormatInfo2 format_info = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+      .format = format,
+      .type = VK_IMAGE_TYPE_2D,
+      .tiling = VK_IMAGE_TILING_OPTIMAL,
+      .usage = image_usage,
+   };
+
+   return tu_android_gralloc_ubwc_possible(device->physical_device,
+                                           &format_info);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+tu_GetSwapchainGrallocUsageANDROID(VkDevice _device, VkFormat format, VkImageUsageFlags imageUsage, int *grallocUsage)
+{
+   VK_FROM_HANDLE(tu_device, device, _device);
+
+   VkResult result = vk_common_GetSwapchainGrallocUsageANDROID(_device, format, imageUsage, grallocUsage);
+   if (result != VK_SUCCESS)
+      return result;
+
+   if (tu_android_swapchain_ubwc_possible(device, format, imageUsage))
+      *grallocUsage |= GRALLOC_USAGE_PRIVATE_0;
+
+   return VK_SUCCESS;
+}
+
+#if ANDROID_API_LEVEL >= 26
+VKAPI_ATTR VkResult VKAPI_CALL
+tu_GetSwapchainGrallocUsage2ANDROID(VkDevice _device,
+                                    VkFormat format,
+                                    VkImageUsageFlags imageUsage,
+                                    VkSwapchainImageUsageFlagsANDROID swapchainImageUsage,
+                                    uint64_t *grallocConsumerUsage,
+                                    uint64_t *grallocProducerUsage)
+{
+   VK_FROM_HANDLE(tu_device, device, _device);
+
+   VkResult result = vk_common_GetSwapchainGrallocUsage2ANDROID(_device, format, imageUsage, swapchainImageUsage,
+                                                                grallocConsumerUsage, grallocProducerUsage);
+   if (result != VK_SUCCESS)
+      return result;
+
+   if (tu_android_swapchain_ubwc_possible(device, format, imageUsage))
+      *grallocProducerUsage |= GRALLOC1_PRODUCER_USAGE_PRIVATE_0;
+
+   return VK_SUCCESS;
+}
+#endif
+
 static bool
 tu_ahb_external_format_resolve_supported(
    struct tu_device *device,
