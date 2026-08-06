@@ -152,8 +152,13 @@ fdl6_layout_image(struct fdl_layout *layout, const struct fd_dev_info *info,
    layout->linear_fallback_threshold_texels =
       fdl_linear_fallback_threshold_texels(layout, info);
 
-   if (!params->force_ubwc &&
-       layout->width0 < layout->linear_fallback_threshold_texels) {
+   if (params->force_ubwc) {
+      /* An explicit compressed modifier describes UBWC storage for every
+       * level.  Falling back to a linear level would describe a different
+       * memory layout than the producer allocated.
+       */
+      layout->tile_all = true;
+   } else if (layout->width0 < layout->linear_fallback_threshold_texels) {
       layout->ubwc = false;
       /* Linear D/S is not supported by HW. */
       if (!util_format_is_depth_or_stencil(params->format))
