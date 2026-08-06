@@ -110,6 +110,8 @@ constexpr int64_t PLANE_COMPONENT_A = INT64_C(1) << 30;
 
 constexpr char QTI_GET_PLANE_LAYOUT_SYMBOL[] =
    "_ZN7gralloc14GetPlaneLayoutEPN10qtigralloc16private_handle_tEPNSt3__16vectorIN4aidl7android8hardware8graphics6common11PlaneLayoutENS3_9allocatorISA_EEEE";
+constexpr char QTI_IS_UBWC_ENABLED_SYMBOL[] =
+   "_ZN7gralloc13IsUBwcEnabledEim";
 
 using HasMapperInstance = bool (*)();
 using GetFourcc = int32_t (*)(void *, const native_handle_t *, uint32_t *);
@@ -120,6 +122,7 @@ using GetPlaneLayouts = int32_t (*)(void *, const native_handle_t *,
                                    std::vector<PlaneLayout> *);
 using GetQtiPlaneLayouts =
    int32_t (*)(native_handle_t *, std::vector<PlaneLayout> *);
+using IsQtiUbwcEnabled = bool (*)(int, unsigned long);
 
 struct libui_gralloc {
    struct u_gralloc base;
@@ -847,7 +850,8 @@ u_gralloc_qti_metadata_api_create(void)
     * access that an untrusted app's SELinux domain may reject.  Otherwise take
     * our own dlopen reference through the Vulkan/SP-HAL linker namespace.
     */
-   if (!load_function(RTLD_DEFAULT, QTI_GET_PLANE_LAYOUT_SYMBOL,
+   void *symbol_scope = RTLD_DEFAULT;
+   if (!load_function(symbol_scope, QTI_GET_PLANE_LAYOUT_SYMBOL,
                       &gr->get_plane_layouts)) {
       gr->grallocutils =
          dlopen("libgrallocutils.so", RTLD_NOW | RTLD_LOCAL);
@@ -855,6 +859,8 @@ u_gralloc_qti_metadata_api_create(void)
           !load_function(gr->grallocutils, QTI_GET_PLANE_LAYOUT_SYMBOL,
                          &gr->get_plane_layouts))
          goto fail;
+
+      symbol_scope = gr->grallocutils;
    }
 
    gr->fallback = u_gralloc_fallback_create();
@@ -865,7 +871,22 @@ u_gralloc_qti_metadata_api_create(void)
    gr->base.ops.destroy = qti_metadata_gralloc_destroy;
    gr->base.capabilities = U_GRALLOC_CAP_EXPLICIT_YUV_LAYOUT;
 
-   mesa_logi("Using runtime QTI gralloc plane metadata bridge");
+   /* Use the exact exported QTI allocation-policy symbol as a second runtime
+    * ABI gate for private producer bit 0.  Do not call it here: gralloc must
+    * make the final per-buffer decision after Android has combined producer,
+    * consumer, and compositor usages.  Absence of the symbol only disables
+    * the allocation request; the metadata bridge remains usable.
+    */
+   IsQtiUbwcEnabled is_ubwc_enabled;
+   if (load_function(symbol_scope, QTI_IS_UBWC_ENABLED_SYMBOL,
+                     &is_ubwc_enabled)) {
+      gr->base.capabilities |= U_GRALLOC_CAP_QCOM_SWAPCHAIN_UBWC;
+   }
+
+   mesa_logi("Using runtime QTI gralloc plane metadata bridge%s",
+             gr->base.capabilities & U_GRALLOC_CAP_QCOM_SWAPCHAIN_UBWC
+                ? " with swapchain UBWC allocation support"
+                : "");
    return &gr->base;
 
 fail:

@@ -17,6 +17,11 @@
 #include "fdl/fd6_format_table.h"
 #include "tu_device.h"
 #include "tu_image.h"
+#include "util/detect_os.h"
+
+#if DETECT_OS_ANDROID
+#include <hardware/gralloc.h>
+#endif
 
 static bool
 tu6_format_vtx_supported(enum pipe_format format)
@@ -780,6 +785,72 @@ tu_get_image_format_properties(
    return VK_SUCCESS;
 }
 
+/* Android native-buffer v11 gets its producer usage from
+ * vkGetPhysicalDeviceImageFormatProperties2(), rather than either of the
+ * legacy VK_ANDROID_native_buffer gralloc-usage entrypoints.  Keep the UBWC
+ * decision independent of that entrypoint so the v11 and legacy paths cannot
+ * silently diverge.
+ *
+ * The caller must already have validated the base image-format query.  These
+ * additional checks cover constraints which would make tu_image_init() choose
+ * a linear or non-UBWC layout.  In particular, never ask gralloc for a QCOM
+ * modifier which image creation would later have to override.
+ */
+static bool
+tu_android_gralloc_ubwc_possible_for_valid_format(
+   struct tu_physical_device *physical_device,
+   const VkPhysicalDeviceImageFormatInfo2 *info)
+{
+   if (TU_DEBUG(NOUBWC) ||
+       !vk_android_gralloc_supports_qcom_swapchain_ubwc() ||
+       info->tiling != VK_IMAGE_TILING_OPTIMAL ||
+       info->type != VK_IMAGE_TYPE_2D ||
+       !tiling_possible(info->format) ||
+       (info->flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) ||
+       (info->usage &
+        (VK_IMAGE_USAGE_STORAGE_BIT |
+         VK_IMAGE_USAGE_FRAGMENT_DENSITY_MAP_BIT_EXT |
+         VK_IMAGE_USAGE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR)))
+      return false;
+
+   const VkImageCompressionControlEXT *compression_control =
+      vk_find_struct_const(info->pNext, IMAGE_COMPRESSION_CONTROL_EXT);
+   if (compression_control &&
+       (compression_control->flags & VK_IMAGE_COMPRESSION_DISABLED_EXT))
+      return false;
+
+   if (info->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) {
+      const VkImageFormatListCreateInfo *format_list =
+         vk_find_struct_const(info->pNext, IMAGE_FORMAT_LIST_CREATE_INFO);
+
+      /* Android's v11 producer-usage query currently does not forward the
+       * swapchain format list.  Without it, Turnip cannot prove that every
+       * eventual view has a UBWC-compatible interpretation, so fail closed.
+       */
+      if (!tu6_mutable_format_list_ubwc_compatible(physical_device->info,
+                                                   format_list))
+         return false;
+   }
+
+   return ubwc_possible(NULL, info->format, info->type, info->flags,
+                        info->usage, info->usage, physical_device->info,
+                        VK_SAMPLE_COUNT_1_BIT, 1, false);
+}
+
+bool
+tu_android_gralloc_ubwc_possible(
+   struct tu_physical_device *physical_device,
+   const VkPhysicalDeviceImageFormatInfo2 *info)
+{
+   VkImageFormatProperties image_format_properties;
+   VkResult result = tu_get_image_format_properties(
+      physical_device, info, &image_format_properties, NULL);
+
+   return result == VK_SUCCESS &&
+          tu_android_gralloc_ubwc_possible_for_valid_format(physical_device,
+                                                            info);
+}
+
 static VkResult
 tu_get_external_image_format_properties(
    const struct tu_physical_device *physical_device,
@@ -949,6 +1020,18 @@ tu_GetPhysicalDeviceImageFormatProperties2(
          /* AHBs with mipmap usage will ignore this property */
          props->maxMipLevels = 1;
          props->sampleCounts = VK_SAMPLE_COUNT_1_BIT;
+
+#if DETECT_OS_ANDROID
+         VkAndroidHardwareBufferUsageANDROID *ahb_usage =
+            vk_find_struct(base_props->pNext,
+                           ANDROID_HARDWARE_BUFFER_USAGE_ANDROID);
+         if (ahb_usage &&
+             tu_android_gralloc_ubwc_possible_for_valid_format(
+                physical_device, base_info)) {
+            ahb_usage->androidHardwareBufferUsage |=
+               (uint64_t) GRALLOC_USAGE_PRIVATE_0;
+         }
+#endif
       } else {
          result = tu_get_external_image_format_properties(
             physical_device, base_info, external_info->handleType,
