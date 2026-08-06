@@ -900,9 +900,13 @@ kgsl_syncobj_wait(struct tu_device *device,
                                          &device->submit_mutex, &abstime);
          }
          if (ret != 0) {
-            assert(ret == ETIMEDOUT);
             pthread_mutex_unlock(&device->submit_mutex);
-            return VK_TIMEOUT;
+
+            if (ret == ETIMEDOUT)
+               return VK_TIMEOUT;
+
+            return vk_errorf(device, VK_ERROR_UNKNOWN, "waiting for a pending KGSL sync object failed: %s",
+                             strerror(ret));
          }
       }
 
@@ -922,12 +926,14 @@ kgsl_syncobj_wait(struct tu_device *device,
 
    case KGSL_SYNCOBJ_STATE_FD: {
       int ret = sync_wait(s->fd, get_relative_ms(abs_timeout_ns));
-      if (ret) {
-         assert(errno == ETIME);
-         return VK_TIMEOUT;
-      } else {
+      if (ret == 0)
          return VK_SUCCESS;
-      }
+
+      const int error = errno;
+      if (error == ETIME || error == ETIMEDOUT)
+         return VK_TIMEOUT;
+
+      return vk_errorf(device, VK_ERROR_UNKNOWN, "waiting for a KGSL sync file failed: %s", strerror(error));
    }
 
    default:
