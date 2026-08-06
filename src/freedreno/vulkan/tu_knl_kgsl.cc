@@ -18,9 +18,9 @@
 
 #include "util/libsync.h"
 #include "util/os_file.h"
+#include "util/stack_array.h"
 #include "util/timespec.h"
 #include "util/u_debug.h"
-#include "util/u_vector.h"
 #include "vk_util.h"
 
 #include "tu_cmd_buffer.h"
@@ -912,12 +912,8 @@ kgsl_syncobj_wait(struct tu_device *device,
    }
 }
 
-#define kgsl_syncobj_foreach_state(syncobjs, filter) \
-   for (uint32_t i = 0; sync = syncobjs[i], i < count; i++) \
-      if (sync->state == filter)
-
 static VkResult
-kgsl_syncobj_wait_any(struct tu_device* device, struct kgsl_syncobj **syncobjs, uint32_t count, uint64_t abs_timeout_ns)
+kgsl_syncobj_wait_any(struct tu_device *device, struct kgsl_syncobj **syncobjs, uint32_t count, uint64_t abs_timeout_ns)
 {
    if (count == 0)
       return VK_TIMEOUT;
@@ -926,107 +922,145 @@ kgsl_syncobj_wait_any(struct tu_device* device, struct kgsl_syncobj **syncobjs, 
 
    uint32_t num_fds = 0;
    struct tu_queue *queue = NULL;
-   struct kgsl_syncobj *sync = NULL;
-
-   /* Simple case, we already have a signal one */
-   kgsl_syncobj_foreach_state(syncobjs, KGSL_SYNCOBJ_STATE_SIGNALED)
-      return VK_SUCCESS;
-
-   kgsl_syncobj_foreach_state(syncobjs, KGSL_SYNCOBJ_STATE_FD)
-      num_fds++;
-
-   /* If we have TS from different queues we cannot compare them and would
-    * have to convert them into FDs
-    */
+   uint32_t lowest_timestamp = 0;
+   bool first_ts = true;
    bool convert_ts_to_fd = false;
-   kgsl_syncobj_foreach_state(syncobjs, KGSL_SYNCOBJ_STATE_TS) {
-      if (queue != NULL && sync->queue != queue) {
-         convert_ts_to_fd = true;
+
+   for (uint32_t i = 0; i < count; i++) {
+      struct kgsl_syncobj *sync = syncobjs[i];
+
+      switch (sync->state) {
+      case KGSL_SYNCOBJ_STATE_SIGNALED:
+         return VK_SUCCESS;
+
+      case KGSL_SYNCOBJ_STATE_FD:
+         num_fds++;
          break;
+
+      case KGSL_SYNCOBJ_STATE_TS:
+         if (first_ts) {
+            first_ts = false;
+            queue = sync->queue;
+            lowest_timestamp = sync->timestamp;
+         } else if (sync->queue != queue) {
+            /* Timestamps from different queues cannot be compared. */
+            convert_ts_to_fd = true;
+         } else {
+            lowest_timestamp = min_ts(lowest_timestamp, sync->timestamp);
+         }
+         break;
+
+      case KGSL_SYNCOBJ_STATE_UNSIGNALED:
+         break;
+
+      default:
+         UNREACHABLE("invalid syncobj state");
       }
-      queue = sync->queue;
    }
 
    /* If we have no FD nor TS syncobjs then we can return immediately */
    if (num_fds == 0 && queue == NULL)
       return VK_TIMEOUT;
 
+   /* Timestamps on one queue are ordered, so waiting for the oldest one is
+    * sufficient for wait-any without allocating a sync file.
+    */
+   if (!convert_ts_to_fd && num_fds == 0)
+      return wait_timestamp_safe(device->fd, queue->msm_queue_id,
+                                 lowest_timestamp, abs_timeout_ns);
+
+   STACK_ARRAY(struct pollfd, poll_fds, count);
+   if (!poll_fds)
+      return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+
    VkResult result = VK_TIMEOUT;
-
-   struct u_vector poll_fds = { 0 };
-   uint32_t lowest_timestamp = 0;
-
-   if (convert_ts_to_fd || num_fds > 0)
-      u_vector_init(&poll_fds, 4, sizeof(struct pollfd));
+   uint32_t fds_count = 0;
+   uint32_t temporary_fd_count = 0;
+   int ret = -1;
 
    if (convert_ts_to_fd) {
-      kgsl_syncobj_foreach_state(syncobjs, KGSL_SYNCOBJ_STATE_TS) {
-         struct pollfd *poll_fd = (struct pollfd *) u_vector_add(&poll_fds);
-         poll_fd->fd = timestamp_to_fd(sync->queue, sync->timestamp);
-         poll_fd->events = POLLIN;
-      }
-   } else {
-      /* TSs could be merged by finding the one with the lowest timestamp */
-      bool first_ts = true;
-      kgsl_syncobj_foreach_state(syncobjs, KGSL_SYNCOBJ_STATE_TS) {
-         if (first_ts || timestamp_cmp(sync->timestamp, lowest_timestamp)) {
-            first_ts = false;
-            lowest_timestamp = sync->timestamp;
+      for (uint32_t i = 0; i < count; i++) {
+         struct kgsl_syncobj *sync = syncobjs[i];
+         if (sync->state != KGSL_SYNCOBJ_STATE_TS)
+            continue;
+
+         int fd = timestamp_to_fd(sync->queue, sync->timestamp);
+         if (fd < 0) {
+            const int error = errno;
+            result =
+               vk_errorf(device, VK_ERROR_UNKNOWN, "creating a KGSL timestamp sync file failed: %s", strerror(error));
+            goto out;
          }
+
+         poll_fds[fds_count++] = (struct pollfd) {
+            .fd = fd,
+            .events = POLLIN,
+         };
+         temporary_fd_count++;
+      }
+   } else if (queue != NULL) {
+      int fd = timestamp_to_fd(queue, lowest_timestamp);
+      if (fd < 0) {
+         const int error = errno;
+         result =
+            vk_errorf(device, VK_ERROR_UNKNOWN, "creating a KGSL timestamp sync file failed: %s", strerror(error));
+         goto out;
       }
 
-      if (num_fds) {
-         struct pollfd *poll_fd = (struct pollfd *) u_vector_add(&poll_fds);
-         poll_fd->fd = timestamp_to_fd(queue, lowest_timestamp);
-         poll_fd->events = POLLIN;
-      }
+      poll_fds[fds_count++] = (struct pollfd) {
+         .fd = fd,
+         .events = POLLIN,
+      };
+      temporary_fd_count++;
    }
 
    if (num_fds) {
-      kgsl_syncobj_foreach_state(syncobjs, KGSL_SYNCOBJ_STATE_FD) {
-         struct pollfd *poll_fd = (struct pollfd *) u_vector_add(&poll_fds);
-         poll_fd->fd = sync->fd;
-         poll_fd->events = POLLIN;
+      for (uint32_t i = 0; i < count; i++) {
+         struct kgsl_syncobj *sync = syncobjs[i];
+         if (sync->state != KGSL_SYNCOBJ_STATE_FD)
+            continue;
+
+         poll_fds[fds_count++] = (struct pollfd) {
+            .fd = sync->fd,
+            .events = POLLIN,
+         };
       }
    }
 
-   if (u_vector_length(&poll_fds) == 0) {
-      result = wait_timestamp_safe(device->fd, queue->msm_queue_id,
-                                   lowest_timestamp, MIN2(abs_timeout_ns, INT64_MAX));
-   } else {
-      int ret, i;
-
-      struct pollfd *fds = (struct pollfd *) poll_fds.data;
-      uint32_t fds_count = u_vector_length(&poll_fds);
-      do {
-         ret = poll(fds, fds_count, get_relative_ms(abs_timeout_ns));
-         if (ret > 0) {
-            for (i = 0; i < fds_count; i++) {
-               if (fds[i].revents & (POLLERR | POLLNVAL)) {
-                  errno = EINVAL;
-                  ret = -1;
-                  break;
-               }
+   do {
+      ret = poll(poll_fds, fds_count, get_relative_ms(abs_timeout_ns));
+      if (ret > 0) {
+         bool signaled = false;
+         for (uint32_t i = 0; i < fds_count; i++) {
+            if (poll_fds[i].revents & (POLLERR | POLLNVAL)) {
+               errno = EINVAL;
+               ret = -1;
+               break;
             }
-            break;
-         } else if (ret == 0) {
-            errno = ETIME;
-            break;
+            signaled = signaled || (poll_fds[i].revents & POLLIN);
          }
-      } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
 
-      for (uint32_t i = 0; i < fds_count - num_fds; i++)
-         close(fds[i].fd);
-
-      if (ret != 0) {
-         assert(errno == ETIME);
-         result = VK_TIMEOUT;
-      } else {
-         result = VK_SUCCESS;
+         if (ret > 0 && !signaled) {
+            errno = EIO;
+            ret = -1;
+         }
+         break;
       }
+   } while (ret == -1 && (errno == EINTR || errno == EAGAIN));
+
+   if (ret > 0) {
+      result = VK_SUCCESS;
+   } else if (ret == 0) {
+      result = VK_TIMEOUT;
+   } else {
+      const int error = errno;
+      result = vk_errorf(device, VK_ERROR_UNKNOWN, "polling KGSL sync files failed: %s", strerror(error));
    }
 
-   u_vector_finish(&poll_fds);
+out:
+   for (uint32_t i = 0; i < temporary_fd_count; i++)
+      close(poll_fds[i].fd);
+   STACK_ARRAY_FINISH(poll_fds);
    return result;
 }
 
