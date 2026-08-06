@@ -5,6 +5,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <linux/dma-heap.h>
 #include <poll.h>
 #include <stdint.h>
@@ -795,43 +796,67 @@ get_relative_ms(uint64_t abs_timeout_ns)
        */
       return -1;
 
-   uint64_t cur_time_ms = os_time_get_nano() / 1000000;
-   uint64_t abs_timeout_ms = abs_timeout_ns / 1000000;
-   if (abs_timeout_ms <= cur_time_ms)
+   const uint64_t now_ns = os_time_get_nano();
+   if (abs_timeout_ns <= now_ns)
       return 0;
 
-   return abs_timeout_ms - cur_time_ms;
+   const uint64_t relative_ns = abs_timeout_ns - now_ns;
+   const uint64_t relative_ms = relative_ns / 1000000 + (relative_ns % 1000000 != 0);
+
+   return MIN2(relative_ms, (uint64_t) INT_MAX);
+}
+
+static VkResult
+get_timestamp_status(struct tu_device *device, unsigned int context_id, unsigned int timestamp)
+{
+   struct kgsl_cmdstream_readtimestamp_ctxtid read = {
+      .context_id = context_id,
+      .type = KGSL_TIMESTAMP_RETIRED,
+   };
+
+   if (safe_ioctl(device->fd, IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID, &read)) {
+      const int error = errno;
+      return vk_errorf(device, VK_ERROR_UNKNOWN, "IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID failed: %s",
+                       strerror(error));
+   }
+
+   return timestamp_cmp(read.timestamp, timestamp) ? VK_SUCCESS : VK_TIMEOUT;
 }
 
 /* safe_ioctl is not enough as restarted waits would not adjust the timeout
  * which could lead to waiting substantially longer than requested
  */
 static VkResult
-wait_timestamp_safe(int fd,
-                    unsigned int context_id,
-                    unsigned int timestamp,
-                    uint64_t abs_timeout_ns)
+wait_timestamp_safe(struct tu_device *device, unsigned int context_id, unsigned int timestamp, uint64_t abs_timeout_ns)
 {
-   struct kgsl_device_waittimestamp_ctxtid wait = {
-      .context_id = context_id,
-      .timestamp = timestamp,
-      .timeout = get_relative_ms(abs_timeout_ns),
-   };
-
    while (true) {
-      int ret = ioctl(fd, IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID, &wait);
+      const int timeout_ms = get_relative_ms(abs_timeout_ns);
+
+      /* KGSL treats a zero timeout as an infinite wait, while Vulkan uses a
+       * zero absolute timeout for a nonblocking status query.  Read the
+       * retired timestamp instead of entering the wait ioctl in that case.
+       */
+      if (timeout_ms == 0)
+         return get_timestamp_status(device, context_id, timestamp);
+
+      struct kgsl_device_waittimestamp_ctxtid wait = {
+         .context_id = context_id,
+         .timestamp = timestamp,
+         .timeout = (uint32_t) timeout_ms,
+      };
+
+      int ret = ioctl(device->fd, IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID, &wait);
 
       if (ret == -1 && (errno == EINTR || errno == EAGAIN)) {
-         int timeout_ms = get_relative_ms(abs_timeout_ns);
-
-         /* update timeout to consider time that has passed since the start */
-         if (timeout_ms == 0)
+         /* Recompute the remaining timeout before retrying. */
+         continue;
+      } else if (ret == -1) {
+         if (errno == ETIMEDOUT || errno == ETIME)
             return VK_TIMEOUT;
 
-         wait.timeout = timeout_ms;
-      } else if (ret == -1) {
-         assert(errno == ETIMEDOUT);
-         return VK_TIMEOUT;
+         const int error = errno;
+         return vk_errorf(device, VK_ERROR_UNKNOWN, "IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID failed: %s",
+                          strerror(error));
       } else {
          return VK_SUCCESS;
       }
@@ -842,10 +867,9 @@ static VkResult
 kgsl_queue_wait_fence(struct tu_queue *queue, uint32_t fence,
                       uint64_t timeout_ns)
 {
-   uint64_t abs_timeout_ns = os_time_get_nano() + timeout_ns;
+   const uint64_t abs_timeout_ns = (uint64_t) os_time_get_absolute_timeout(timeout_ns);
 
-   return wait_timestamp_safe(queue->device->fd, queue->msm_queue_id,
-                              fence, abs_timeout_ns);
+   return wait_timestamp_safe(queue->device, queue->msm_queue_id, fence, abs_timeout_ns);
 }
 
 static VkResult
@@ -893,8 +917,7 @@ kgsl_syncobj_wait(struct tu_device *device,
       return VK_TIMEOUT;
 
    case KGSL_SYNCOBJ_STATE_TS: {
-      return wait_timestamp_safe(device->fd, s->queue->msm_queue_id,
-                                 s->timestamp, abs_timeout_ns);
+      return wait_timestamp_safe(device, s->queue->msm_queue_id, s->timestamp, abs_timeout_ns);
    }
 
    case KGSL_SYNCOBJ_STATE_FD: {
@@ -966,8 +989,7 @@ kgsl_syncobj_wait_any(struct tu_device *device, struct kgsl_syncobj **syncobjs, 
     * sufficient for wait-any without allocating a sync file.
     */
    if (!convert_ts_to_fd && num_fds == 0)
-      return wait_timestamp_safe(device->fd, queue->msm_queue_id,
-                                 lowest_timestamp, abs_timeout_ns);
+      return wait_timestamp_safe(device, queue->msm_queue_id, lowest_timestamp, abs_timeout_ns);
 
    STACK_ARRAY(struct pollfd, poll_fds, count);
    if (!poll_fds)
