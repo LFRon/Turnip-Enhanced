@@ -32,6 +32,7 @@ fdl_test_layout(const struct testcase *testcase, const struct fd_dev_id *dev_id)
       .array_size = MAX2(testcase->array_size, 1),
       .is_3d = testcase->is_3d,
       .ubwc = testcase->layout.ubwc,
+      .force_ubwc = testcase->force_ubwc,
       .tile_mode = testcase->layout.tile_mode,
    };
 
@@ -41,6 +42,13 @@ fdl_test_layout(const struct testcase *testcase, const struct fd_dev_id *dev_id)
    } else {
       assert(fd_dev_gen(dev_id) >= 5);
       fdl5_layout_image(&layout, &params);
+   }
+
+   if (testcase->layout.tile_all && !layout.tile_all) {
+      fprintf(stderr, "%s %dx%dx%d@%dx: expected all levels to be tiled\n",
+              util_format_short_name(testcase->format), layout.width0,
+              layout.height0, layout.depth0, layout.nr_samples);
+      ok = false;
    }
 
    /* fdl lays out UBWC data before the color data, while all we have
@@ -98,6 +106,16 @@ fdl_test_layout(const struct testcase *testcase, const struct fd_dev_id *dev_id)
                  layout.height0, layout.depth0, layout.nr_samples, l,
                  fdl_ubwc_pitch(&layout, l),
                  testcase->layout.ubwc_slices[l].pitch);
+         ok = false;
+      }
+      if (testcase->layout.ubwc_slices[l].size0 &&
+          layout.ubwc_slices[l].size0 !=
+             testcase->layout.ubwc_slices[l].size0) {
+         fprintf(stderr, "%s %dx%dx%d@%dx lvl%d: UBWC slice size %d != %d\n",
+                 util_format_short_name(testcase->format), layout.width0,
+                 layout.height0, layout.depth0, layout.nr_samples, l,
+                 layout.ubwc_slices[l].size0,
+                 testcase->layout.ubwc_slices[l].size0);
          ok = false;
       }
    }
