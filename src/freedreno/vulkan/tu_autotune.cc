@@ -1013,9 +1013,53 @@ struct tu_autotune::rp_history {
    /** Bandwidth Estimation Algorithm **/
    struct bandwidth_algo {
     private:
+      static constexpr uint32_t GMEM_FIXED_COST_NUMERATOR = 11;
+      static constexpr uint32_t COST_DENOMINATOR = 10;
+
       exponential_average<uint32_t> mean_samples_passed;
 
     public:
+      static uint64_t get_pass_pixel_count(const struct tu_cmd_state *cmd_state,
+                                           const struct tu_framebuffer *framebuffer)
+      {
+         uint64_t pass_pixel_count = 0;
+         if (cmd_state->per_layer_render_area) {
+            for (unsigned i = 0; i < cmd_state->pass->num_views; i++) {
+               const VkExtent2D &extent = cmd_state->render_areas[i].extent;
+               pass_pixel_count += (uint64_t) extent.width * extent.height;
+            }
+         } else {
+            const VkExtent2D &extent = cmd_state->render_areas[0].extent;
+            pass_pixel_count =
+               (uint64_t) extent.width * extent.height * MAX2(cmd_state->pass->num_views, framebuffer->layers);
+         }
+
+         return pass_pixel_count;
+      }
+
+      static bool render_area_is_large_for_binning(const struct tu_cmd_state *cmd_state,
+                                                   const struct tu_framebuffer *framebuffer)
+      {
+         const VkExtent2D &tile = cmd_state->tiling->tile0;
+         const uint64_t tile_pixel_count = (uint64_t) tile.width * tile.height;
+
+         /* Match the existing binning_useful threshold while using the actual
+          * render areas instead of only the framebuffer dimensions.
+          */
+         return get_pass_pixel_count(cmd_state, framebuffer) > tile_pixel_count * 2;
+      }
+
+      static constexpr bool fixed_costs_prefer_gmem(const struct tu_render_pass *pass)
+      {
+         /* Draw bandwidth is charged fully to SYSMEM but only at 1/10th of
+          * its cost to GMEM below.  Therefore, if attachment operations alone
+          * prefer GMEM, adding any amount of draw traffic cannot reverse the
+          * decision.
+          */
+         return (uint64_t) pass->sysmem_bandwidth_per_pixel * COST_DENOMINATOR >
+                (uint64_t) pass->gmem_bandwidth_per_pixel * GMEM_FIXED_COST_NUMERATOR;
+      }
+
       void update(uint32_t samples)
       {
          mean_samples_passed.add(samples);
@@ -1027,17 +1071,7 @@ struct tu_autotune::rp_history {
                                    const struct tu_framebuffer *framebuffer,
                                    const struct tu_render_pass_state *rp_state)
       {
-         uint32_t pass_pixel_count = 0;
-         if (cmd_state->per_layer_render_area) {
-            for (unsigned i = 0; i < cmd_state->pass->num_views; i++) {
-               const VkExtent2D &extent = cmd_state->render_areas[i].extent;
-               pass_pixel_count += extent.width * extent.height;
-            }
-         } else {
-            const VkExtent2D &extent = cmd_state->render_areas[0].extent;
-            pass_pixel_count =
-               extent.width * extent.height * MAX2(cmd_state->pass->num_views, cmd_state->framebuffer->layers);
-         }
+         const uint64_t pass_pixel_count = get_pass_pixel_count(cmd_state, framebuffer);
 
          uint64_t sysmem_bandwidth = (uint64_t) pass->sysmem_bandwidth_per_pixel * pass_pixel_count;
          uint64_t gmem_bandwidth = (uint64_t) pass->gmem_bandwidth_per_pixel * pass_pixel_count;
@@ -1061,7 +1095,7 @@ struct tu_autotune::rp_history {
          /* Drawcalls access GMEM in GMEM rendering, but we do not want to ignore them completely.  The state changes
           * between tiles also have an overhead.  The magic numbers of 11 and 10 are randomly chosen.
           */
-         gmem_bandwidth = (gmem_bandwidth * 11 + total_draw_call_bandwidth) / 10;
+         gmem_bandwidth = (gmem_bandwidth * GMEM_FIXED_COST_NUMERATOR + total_draw_call_bandwidth) / COST_DENOMINATOR;
 
          bool select_sysmem = sysmem_bandwidth <= gmem_bandwidth;
          render_mode mode = select_sysmem ? render_mode::SYSMEM : render_mode::GMEM;
@@ -1843,20 +1877,36 @@ tu_autotune::get_optimal_mode(struct tu_cmd_buffer *cmd_buffer, rp_ctx_t *rp_ctx
    if (key_opt && config.test(mod_flag::PREEMPT_OPTIMIZE))
       latency_info = get_rp_latency_info(key_opt->hash, true);
 
+   if (!enabled || simultaneous_use)
+      return default_mode;
+
    /* These smaller RPs with few draws are too difficult to create a balanced hash for that can independently identify
-    * them while not being so unique to not properly identify them across CBs. They're generally insigificant outside of
-    * a few edge cases such as during deferred rendering G-buffer passes, as we don't have a good way to deal with those
-    * edge cases yet, we just disable the autotuner for small RPs entirely for now unless TUNE_SMALL is specified.
+    * them while not being so unique to not properly identify them across CBs. They're generally insignificant outside
+    * of a few edge cases such as during deferred rendering G-buffer passes, so we disable the autotuner for small RPs
+    * unless TUNE_SMALL is specified.
+    *
+    * Do not apply that fallback when static attachment bandwidth alone already guarantees that the bandwidth algorithm
+    * will select GMEM and the RP has enough tiles for binning to be useful. This covers bandwidth-heavy clear/resolve
+    * passes without creating a bandwidth history entry or GPU metric allocation. Outside preemption tracking it also
+    * avoids generating an RP hash. GMEM loads naturally increase the GMEM side of the same cost model.
     *
     * Note: If we detect a small RP to be latency sensitive, we enable the autotuner for it anyway.
     */
-   bool ignore_small_rp = !config.test(mod_flag::TUNE_SMALL) && rp_state->drawcall_count < 5 &&
-                          (!latency_info || !latency_info->seen_latency_spike);
+   const bool small_rp = rp_state->drawcall_count < 5;
+   const bool track_small_rp_latency = latency_info && latency_info->seen_latency_spike;
+   const bool statically_select_gmem =
+      small_rp && !config.test(mod_flag::TUNE_SMALL) && !track_small_rp_latency &&
+      config.is_enabled(algorithm::BANDWIDTH) && cmd_state->tiling->vsc.binning_useful &&
+      rp_history::bandwidth_algo::render_area_is_large_for_binning(cmd_state, framebuffer) &&
+      rp_history::bandwidth_algo::fixed_costs_prefer_gmem(pass);
 
-   if (!enabled)
-      return forced("Autotuner is disabled", default_mode);
-   if (simultaneous_use)
-      return forced("VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT", default_mode);
+   if (statically_select_gmem) {
+      at_log_base("small RP fixed attachment costs prefer GMEM");
+      return render_mode::GMEM;
+   }
+
+   bool ignore_small_rp = !config.test(mod_flag::TUNE_SMALL) && small_rp && !track_small_rp_latency;
+
    if (ignore_small_rp)
       return forced("Too few draws to tune", default_mode);
 
