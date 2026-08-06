@@ -1257,6 +1257,33 @@ static const struct testcase
          },
       };
 
+static const struct testcase testcases_a740[] = {
+   /* Explicit QCOM_COMPRESSED imports must not use the linear fallback
+    * for a small level 0.  This is the layout of a 15x4 RGBA AHB: one
+    * 4K UBWC metadata page followed by one 4K data page.
+    */
+   {
+      .format = PIPE_FORMAT_R8G8B8A8_UNORM,
+      .force_ubwc = true,
+      .layout =
+         {
+            .tile_mode = TILE6_3,
+            .tile_all = true,
+            .ubwc = true,
+            .width0 = 15,
+            .height0 = 4,
+            .slices =
+               {
+                  {.offset = 4096, .pitch = 256, .size0 = 4096},
+               },
+            .ubwc_slices =
+               {
+                  {.offset = 0, .pitch = 64, .size0 = 4096},
+               },
+         },
+   },
+};
+
 int
 main(int argc, char **argv)
 {
@@ -1275,6 +1302,14 @@ main(int argc, char **argv)
    };
    for (int i = 0; i < ARRAY_SIZE(testcases_a660); i++) {
       if (!fdl_test_layout(&testcases_a660[i], &a660_dev_id))
+         ret = 1;
+   }
+
+   struct fd_dev_id a740_dev_id = {
+      .gpu_id = 740,
+   };
+   for (int i = 0; i < ARRAY_SIZE(testcases_a740); i++) {
+      if (!fdl_test_layout(&testcases_a740[i], &a740_dev_id))
          ret = 1;
    }
 
