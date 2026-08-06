@@ -17,6 +17,8 @@
 
 #include "common/fd6_hw.h"
 
+struct tu_physical_device;
+
 struct tu_native_format
 {
    enum a6xx_format fmt : 8;
@@ -31,6 +33,10 @@ struct tu_native_format tu6_format_texture(enum pipe_format format, enum a6xx_ti
 
 bool tu6_mutable_format_list_ubwc_compatible(const struct fd_dev_info *info,
                                              const VkImageFormatListCreateInfo *fmt_list);
+
+bool tu_android_gralloc_ubwc_possible(
+   struct tu_physical_device *physical_device,
+   const VkPhysicalDeviceImageFormatInfo2 *info);
 
 bool tu_external_format_resolve_supported(const struct fd_dev_info *info,
                                           VkFormat format,
