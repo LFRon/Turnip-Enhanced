@@ -98,7 +98,7 @@ struct fdl_image_params {
    bool ubwc;
 
    /**
-    * Force UBWC, even when below the minimum width.
+    * Force UBWC at every level, disabling all linear fallback.
     */
    bool force_ubwc;
 
