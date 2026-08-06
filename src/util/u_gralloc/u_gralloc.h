@@ -89,6 +89,13 @@ enum u_gralloc_capability {
     * format or a private native-handle layout.
     */
    U_GRALLOC_CAP_EXPLICIT_YUV_LAYOUT = 1u << 0,
+
+   /* The backend is a verified QTI gralloc ABI where producer private bit 0
+    * requests a UBWC allocation.  This is intentionally narrower than merely
+    * recognizing QCOM-compressed buffer metadata: the private usage bit must
+    * never be sent to an unrelated Android gralloc implementation.
+    */
+   U_GRALLOC_CAP_QCOM_SWAPCHAIN_UBWC = 1u << 1,
 };
 
 struct u_gralloc *u_gralloc_create(enum u_gralloc_type type);
