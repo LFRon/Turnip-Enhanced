@@ -72,7 +72,7 @@ kgsl_submitqueue_new(struct tu_device *dev, struct tu_queue *queue)
    const uint32_t priority = kgsl_context_priorities[queue->priority];
    struct kgsl_drawctxt_create req = {
       .flags = KGSL_CONTEXT_SAVE_GMEM | KGSL_CONTEXT_NO_GMEM_ALLOC | KGSL_CONTEXT_PREAMBLE |
-               (priority << KGSL_CONTEXT_PRIORITY_SHIFT),
+               (KGSL_CONTEXT_TYPE_VK << KGSL_CONTEXT_TYPE_SHIFT) | (priority << KGSL_CONTEXT_PRIORITY_SHIFT),
    };
 
    int ret = safe_ioctl(dev->physical_device->local_fd, IOCTL_KGSL_DRAWCTXT_CREATE, &req);
