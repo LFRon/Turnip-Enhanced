@@ -759,7 +759,7 @@ kgsl_syncobj_dup(struct kgsl_syncobj *s)
 static int
 timestamp_to_fd(struct tu_queue *queue, uint32_t timestamp)
 {
-   int fd;
+   int fd = -1;
    struct kgsl_timestamp_event event = {
       .type = KGSL_TIMESTAMP_EVENT_FENCE,
       .timestamp = timestamp,
@@ -771,6 +771,11 @@ timestamp_to_fd(struct tu_queue *queue, uint32_t timestamp)
    int ret = safe_ioctl(queue->device->fd, IOCTL_KGSL_TIMESTAMP_EVENT, &event);
    if (ret)
       return -1;
+
+   if (unlikely(fd < 0)) {
+      errno = EIO;
+      return -1;
+   }
 
    return fd;
 }
@@ -1131,6 +1136,11 @@ kgsl_syncobj_export(struct kgsl_syncobj *s, int *pFd)
 
    case KGSL_SYNCOBJ_STATE_TS:
       *pFd = kgsl_syncobj_ts_to_fd(s);
+      if (unlikely(*pFd < 0)) {
+         const int error = errno;
+         return vk_errorf(s->queue->device, VK_ERROR_UNKNOWN, "creating a KGSL timestamp sync file failed: %s",
+                          strerror(error));
+      }
       return VK_SUCCESS;
 
    default:
@@ -1537,6 +1547,18 @@ kgsl_queue_submit(struct tu_queue *queue, void *_submit,
          kgsl_syncobj_destroy(&wait_sync);
          kgsl_syncobj_destroy(&last_submit_sync);
          return vk_device_set_lost(&queue->device->vk, "refusing to submit an unsignaled semaphore wait to KGSL");
+      }
+
+      /* Vulkan represents an already-signaled sync-file payload as fd -1,
+       * while Android EGL native-fence consumers require a real sync_file.
+       * Keep the no-op submission tied to this KGSL context so export can
+       * lazily materialize an immediately-signaled fence.  Timestamp zero is
+       * retired before the first submission on a KGSL context.
+       */
+      if (wait_sync.state == KGSL_SYNCOBJ_STATE_SIGNALED) {
+         wait_sync.state = KGSL_SYNCOBJ_STATE_TS;
+         wait_sync.queue = queue;
+         wait_sync.timestamp = 0;
       }
 
       if (signal_count == 1) {
