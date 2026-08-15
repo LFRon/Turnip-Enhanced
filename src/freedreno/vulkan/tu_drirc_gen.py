@@ -103,6 +103,11 @@ def declare_options():
           "Provide a second queue for applications that require it, like the Android framework",
           c_name="emulate_second_queue"),
 
+        B("tu_tencent_anb_acquire_semaphore_replay", False,
+          "Replay Tencent's AHB acquire semaphore payload once to work around "
+          "Tencent's invalid duplicate binary semaphore wait",
+          c_name="tencent_anb_acquire_semaphore_replay"),
+
         I("tu_override_graphics_shader_version", 0, 0, 255,
           "Override graphics shader version to force recompilation when TU_BUILD_ID_OVERRIDE is enabled.",
           c_name="override_graphics_shader_version"),
