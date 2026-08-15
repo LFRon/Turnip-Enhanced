@@ -10,6 +10,7 @@
 #include "tu_sampler.h"
 
 #include "tu_device.h"
+#include "tu_formats.h"
 #include "tu_util.h"
 
 template <chip CHIP>
@@ -180,6 +181,12 @@ tu_CreateSampler(VkDevice _device,
          sampler->descriptor[2] |= A6XX_TEX_SAMP_2_CHROMA_LINEAR;
       }
    }
+
+   sampler->plane_count =
+      sampler->vk.ycbcr_conversion &&
+      tu_format_uses_software_ycbcr(
+         sampler->vk.ycbcr_conversion->state.format) ?
+         TU_MAX_PLANE_COUNT : 1;
 
    /* TODO:
     * A6XX_TEX_SAMP_1_MIPFILTER_LINEAR_FAR disables mipmapping, but vk has no NONE mipfilter?

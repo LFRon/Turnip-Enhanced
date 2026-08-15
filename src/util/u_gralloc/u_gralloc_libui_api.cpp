@@ -27,6 +27,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <system/graphics.h>
 
 #include <string>
 #include <vector>
@@ -110,6 +111,8 @@ constexpr int64_t PLANE_COMPONENT_A = INT64_C(1) << 30;
 
 constexpr char QTI_GET_PLANE_LAYOUT_SYMBOL[] =
    "_ZN7gralloc14GetPlaneLayoutEPN10qtigralloc16private_handle_tEPNSt3__16vectorIN4aidl7android8hardware8graphics6common11PlaneLayoutENS3_9allocatorISA_EEEE";
+constexpr char QTI_GET_COLOR_SPACE_SYMBOL[] =
+   "_ZN7gralloc25GetColorSpaceFromMetadataEPN10qtigralloc16private_handle_tEPi";
 constexpr char QTI_IS_UBWC_ENABLED_SYMBOL[] =
    "_ZN7gralloc13IsUBwcEnabledEim";
 
@@ -122,6 +125,7 @@ using GetPlaneLayouts = int32_t (*)(void *, const native_handle_t *,
                                    std::vector<PlaneLayout> *);
 using GetQtiPlaneLayouts =
    int32_t (*)(native_handle_t *, std::vector<PlaneLayout> *);
+using GetQtiColorSpace = void (*)(native_handle_t *, int *);
 using IsQtiUbwcEnabled = bool (*)(int, unsigned long);
 
 struct libui_gralloc {
@@ -139,6 +143,7 @@ struct qti_metadata_gralloc {
    struct u_gralloc base;
    void *grallocutils;
    GetQtiPlaneLayouts get_plane_layouts;
+   GetQtiColorSpace get_color_space;
    struct u_gralloc *fallback;
 };
 
@@ -330,6 +335,97 @@ static bool
 is_data_plane(const PlaneLayout &layout)
 {
    return layout.sampleIncrementInBits > 0 && layout.strideInBytes > 0;
+}
+
+static bool
+is_yv12_plane(const PlaneLayout &layout, int64_t component_type,
+              int64_t subsampling)
+{
+   if (layout.components.size() != 1 ||
+       layout.sampleIncrementInBits != 8 ||
+       layout.horizontalSubsampling != subsampling ||
+       layout.verticalSubsampling != subsampling ||
+       layout.offsetInBytes < 0 || layout.strideInBytes <= 0 ||
+       layout.widthInSamples <= 0 || layout.heightInSamples <= 0 ||
+       layout.totalSizeInBytes <= 0)
+      return false;
+
+   const PlaneLayoutComponent &component = layout.components[0];
+   return is_standard_component(component, component_type) &&
+          component.offsetInBits == 0 && component.sizeInBits == 8;
+}
+
+static bool
+normalize_qti_yv12_layouts(const std::vector<PlaneLayout> &layouts,
+                           int32_t hal_format,
+                           std::vector<PlaneLayout> *normalized)
+{
+   if (hal_format != HAL_PIXEL_FORMAT_YV12 || layouts.size() != 3)
+      return false;
+
+   const PlaneLayout *y = nullptr;
+   const PlaneLayout *cb = nullptr;
+   const PlaneLayout *cr = nullptr;
+
+   for (const PlaneLayout &layout : layouts) {
+      const PlaneLayout **plane = nullptr;
+      if (is_yv12_plane(layout, PLANE_COMPONENT_Y, 1))
+         plane = &y;
+      else if (is_yv12_plane(layout, PLANE_COMPONENT_CB, 2))
+         plane = &cb;
+      else if (is_yv12_plane(layout, PLANE_COMPONENT_CR, 2))
+         plane = &cr;
+      else
+         return false;
+
+      if (*plane)
+         return false;
+      *plane = &layout;
+   }
+
+   if (!y || !cb || !cr || (y->widthInSamples & 1) ||
+       (y->heightInSamples & 1) ||
+       cb->widthInSamples != y->widthInSamples / 2 ||
+       cr->widthInSamples != cb->widthInSamples ||
+       cb->heightInSamples != y->heightInSamples / 2 ||
+       cr->heightInSamples != cb->heightInSamples ||
+       y->strideInBytes < y->widthInSamples ||
+       cb->strideInBytes < cb->widthInSamples ||
+       cr->strideInBytes != cb->strideInBytes)
+      return false;
+
+   const uint64_t y_stride = static_cast<uint64_t>(y->strideInBytes);
+   const uint64_t y_height = static_cast<uint64_t>(y->heightInSamples);
+   const uint64_t chroma_stride = (y_stride / 2 + 15) & ~UINT64_C(15);
+   const uint64_t chroma_height = y_height / 2;
+
+   if ((y_stride & 15) != 0 ||
+       static_cast<uint64_t>(cb->strideInBytes) != chroma_stride ||
+       y_height > UINT64_MAX / y_stride ||
+       chroma_height > UINT64_MAX / chroma_stride)
+      return false;
+
+   const uint64_t y_size = y_stride * y_height;
+   const uint64_t chroma_size = chroma_stride * chroma_height;
+   if (y_size > UINT64_MAX - chroma_size ||
+       static_cast<uint64_t>(y->totalSizeInBytes) != y_size ||
+       static_cast<uint64_t>(cb->totalSizeInBytes) != chroma_size ||
+       static_cast<uint64_t>(cr->totalSizeInBytes) != chroma_size ||
+       y->offsetInBytes != 0 ||
+       static_cast<uint64_t>(cr->offsetInBytes) != y_size ||
+       static_cast<uint64_t>(cb->offsetInBytes) != y_size + chroma_size)
+      return false;
+
+   /* QTI reports components in logical Y-Cb-Cr order even though YV12 is
+    * stored as Y-Cr-Cb.  u_gralloc uses DRM plane order; vk_android will
+    * swap the chroma layouts back to Vulkan's Y-Cb-Cr order later.
+    */
+   normalized->clear();
+   normalized->reserve(3);
+   normalized->push_back(*y);
+   normalized->push_back(*cr);
+   normalized->push_back(*cb);
+   return true;
 }
 
 static bool
@@ -685,6 +781,17 @@ qti_get_buffer_basic_info(struct u_gralloc *gralloc,
    out->alloc_size = allocation_size;
 
    std::vector<PlaneLayout> normalized;
+   if (normalize_qti_yv12_layouts(layouts, hnd->hal_format, &normalized)) {
+      out->drm_fourcc = DRM_FORMAT_YVU420;
+      out->modifier = DRM_FORMAT_MOD_LINEAR;
+
+      const int ret = copy_linear_layout(hnd->handle, normalized,
+                                         allocation_size, out);
+      if (ret)
+         mesa_logw_once("Unsupported or inconsistent QTI YV12 plane layout");
+      return ret;
+   }
+
    bool compressed = false;
    if (normalize_qti_nv12_layouts(layouts, hnd->hal_format, &normalized,
                                   &compressed)) {
@@ -724,6 +831,65 @@ qti_get_buffer_basic_info(struct u_gralloc *gralloc,
    mesa_logw_once("Unsupported QTI private YUV plane component layout "
                   "(HAL format 0x%x)", hnd->hal_format);
    return -ENOTSUP;
+}
+
+static int
+qti_get_buffer_color_info(struct u_gralloc *gralloc,
+                          struct u_gralloc_buffer_handle *hnd,
+                          struct u_gralloc_buffer_color_info *out)
+{
+   qti_metadata_gralloc *gr =
+      reinterpret_cast<qti_metadata_gralloc *>(gralloc);
+
+   if (!hnd || !qti_handle_is_compatible(hnd->handle) ||
+       !gr->get_color_space)
+      return -EINVAL;
+
+   /* Values are the stable QTI HAL_CSC_* ABI used by
+    * GetColorSpaceFromMetadata().  Newer stacks add 709 full-range as 5.
+    */
+   constexpr int QTI_CSC_ITU_R_601 = 0;
+   constexpr int QTI_CSC_ITU_R_601_FR = 1;
+   constexpr int QTI_CSC_ITU_R_709 = 2;
+   constexpr int QTI_CSC_ITU_R_2020 = 3;
+   constexpr int QTI_CSC_ITU_R_2020_FR = 4;
+   constexpr int QTI_CSC_ITU_R_709_FR = 5;
+
+   int color_space = QTI_CSC_ITU_R_601;
+   gr->get_color_space(const_cast<native_handle_t *>(hnd->handle),
+                       &color_space);
+
+   *out = {
+      .yuv_color_space = __DRI_YUV_COLOR_SPACE_ITU_REC601,
+      .sample_range = __DRI_YUV_NARROW_RANGE,
+      .horizontal_siting = __DRI_YUV_CHROMA_SITING_0_5,
+      .vertical_siting = __DRI_YUV_CHROMA_SITING_0_5,
+   };
+
+   switch (color_space) {
+   case QTI_CSC_ITU_R_601_FR:
+      out->sample_range = __DRI_YUV_FULL_RANGE;
+      break;
+   case QTI_CSC_ITU_R_709:
+      out->yuv_color_space = __DRI_YUV_COLOR_SPACE_ITU_REC709;
+      break;
+   case QTI_CSC_ITU_R_709_FR:
+      out->yuv_color_space = __DRI_YUV_COLOR_SPACE_ITU_REC709;
+      out->sample_range = __DRI_YUV_FULL_RANGE;
+      break;
+   case QTI_CSC_ITU_R_2020:
+      out->yuv_color_space = __DRI_YUV_COLOR_SPACE_ITU_REC2020;
+      break;
+   case QTI_CSC_ITU_R_2020_FR:
+      out->yuv_color_space = __DRI_YUV_COLOR_SPACE_ITU_REC2020;
+      out->sample_range = __DRI_YUV_FULL_RANGE;
+      break;
+   case QTI_CSC_ITU_R_601:
+   default:
+      break;
+   }
+
+   return 0;
 }
 
 static int
@@ -868,6 +1034,9 @@ u_gralloc_qti_metadata_api_create(void)
       goto fail;
 
    gr->base.ops.get_buffer_basic_info = qti_get_buffer_basic_info;
+   if (load_function(symbol_scope, QTI_GET_COLOR_SPACE_SYMBOL,
+                     &gr->get_color_space))
+      gr->base.ops.get_buffer_color_info = qti_get_buffer_color_info;
    gr->base.ops.destroy = qti_metadata_gralloc_destroy;
    gr->base.capabilities = U_GRALLOC_CAP_EXPLICIT_YUV_LAYOUT;
 

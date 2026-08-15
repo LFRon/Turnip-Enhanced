@@ -16,6 +16,12 @@ struct tu_sampler {
 
    uint32_t descriptor[A6XX_TEX_SAMP_DWORDS];
 
+   /* Number of image/sampler descriptor pairs reserved by an immutable
+    * combined-image sampler.  Software YV12 reconstruction reuses those
+    * slots for bounded plane and metadata buffer descriptors.
+    */
+   uint8_t plane_count;
+
    bool custom_border_color;
    uint32_t border_color_index;
 };

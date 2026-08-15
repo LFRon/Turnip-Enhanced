@@ -15,8 +15,6 @@
 #include "fdl/freedreno_lrz_layout.h"
 #include "tu_knl.h"
 
-#define TU_MAX_PLANE_COUNT 3
-
 struct tu_image
 {
    struct vk_image vk;
@@ -87,7 +85,8 @@ struct tu_image_view
    struct tu_image *image; /**< VkImageViewCreateInfo::image */
 
    struct fdl6_view view;
-   struct fdl6_view view_ds_other_aspect; /* for d32s8 separate depth/stencil */
+   struct fdl6_view view_ds_other_aspect;
+   bool has_software_ycbcr;
 
    struct fdl6_view *view_depth;
    struct fdl6_view *view_stencil;
