@@ -1545,7 +1545,7 @@ tu_get_properties(struct tu_physical_device *pdevice,
 
    /* VK_KHR_maintenance6 */
    props->blockTexelViewCompatibleMultipleLayers = true;
-   props->maxCombinedImageSamplerDescriptorCount = 1;
+   props->maxCombinedImageSamplerDescriptorCount = TU_MAX_PLANE_COUNT;
    props->fragmentShadingRateClampCombinerInputs = true;
 
    /* VK_KHR_maintenance7 */

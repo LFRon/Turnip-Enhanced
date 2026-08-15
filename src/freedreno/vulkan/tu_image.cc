@@ -191,6 +191,7 @@ tu_image_view_init(struct tu_device *device,
    assert(iview->vk.format != VK_FORMAT_UNDEFINED);
 
    iview->image = image;
+   iview->has_software_ycbcr = false;
 
    const struct fdl_layout *layouts[3];
 
@@ -283,6 +284,29 @@ tu_image_view_init(struct tu_device *device,
    }
 
    TU_CALLX(device, fdl6_view_init)(&iview->view, layouts, &args, device->use_z24uint_s8uint);
+
+   if (conversion &&
+       tu_format_uses_software_ycbcr(conversion->state.format) &&
+       image->vk.format == conversion->state.format &&
+       aspect_mask == VK_IMAGE_ASPECT_COLOR_BIT &&
+       pCreateInfo->viewType == VK_IMAGE_VIEW_TYPE_2D &&
+       iview->vk.level_count == 1 && iview->vk.layer_count == 1) {
+      /* An R8 texel-buffer view is used for each plane.  Unlike an ordinary
+       * 2D texture descriptor, it gives the hardware an exact byte bound and
+       * does not impose a hidden row-pitch granularity.  Restrict this path
+       * to a single linear 2D subresource; this covers Android YV12 imports
+       * and avoids pretending that tiled or array-layer addressing is flat.
+       */
+      iview->has_software_ycbcr = true;
+      for (uint32_t plane = 0; plane < TU_MAX_PLANE_COUNT; plane++) {
+         const struct fdl_layout *layout = &image->layout[plane];
+         if (layout->tile_mode != TILE6_LINEAR || layout->ubwc ||
+             layout->cpp != 1) {
+            iview->has_software_ycbcr = false;
+            break;
+         }
+      }
+   }
 
    if (image->vk.format == VK_FORMAT_D32_SFLOAT_S8_UINT) {
       VkImageAspectFlags other_aspect =
@@ -520,6 +544,45 @@ format_list_ubwc_possible(struct tu_device *dev,
    return true;
 }
 
+static bool
+tu_is_android_yv12_import(struct tu_image *image, uint64_t modifier, const VkSubresourceLayout *plane_layouts)
+{
+   const bool is_android_buffer = vk_image_is_android_hardware_buffer(&image->vk) ||
+                                  vk_image_is_android_native_buffer(&image->vk) ||
+                                  vk_image_is_android_native_buffer_alias(&image->vk);
+
+   if (!plane_layouts || modifier != DRM_FORMAT_MOD_LINEAR || !is_android_buffer ||
+       image->vk.format != VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM || image->vk.image_type != VK_IMAGE_TYPE_2D ||
+       image->vk.samples != VK_SAMPLE_COUNT_1_BIT || image->vk.mip_levels != 1 || image->vk.array_layers != 1 ||
+       image->vk.extent.depth != 1 || image->vk.usage != VK_IMAGE_USAGE_SAMPLED_BIT || (image->vk.extent.width & 1) ||
+       (image->vk.extent.height & 1))
+      return false;
+
+   const uint64_t y_pitch = plane_layouts[0].rowPitch;
+   const uint64_t cb_pitch = plane_layouts[1].rowPitch;
+   const uint64_t cr_pitch = plane_layouts[2].rowPitch;
+
+   if (!y_pitch || !cb_pitch || y_pitch > UINT32_MAX || cb_pitch > UINT32_MAX || cr_pitch != cb_pitch ||
+       y_pitch < image->vk.extent.width || cb_pitch < image->vk.extent.width / 2 || (y_pitch & 15) ||
+       cb_pitch != ((y_pitch / 2 + 15) & ~UINT64_C(15)))
+      return false;
+
+   const uint64_t height = image->vk.extent.height;
+   if (height > UINT64_MAX / y_pitch || height / 2 > UINT64_MAX / cb_pitch)
+      return false;
+
+   const uint64_t y_size = y_pitch * height;
+   const uint64_t chroma_size = cb_pitch * (height / 2);
+   if (y_size > UINT32_MAX || chroma_size > (UINT32_MAX - y_size) / 2)
+      return false;
+
+   /* vk_android has already changed DRM Y-V-U plane order into Vulkan's
+    * logical Y-U-V order at this point.
+    */
+   return plane_layouts[0].offset == 0 && plane_layouts[2].offset == y_size &&
+          plane_layouts[1].offset == y_size + chroma_size;
+}
+
 template <chip CHIP>
 VkResult
 tu_image_init(struct tu_device *device, struct tu_image *image,
@@ -744,6 +807,14 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
    assert(!(image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT) ||
           tile_mode == TILE6_3);
 
+   /* Android YV12 guarantees only 16-byte row-pitch alignment.  Accept that
+    * layout only for this exact single-level, sampled-only shared-buffer
+    * shape.  Sampling is later lowered to bounded texel-buffer loads, so the
+    * relaxed validation is never used for an ordinary R8 2D texture access
+    * with an unsupported pitch.
+    */
+   const bool android_yv12_import = tu_is_android_yv12_import(image, modifier, plane_layouts);
+
    for (uint32_t i = 0; i < tu6_plane_count(image->vk.format); i++) {
       struct fdl_layout *layout = &image->layout[i];
       enum pipe_format format = tu6_plane_format(image->vk.format, i);
@@ -763,7 +834,10 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
          height0 += device->physical_device->info->tile_align_h;
       }
 
-      struct fdl_explicit_layout plane_layout;
+      struct fdl_explicit_layout plane_layout = {
+         .pitch_alignment = android_yv12_import ? 16u : 0u,
+         .skip_last_level_padding = android_yv12_import,
+      };
 
       if (plane_layouts) {
          /* Reject mipmap and 3D images; fdl6_layout_image only accepts
