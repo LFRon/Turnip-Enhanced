@@ -80,9 +80,10 @@ struct fdl_explicit_layout {
     */
    uint32_t pitch_alignment;
 
-   /* Imported sampled-only images do not need the four-row over-allocation
-    * used to make linear GMEM blits safe.  This is valid only for a
-    * single-level, single-layer, linear, non-UBWC image.
+   /* Imported images may omit the four-row over-allocation when the caller
+    * guarantees that any mem<->GMEM access which can cross the logical image
+    * edge uses a bounded path.  This is valid only for a single-level,
+    * single-layer, linear, non-UBWC image.
     */
    bool skip_last_level_padding;
 };
