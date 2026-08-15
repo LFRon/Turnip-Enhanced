@@ -479,11 +479,33 @@ struct qti_standard_buffer_metadata {
    int32_t requested_format;
    uint32_t drm_fourcc;
    uint64_t modifier;
-   uint64_t usage;
    uint64_t allocation_size;
    bool protected_content;
    uint32_t private_flags;
 };
+
+static bool
+buffer_description_matches_allocation_protection(
+   const struct u_gralloc_buffer_handle *hnd, uint64_t allocation_usage)
+{
+   if (!hnd->has_usage)
+      return true;
+
+   /* AHardwareBuffer usage belongs to the GraphicBuffer wrapper, not to the
+    * native handle itself.  In particular, AOSP Codec2 migrates a buffer by
+    * wrapping the same native handle with its original usage ORed with the
+    * destination consumer usage.  QTI's standard USAGE metadata instead
+    * returns the immutable allocation-time usage from private_handle_t, so
+    * comparing the complete masks would reject a valid migrated buffer.
+    *
+    * Protected content is different: Turnip has no protected-memory import
+    * path, and a wrapper must not change whether the underlying allocation is
+    * secure.  Keep that security boundary fail-closed.  Other usage bits may
+    * have influenced the original allocation policy, but cannot be compared
+    * as native-handle identity after AOSP has re-wrapped the allocation.
+    */
+   return !((hnd->usage ^ allocation_usage) & GRALLOC_USAGE_PROTECTED);
+}
 
 static bool
 qti_get_standard_buffer_metadata(
@@ -545,10 +567,12 @@ qti_get_standard_buffer_metadata(
        static_cast<bool>(protected_content) != flags_are_protected)
       return false;
 
+   if (!buffer_description_matches_allocation_protection(hnd, usage))
+      return false;
+
    if ((hnd->width && hnd->width != width) ||
        (hnd->height && hnd->height != height) ||
-       (hnd->layer_count && hnd->layer_count != layer_count) ||
-       (hnd->has_usage && hnd->usage != usage))
+       (hnd->layer_count && hnd->layer_count != layer_count))
       return false;
 
    *metadata = {
@@ -558,7 +582,6 @@ qti_get_standard_buffer_metadata(
       .requested_format = requested_format,
       .drm_fourcc = drm_fourcc,
       .modifier = modifier,
-      .usage = usage,
       .allocation_size = allocation_size,
       .protected_content = protected_content != 0,
       .private_flags = private_flags,
@@ -568,8 +591,6 @@ qti_get_standard_buffer_metadata(
    validated_hnd->width = metadata->width;
    validated_hnd->height = metadata->height;
    validated_hnd->layer_count = metadata->layer_count;
-   validated_hnd->usage = metadata->usage;
-   validated_hnd->has_usage = true;
    return true;
 }
 
@@ -1531,21 +1552,26 @@ qti_validate_legacy_buffer_contract(
     */
    if (secure_flag != protected_usage)
       return -EINVAL;
+
+   if (!buffer_description_matches_allocation_protection(hnd, info.usage))
+      return -EINVAL;
+
    if (secure_flag)
       return -ENOTSUP;
 
-   /* The native handle stores the allocator's logical description.  Cross-
-    * check every field that the AHB/ANB caller can provide before calling a
-    * legacy helper with private-handle geometry.  Zero remains the explicit
-    * "unknown to this caller" value used by older Mesa entry points.
+   /* The native handle stores the allocator's logical geometry.  Cross-check
+    * those immutable fields before calling a legacy helper with private-handle
+    * dimensions.  Usage protection was checked separately above because the
+    * remaining wrapper usage bits are intentionally allowed to evolve.  Zero
+    * remains the explicit "unknown to this caller" value used by older Mesa
+    * entry points.
     */
    if ((hnd->width &&
         hnd->width != static_cast<uint32_t>(info.unaligned_width)) ||
        (hnd->height &&
         hnd->height != static_cast<uint32_t>(info.unaligned_height)) ||
        (hnd->layer_count &&
-        hnd->layer_count != static_cast<uint32_t>(info.layer_count)) ||
-       (hnd->has_usage && hnd->usage != info.usage))
+        hnd->layer_count != static_cast<uint32_t>(info.layer_count)))
       return -EINVAL;
 
    return 0;
