@@ -477,9 +477,15 @@ struct tu_device
    struct list_head copy_timestamp_cs_pool;
    mtx_t copy_timestamp_cs_pool_mutex;
 
-   #ifdef HAVE_PERFETTO
+#if DETECT_OS_ANDROID
+   /* One-shot AHB sync-file payload copies for the com.tencent.mm workaround. */
+   struct list_head tencent_anb_acquire_replays;
+   mtx_t tencent_anb_acquire_replay_mutex;
+#endif
+
+#ifdef HAVE_PERFETTO
    struct tu_perfetto_state perfetto;
-   #endif
+#endif
 
    bool use_z24uint_s8uint;
    bool use_lrz;

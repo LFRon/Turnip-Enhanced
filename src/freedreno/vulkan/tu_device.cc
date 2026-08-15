@@ -19,6 +19,7 @@
 #include "util/disk_cache.h"
 #include "util/driconf.h"
 #include "util/hex.h"
+#include "util/os_file.h"
 #include "util/os_misc.h"
 #include "util/u_atomic.h"
 #include "util/u_debug.h"
@@ -26,9 +27,10 @@
 #include "vk_android.h"
 #include "vk_debug_utils.h"
 #include "vk_physical_device.h"
+#include "vk_sampler.h"
+#include "vk_semaphore.h"
 #include "vk_shader_module.h"
 #include "vk_util.h"
-#include "vk_sampler.h"
 
 #include "common/freedreno_uuid.h"
 #include "fdl/freedreno_layout.h"
@@ -1695,6 +1697,315 @@ tu_get_properties(struct tu_physical_device *pdevice,
 }
 
 #if DETECT_OS_ANDROID
+struct tu_tencent_anb_acquire_replay {
+   struct list_head link;
+   struct vk_semaphore *semaphore;
+   const struct vk_sync_type *sync_type;
+   int sync_file_fd;
+};
+
+static bool
+tu_tencent_anb_acquire_replay_enabled(const struct tu_device *device)
+{
+   return device->instance->drirc.misc.tencent_anb_acquire_semaphore_replay;
+}
+
+static bool
+tu_tencent_anb_acquire_replay_pending(struct tu_device *device)
+{
+   mtx_lock(&device->tencent_anb_acquire_replay_mutex);
+   bool pending = !list_is_empty(&device->tencent_anb_acquire_replays);
+   mtx_unlock(&device->tencent_anb_acquire_replay_mutex);
+
+   return pending;
+}
+
+static struct tu_tencent_anb_acquire_replay *
+tu_tencent_anb_acquire_replay_take(struct tu_device *device, struct vk_semaphore *semaphore)
+{
+   struct tu_tencent_anb_acquire_replay *found = NULL;
+
+   mtx_lock(&device->tencent_anb_acquire_replay_mutex);
+   list_for_each_entry (struct tu_tencent_anb_acquire_replay, replay, &device->tencent_anb_acquire_replays, link) {
+      if (replay->semaphore == semaphore) {
+         list_del(&replay->link);
+         found = replay;
+         break;
+      }
+   }
+   mtx_unlock(&device->tencent_anb_acquire_replay_mutex);
+
+   if (!found)
+      return NULL;
+
+   return found;
+}
+
+static void
+tu_tencent_anb_acquire_replay_free(struct tu_device *device, struct tu_tencent_anb_acquire_replay *replay)
+{
+   if (replay->sync_file_fd >= 0)
+      close(replay->sync_file_fd);
+   vk_free(&device->vk.alloc, replay);
+}
+
+static bool
+tu_tencent_anb_acquire_replay_discard(struct tu_device *device, struct vk_semaphore *semaphore)
+{
+   if (!semaphore)
+      return false;
+
+   struct tu_tencent_anb_acquire_replay *replay = tu_tencent_anb_acquire_replay_take(device, semaphore);
+   if (!replay)
+      return false;
+
+   tu_tencent_anb_acquire_replay_free(device, replay);
+   return true;
+}
+
+static void
+tu_tencent_anb_acquire_replay_store(struct tu_device *device,
+                                    struct vk_semaphore *semaphore,
+                                    const struct vk_sync_type *sync_type,
+                                    int sync_file_fd)
+{
+   struct tu_tencent_anb_acquire_replay *replay = (struct tu_tencent_anb_acquire_replay *) vk_alloc(
+      &device->vk.alloc, sizeof(*replay), alignof(struct tu_tencent_anb_acquire_replay),
+      VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+   if (!replay) {
+      if (sync_file_fd >= 0)
+         close(sync_file_fd);
+      mesa_logw_once("Turnip: failed to allocate the com.tencent.mm "
+                     "AHB semaphore replay");
+      return;
+   }
+
+   replay->semaphore = semaphore;
+   replay->sync_type = sync_type;
+   replay->sync_file_fd = sync_file_fd;
+
+   struct tu_tencent_anb_acquire_replay *old = NULL;
+   mtx_lock(&device->tencent_anb_acquire_replay_mutex);
+   list_for_each_entry (struct tu_tencent_anb_acquire_replay, entry, &device->tencent_anb_acquire_replays, link) {
+      if (entry->semaphore == semaphore) {
+         list_del(&entry->link);
+         old = entry;
+         break;
+      }
+   }
+   list_addtail(&replay->link, &device->tencent_anb_acquire_replays);
+   mtx_unlock(&device->tencent_anb_acquire_replay_mutex);
+
+   if (old)
+      tu_tencent_anb_acquire_replay_free(device, old);
+}
+
+static void
+tu_tencent_anb_acquire_replay_finish(struct tu_device *device)
+{
+   while (true) {
+      mtx_lock(&device->tencent_anb_acquire_replay_mutex);
+      if (list_is_empty(&device->tencent_anb_acquire_replays)) {
+         mtx_unlock(&device->tencent_anb_acquire_replay_mutex);
+         return;
+      }
+
+      struct tu_tencent_anb_acquire_replay *replay =
+         list_first_entry(&device->tencent_anb_acquire_replays, struct tu_tencent_anb_acquire_replay, link);
+      list_del(&replay->link);
+      mtx_unlock(&device->tencent_anb_acquire_replay_mutex);
+
+      tu_tencent_anb_acquire_replay_free(device, replay);
+   }
+}
+
+static thread_local uint32_t tu_tencent_anb_acquire_image_depth;
+
+/*
+ * com.tencent.mm's custom Flutter AHB renderer imports a temporary sync-file
+ * payload into the binary semaphore passed to vkAcquireImageANDROID (named
+ * "AHBRenderReadySemaphore" when its debug naming is enabled), then submits
+ * two waits for that payload.  That is invalid Vulkan: the first wait consumes
+ * the temporary payload and restores the semaphore's unsignaled permanent
+ * payload.  Qualcomm's proprietary driver happens to tolerate it, so preserve
+ * one real copy of this acquire dependency for the second wait.
+ *
+ * The shipped renderer does not enable debug naming, so use the
+ * vkAcquireImageANDROID nesting depth as the reliable discriminator and use
+ * the known name as an additional filter whenever one is present.  Keep the
+ * copy as a sync-file fd and only allocate a second vk_sync if the invalid
+ * second wait actually occurs.  The exact com.tencent.mm drirc match is
+ * mandatory; this must never become general binary-semaphore behavior.
+ */
+VKAPI_ATTR VkResult VKAPI_CALL
+tu_AcquireImageANDROID(VkDevice _device, VkImage image, int nativeFenceFd, VkSemaphore _semaphore, VkFence fence)
+{
+   VK_FROM_HANDLE(tu_device, device, _device);
+
+   if (!tu_tencent_anb_acquire_replay_enabled(device))
+      return vk_common_AcquireImageANDROID(_device, image, nativeFenceFd, _semaphore, fence);
+
+   tu_tencent_anb_acquire_image_depth++;
+   VkResult result = vk_common_AcquireImageANDROID(_device, image, nativeFenceFd, _semaphore, fence);
+   tu_tencent_anb_acquire_image_depth--;
+
+   return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+tu_ImportSemaphoreFdKHR(VkDevice _device, const VkImportSemaphoreFdInfoKHR *pImportSemaphoreFdInfo)
+{
+   VK_FROM_HANDLE(tu_device, device, _device);
+   VK_FROM_HANDLE(vk_semaphore, semaphore, pImportSemaphoreFdInfo->semaphore);
+
+   const char *object_name = semaphore ? semaphore->base.object_name : NULL;
+   const bool name_matches = !object_name || strcmp(object_name, "AHBRenderReadySemaphore") == 0;
+   const bool want_replay = tu_tencent_anb_acquire_replay_enabled(device) && tu_tencent_anb_acquire_image_depth > 0 &&
+                            semaphore && semaphore->type == VK_SEMAPHORE_TYPE_BINARY &&
+                            (pImportSemaphoreFdInfo->flags & VK_SEMAPHORE_IMPORT_TEMPORARY_BIT) &&
+                            pImportSemaphoreFdInfo->handleType == VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT &&
+                            name_matches;
+
+   bool can_replay = want_replay;
+   int replay_fd = -1;
+   if (want_replay && pImportSemaphoreFdInfo->fd >= 0) {
+      replay_fd = os_dupfd_cloexec(pImportSemaphoreFdInfo->fd);
+      if (replay_fd < 0) {
+         can_replay = false;
+         mesa_logw_once("Turnip: failed to duplicate the com.tencent.mm "
+                        "AHB acquire sync-file import: %s",
+                        strerror(errno));
+      }
+   }
+
+   VkResult result = vk_common_ImportSemaphoreFdKHR(_device, pImportSemaphoreFdInfo);
+   if (result != VK_SUCCESS) {
+      if (replay_fd >= 0)
+         close(replay_fd);
+      return result;
+   }
+
+   if (tu_tencent_anb_acquire_replay_enabled(device))
+      tu_tencent_anb_acquire_replay_discard(device, semaphore);
+
+   if (!can_replay)
+      return result;
+
+   if (unlikely(!semaphore->temporary)) {
+      if (replay_fd >= 0)
+         close(replay_fd);
+      mesa_logw_once("Turnip: com.tencent.mm AHB acquire sync-file import "
+                     "completed without a temporary semaphore payload");
+      return result;
+   }
+
+   tu_tencent_anb_acquire_replay_store(device, semaphore, semaphore->temporary->type, replay_fd);
+   return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+tu_GetSemaphoreFdKHR(VkDevice _device, const VkSemaphoreGetFdInfoKHR *pGetFdInfo, int *pFd)
+{
+   VK_FROM_HANDLE(tu_device, device, _device);
+
+   VkResult result = vk_common_GetSemaphoreFdKHR(_device, pGetFdInfo, pFd);
+   if (result == VK_SUCCESS && tu_tencent_anb_acquire_replay_enabled(device)) {
+      VK_FROM_HANDLE(vk_semaphore, semaphore, pGetFdInfo->semaphore);
+      tu_tencent_anb_acquire_replay_discard(device, semaphore);
+   }
+
+   return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL
+tu_DestroySemaphore(VkDevice _device, VkSemaphore _semaphore, const VkAllocationCallbacks *pAllocator)
+{
+   VK_FROM_HANDLE(tu_device, device, _device);
+   VK_FROM_HANDLE(vk_semaphore, semaphore, _semaphore);
+
+   if (tu_tencent_anb_acquire_replay_enabled(device))
+      tu_tencent_anb_acquire_replay_discard(device, semaphore);
+
+   vk_common_DestroySemaphore(_device, _semaphore, pAllocator);
+}
+
+static void
+tu_tencent_anb_acquire_replay_prepare_submit(struct tu_device *device, const VkSubmitInfo2 *submit)
+{
+   for (uint32_t i = 0; i < submit->waitSemaphoreInfoCount; i++) {
+      VK_FROM_HANDLE(vk_semaphore, semaphore, submit->pWaitSemaphoreInfos[i].semaphore);
+      if (!semaphore || semaphore->type != VK_SEMAPHORE_TYPE_BINARY || semaphore->temporary)
+         continue;
+
+      struct tu_tencent_anb_acquire_replay *replay = tu_tencent_anb_acquire_replay_take(device, semaphore);
+      if (replay) {
+         struct vk_sync *sync = NULL;
+         VkResult result = vk_sync_create(&device->vk, replay->sync_type, (enum vk_sync_flags) 0, 0, &sync);
+         if (result == VK_SUCCESS) {
+            result = vk_sync_import_sync_file(&device->vk, sync, replay->sync_file_fd);
+         }
+
+         tu_tencent_anb_acquire_replay_free(device, replay);
+
+         if (result == VK_SUCCESS) {
+            semaphore->temporary = sync;
+            mesa_logi_once("Turnip: applying the com.tencent.mm AHB "
+                           "semaphore replay workaround");
+         } else {
+            if (sync)
+               vk_sync_destroy(&device->vk, sync);
+            mesa_logw_once("Turnip: failed to replay the com.tencent.mm "
+                           "AHB semaphore payload");
+         }
+      }
+   }
+
+   /* A signal starts a new binary-semaphore lifetime.  Never carry an old
+    * AHB replay across it.
+    */
+   for (uint32_t i = 0; i < submit->signalSemaphoreInfoCount; i++) {
+      VK_FROM_HANDLE(vk_semaphore, semaphore, submit->pSignalSemaphoreInfos[i].semaphore);
+      tu_tencent_anb_acquire_replay_discard(device, semaphore);
+   }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+tu_QueueSubmit2(VkQueue _queue, uint32_t submitCount, const VkSubmitInfo2 *pSubmits, VkFence fence)
+{
+   VK_FROM_HANDLE(tu_queue, queue, _queue);
+   struct tu_device *device = queue->device;
+
+   if (submitCount == 0 || !tu_tencent_anb_acquire_replay_enabled(device) ||
+       !tu_tencent_anb_acquire_replay_pending(device)) {
+      return vk_common_QueueSubmit2(_queue, submitCount, pSubmits, fence);
+   }
+
+   /* vk_common_QueueSubmit2 consumes all temporary payloads while building
+    * its internal submissions.  Process submit infos in order while replay
+    * records exist so a later submit can observe the first wait's consume.
+    */
+   for (uint32_t i = 0; i < submitCount; i++) {
+      if (!tu_tencent_anb_acquire_replay_pending(device)) {
+         return vk_common_QueueSubmit2(_queue, submitCount - i, &pSubmits[i], fence);
+      }
+
+      tu_tencent_anb_acquire_replay_prepare_submit(device, &pSubmits[i]);
+
+      VkFence submit_fence = i == submitCount - 1 ? fence : VK_NULL_HANDLE;
+      VkResult result = vk_common_QueueSubmit2(_queue, 1, &pSubmits[i], submit_fence);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+tu_QueueSubmit2KHR(VkQueue queue, uint32_t submitCount, const VkSubmitInfo2 *pSubmits, VkFence fence)
+{
+   return tu_QueueSubmit2(queue, submitCount, pSubmits, fence);
+}
+
 static bool
 tu_android_swapchain_ubwc_possible(struct tu_device *device,
                                    VkFormat format,
@@ -2968,6 +3279,9 @@ tu_device_get_timestamp(struct vk_device *vk_device, uint64_t *timestamp)
 static void
 tu_device_destroy_mutexes(struct tu_device *device)
 {
+#if DETECT_OS_ANDROID
+   mtx_destroy(&device->tencent_anb_acquire_replay_mutex);
+#endif
    mtx_destroy(&device->bo_mutex);
    mtx_destroy(&device->pipeline_mutex);
    mtx_destroy(&device->kgsl_profiling_mutex);
@@ -3093,6 +3407,10 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
    mtx_init(&device->mutex, mtx_plain);
    mtx_init(&device->copy_timestamp_cs_pool_mutex, mtx_plain);
    mtx_init(&device->softfloat_mutex, mtx_plain);
+#if DETECT_OS_ANDROID
+   list_inithead(&device->tencent_anb_acquire_replays);
+   mtx_init(&device->tencent_anb_acquire_replay_mutex, mtx_plain);
+#endif
 #ifdef HAVE_PERFETTO
    tu_perfetto_init_state(&device->perfetto);
 #endif
@@ -3497,6 +3815,9 @@ fail_queues:
 #ifdef HAVE_PERFETTO
    tu_perfetto_destroy_state(&device->perfetto);
 #endif
+#if DETECT_OS_ANDROID
+   tu_tencent_anb_acquire_replay_finish(device);
+#endif
    tu_device_destroy_mutexes(device);
    tu_drm_device_finish(device);
    vk_device_finish(&device->vk);
@@ -3603,6 +3924,9 @@ tu_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
          vk_free(&device->vk.alloc, device->queues[i]);
    }
 
+#if DETECT_OS_ANDROID
+   tu_tencent_anb_acquire_replay_finish(device);
+#endif
    tu_drm_device_finish(device);
 
    if (device->physical_device->has_set_iova)
