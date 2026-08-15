@@ -1563,6 +1563,18 @@ kgsl_queue_submit(struct tu_queue *queue, void *_submit,
          return vk_device_set_lost(&queue->device->vk, "refusing to submit an unsignaled semaphore wait to KGSL");
       }
 
+      /* Vulkan represents an already-signaled sync-file payload as fd -1,
+       * while Android EGL native-fence consumers require a real sync_file.
+       * Keep the no-op submission tied to this KGSL context so export can
+       * lazily materialize an immediately-signaled fence.  Timestamp zero is
+       * retired before the first submission on a KGSL context.
+       */
+      if (wait_sync.state == KGSL_SYNCOBJ_STATE_SIGNALED) {
+         wait_sync.state = KGSL_SYNCOBJ_STATE_TS;
+         wait_sync.queue = queue;
+         wait_sync.timestamp = 0;
+      }
+
       if (signal_count == 1) {
          /* Move instead of duplicating the syncobj, as we don't need to
           * keep the original one around.
