@@ -2316,6 +2316,16 @@ qti_get_modern_buffer_basic_info(
       return -EINVAL;
    }
 
+   /* Without standard metadata there is no authoritative QTI secure flag to
+    * cross-check.  Turnip has no protected-memory import path, so reject an
+    * explicitly protected public description instead of importing it as an
+    * ordinary dma-buf.  Non-protected linear imports can still use the public
+    * plane-layout API on QTI revisions without GetMetaDataValue().
+    */
+   if (!gr->get_metadata_value && hnd->has_usage &&
+       (hnd->usage & GRALLOC_USAGE_PROTECTED))
+      return -ENOTSUP;
+
    uint64_t dma_buf_size = 0;
    if (!get_dma_buf_allocation_size(hnd->handle, &dma_buf_size))
       return -EINVAL;
@@ -2778,9 +2788,12 @@ u_gralloc_qti_metadata_api_create(void)
     * The legacy ABI can validate already allocated RGB/YUV buffers, but it
     * does not establish that Vulkan private producer bit 0 requests the same
     * RGB UBWC layout on every revision.  Never turn import support into an
-    * allocation-policy claim.
+    * allocation-policy claim.  The modern ABI additionally needs standard
+    * allocation metadata so every UBWC buffer requested here can be checked
+    * against its immutable FourCC, modifier, size, usage, and private flags
+    * before import.
     */
-   if (gr->backend->supports_swapchain_ubwc) {
+   if (gr->backend->supports_swapchain_ubwc && gr->get_metadata_value) {
       IsQtiUbwcEnabled is_ubwc_enabled;
       if (load_function(symbol_scope, QTI_IS_UBWC_ENABLED_SYMBOL,
                         &is_ubwc_enabled)) {
