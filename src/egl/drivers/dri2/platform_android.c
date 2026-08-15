@@ -82,11 +82,8 @@ droid_create_image_from_native_buffer(_EGLDisplay *disp,
       .width = buf->width,
       .height = buf->height,
       .layer_count = buf->layerCount,
-      /* This ANativeWindowBuffer ABI exposes only the legacy 32-bit usage
-       * field.  It cannot authoritatively represent gralloc's 64-bit usage,
-       * so leave usage validation to call sites with usage3/AHB metadata.
-       */
-      .has_usage = false,
+      .usage = buf->usage,
+      .has_usage = true,
    };
    struct dri_image *img = NULL;
 
