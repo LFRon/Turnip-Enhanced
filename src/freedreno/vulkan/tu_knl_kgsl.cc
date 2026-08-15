@@ -1509,8 +1509,11 @@ kgsl_queue_submit(struct tu_queue *queue, void *_submit,
 
       struct kgsl_syncobj wait_sync =
          kgsl_syncobj_merge(wait_semaphores, wait_count + 1);
-      assert(wait_sync.state !=
-             KGSL_SYNCOBJ_STATE_UNSIGNALED); // Would wait forever
+      if (unlikely(wait_sync.state == KGSL_SYNCOBJ_STATE_UNSIGNALED)) {
+         kgsl_syncobj_destroy(&wait_sync);
+         kgsl_syncobj_destroy(&last_submit_sync);
+         return vk_device_set_lost(&queue->device->vk, "refusing to submit an unsignaled semaphore wait to KGSL");
+      }
 
       if (signal_count == 1) {
          /* Move instead of duplicating the syncobj, as we don't need to
@@ -1586,15 +1589,23 @@ kgsl_queue_submit(struct tu_queue *queue, void *_submit,
              ->syncobj;
    }
 
-   struct kgsl_syncobj wait_sync =
-      kgsl_syncobj_merge(wait_semaphores, wait_count);
-   assert(wait_sync.state !=
-          KGSL_SYNCOBJ_STATE_UNSIGNALED); // Would wait forever
+   struct kgsl_syncobj wait_sync = kgsl_syncobj_merge(wait_semaphores, wait_count);
 
    struct kgsl_cmd_syncpoint_timestamp ts;
    struct kgsl_cmd_syncpoint_fence fn;
    struct kgsl_command_syncpoint sync = { 0 };
    bool has_sync = false;
+
+   int ret;
+   uint32_t timestamp = 0;
+   uint64_t gpu_offset = 0;
+
+   if (unlikely(wait_sync.state == KGSL_SYNCOBJ_STATE_UNSIGNALED)) {
+      kgsl_syncobj_destroy(&wait_sync);
+      result = vk_device_set_lost(&queue->device->vk, "refusing to submit an unsignaled semaphore wait to KGSL");
+      goto fail_submit;
+   }
+
    switch (wait_sync.state) {
    case KGSL_SYNCOBJ_STATE_SIGNALED:
       break;
@@ -1621,10 +1632,6 @@ kgsl_queue_submit(struct tu_queue *queue, void *_submit,
    default:
       UNREACHABLE("invalid syncobj state");
    }
-
-   int ret;
-   uint32_t timestamp = 0;
-   uint64_t gpu_offset = 0;
 
    if (submit->bind_cmds.size == 0) {
       struct kgsl_gpu_command req = {
