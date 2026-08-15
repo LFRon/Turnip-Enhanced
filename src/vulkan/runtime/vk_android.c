@@ -1152,6 +1152,14 @@ get_ahb_buffer_format_properties2(
    case DRM_FORMAT_NV12:
       external_format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
       break;
+   case DRM_FORMAT_NV21:
+      /* Vulkan has no native VU two-plane format.  Reuse the NV12 plane
+       * representation and swap Cb/Cr through the conversion component map.
+       */
+      external_format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
+      p->samplerYcbcrConversionComponents.r = VK_COMPONENT_SWIZZLE_B;
+      p->samplerYcbcrConversionComponents.b = VK_COMPONENT_SWIZZLE_R;
+      break;
    case DRM_FORMAT_P010:
       external_format = VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16;
       break;
@@ -1274,7 +1282,23 @@ vk_common_GetAndroidHardwareBufferPropertiesANDROID(
    }
 
    if (format_resolve) {
-      if (device->enabled_extensions.ANDROID_external_format_resolve) {
+      const bool identity_components =
+         format_prop2->samplerYcbcrConversionComponents.r ==
+            VK_COMPONENT_SWIZZLE_IDENTITY &&
+         format_prop2->samplerYcbcrConversionComponents.g ==
+            VK_COMPONENT_SWIZZLE_IDENTITY &&
+         format_prop2->samplerYcbcrConversionComponents.b ==
+            VK_COMPONENT_SWIZZLE_IDENTITY &&
+         format_prop2->samplerYcbcrConversionComponents.a ==
+            VK_COMPONENT_SWIZZLE_IDENTITY;
+
+      /* The common resolve contract currently writes the canonical external
+       * format component order.  A swizzled external format such as NV21 is
+       * valid for sampling, but must not advertise resolve until a driver can
+       * apply that swizzle while writing the destination planes.
+       */
+      if (device->enabled_extensions.ANDROID_external_format_resolve &&
+          identity_components) {
          assert(format_prop2->externalFormat != VK_FORMAT_UNDEFINED);
          /* Multiplanar format descriptions do not model conventional RGBA
           * component indices.  Querying component 1 would therefore
