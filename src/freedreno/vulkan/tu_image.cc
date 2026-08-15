@@ -583,6 +583,50 @@ tu_is_android_yv12_import(struct tu_image *image, uint64_t modifier, const VkSub
           plane_layouts[1].offset == y_size + chroma_size;
 }
 
+static bool
+tu_is_android_exact_linear_color_import(struct tu_image *image,
+                                        uint64_t modifier,
+                                        const VkSubresourceLayout *plane_layouts)
+{
+   const VkImageUsageFlags supported_usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                                             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
+                                             VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
+   const bool is_android_buffer = vk_image_is_android_hardware_buffer(&image->vk) ||
+                                  vk_image_is_android_native_buffer(&image->vk) ||
+                                  vk_image_is_android_native_buffer_alias(&image->vk);
+
+   if (!is_android_buffer || !plane_layouts || modifier != DRM_FORMAT_MOD_LINEAR ||
+       tu6_plane_count(image->vk.format) != 1 || !vk_format_is_color(image->vk.format) ||
+       vk_format_is_depth_or_stencil(image->vk.format) || vk_format_is_compressed(image->vk.format) ||
+       image->vk.image_type != VK_IMAGE_TYPE_2D || image->vk.samples != VK_SAMPLE_COUNT_1_BIT ||
+       image->vk.mip_levels != 1 || image->vk.array_layers != 1 || image->vk.extent.depth != 1 ||
+       (image->vk.usage & ~supported_usage))
+      return false;
+
+   const enum pipe_format format = tu6_plane_format(image->vk.format, 0);
+   if (format == PIPE_FORMAT_NONE)
+      return false;
+
+   const uint64_t pitch = plane_layouts[0].rowPitch;
+   const uint64_t offset = plane_layouts[0].offset;
+   const uint64_t min_pitch = util_format_get_stride(format, image->vk.extent.width);
+   const uint64_t size = pitch * image->vk.extent.height;
+
+   /* Whether an imported AHB is writable is local to this VkImage.  The same
+    * allocation can be a color attachment in its producer and sampled-only
+    * in SurfaceFlinger, so it must not change the allocation's physical
+    * footprint.  Keep the accepted operations narrowly allowlisted above;
+    * attachment accesses are redirected to bounded GMEM paths below.
+    *
+    * fdl_explicit_layout and fdl_slice store these values in 32 bits.  Stay
+    * within those representations and verify that every logical row is
+    * present before dropping Turnip's private tail padding.
+    */
+   return pitch >= min_pitch && pitch <= UINT32_MAX && offset <= UINT32_MAX && size <= UINT32_MAX &&
+          offset + size <= UINT32_MAX;
+}
+
 template <chip CHIP>
 VkResult
 tu_image_init(struct tu_device *device, struct tu_image *image,
@@ -765,6 +809,7 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
 
    /* Layout computation begins here */
    enum a6xx_tile_mode tile_mode = TILE6_3;
+   image->android_external_no_gmem_padding = false;
 #if DETECT_OS_LINUX || DETECT_OS_BSD
    image->vk.drm_format_mod = modifier;
 #endif
@@ -813,6 +858,9 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
     * with an unsupported pitch.
     */
    const bool android_yv12_import = tu_is_android_yv12_import(image, modifier, plane_layouts);
+   const bool android_exact_linear_color_import =
+      tu_is_android_exact_linear_color_import(image, modifier, plane_layouts);
+   image->android_external_no_gmem_padding = android_exact_linear_color_import;
 
    for (uint32_t i = 0; i < tu6_plane_count(image->vk.format); i++) {
       struct fdl_layout *layout = &image->layout[i];
@@ -835,7 +883,7 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
 
       struct fdl_explicit_layout plane_layout = {
          .pitch_alignment = android_yv12_import ? 16u : 0u,
-         .skip_last_level_padding = android_yv12_import,
+         .skip_last_level_padding = android_yv12_import || android_exact_linear_color_import,
       };
 
       if (plane_layouts) {
@@ -1274,6 +1322,16 @@ tu_image_bind(struct tu_device *device,
    }
 
    assert(mem);
+
+   const bool is_android_buffer = vk_image_is_android_hardware_buffer(&image->vk) ||
+                                  vk_image_is_android_native_buffer(&image->vk) ||
+                                  vk_image_is_android_native_buffer_alias(&image->vk);
+   if (is_android_buffer && mem->bo && (offset > mem->bo->size || image->total_size > mem->bo->size - offset)) {
+      return vk_errorf(device, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                       "Android image binding exceeds dma-buf size (%" PRIu64 " + %" PRIu64 " > %" PRIu64 ")", offset,
+                       image->total_size, mem->bo->size);
+   }
+
    image->mem = mem;
    image->mem_offset = offset;
    image->iova = mem->iova + offset;
