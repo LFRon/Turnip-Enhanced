@@ -5,6 +5,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <linux/dma-heap.h>
 #include <poll.h>
@@ -120,8 +121,7 @@ bo_init_new_dmaheap(struct tu_device *dev, struct tu_bo **out_bo, uint64_t size,
     * ours and nobody else will ever drop it. Leaking it keeps the dma-buf
     * alive after the BO is destroyed, so the memory is never reclaimed.
     */
-   VkResult result =
-      tu_bo_init_dmabuf(dev, out_bo, -1, TU_BO_ALLOC_NO_FLAGS, alloc.fd);
+   VkResult result = tu_bo_init_dmabuf(dev, out_bo, size, TU_BO_ALLOC_NO_FLAGS, alloc.fd);
    close(alloc.fd);
 
    return result;
@@ -146,8 +146,7 @@ bo_init_new_ion(struct tu_device *dev, struct tu_bo **out_bo, uint64_t size,
    }
 
    /* See bo_init_new_dmaheap(): the fd is ours to close. */
-   VkResult result =
-      tu_bo_init_dmabuf(dev, out_bo, -1, TU_BO_ALLOC_NO_FLAGS, alloc.fd);
+   VkResult result = tu_bo_init_dmabuf(dev, out_bo, size, TU_BO_ALLOC_NO_FLAGS, alloc.fd);
    close(alloc.fd);
 
    return result;
@@ -193,8 +192,7 @@ bo_init_new_ion_legacy(struct tu_device *dev, struct tu_bo **out_bo, uint64_t si
    }
 
    /* See bo_init_new_dmaheap(): the fd is ours to close. */
-   VkResult result =
-      tu_bo_init_dmabuf(dev, out_bo, -1, TU_BO_ALLOC_NO_FLAGS, share.fd);
+   VkResult result = tu_bo_init_dmabuf(dev, out_bo, size, TU_BO_ALLOC_NO_FLAGS, share.fd);
    close(share.fd);
 
    return result;
@@ -389,13 +387,32 @@ kgsl_bo_init_dmabuf(struct tu_device *dev,
       .id = req.id,
    };
 
-   ret = safe_ioctl(dev->physical_device->local_fd,
-                    IOCTL_KGSL_GPUOBJ_INFO, &info_req);
-   if (ret)
-      return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
-                       "Failed to get dma-buf info (%s)\n", strerror(errno));
+   ret = safe_ioctl(dev->physical_device->local_fd, IOCTL_KGSL_GPUOBJ_INFO, &info_req);
+   if (ret) {
+      const int info_errno = errno;
+      struct kgsl_gpumem_free_id free_req = {
+         .id = req.id,
+      };
+      safe_ioctl(dev->physical_device->local_fd, IOCTL_KGSL_GPUMEM_FREE_ID, &free_req);
+      return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY, "Failed to get dma-buf info (%s)\n", strerror(info_errno));
+   }
 
-   struct tu_bo* bo = tu_device_lookup_bo(dev, req.id);
+   /* Reject an object which is smaller than the Vulkan allocation before
+    * exposing an IOVA that commands could address past the end of the
+    * dma-buf.  Keep accepting zero as "no lower bound" for callers which do
+    * not have a requested size.
+    */
+   if (size && info_req.size < size) {
+      struct kgsl_gpumem_free_id free_req = {
+         .id = req.id,
+      };
+      safe_ioctl(dev->physical_device->local_fd, IOCTL_KGSL_GPUMEM_FREE_ID, &free_req);
+      return vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE,
+                       "dma-buf is smaller than requested (%" PRIu64 " < %" PRIu64 ")",
+                       static_cast<uint64_t>(info_req.size), size);
+   }
+
+   struct tu_bo *bo = tu_device_lookup_bo(dev, req.id);
    assert(bo && bo->gem_handle == 0);
 
    *bo = (struct tu_bo) {
