@@ -2504,6 +2504,11 @@ resolve_ahb_image(struct anv_device *device,
          .handle = handle,
          .hal_format = desc.format,
          .pixel_stride = desc.stride,
+         .width = desc.width,
+         .height = desc.height,
+         .layer_count = desc.layers,
+         .usage = desc.usage,
+         .has_usage = true,
       };
       result = anv_android_get_tiling(device, &gr_handle, &tiling);
       assert(result == VK_SUCCESS);
