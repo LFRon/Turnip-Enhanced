@@ -23,6 +23,11 @@ struct tu_image
    uint64_t subsampled_metadata_offset;
    uint64_t total_size;
 
+   /* The explicit gralloc allocation ends at the logical image height, so
+    * mem<->GMEM operations must not rely on FDL's usual four-row padding.
+    */
+   bool android_external_no_gmem_padding;
+
    /* Set when bound */
    uint64_t iova;
    union {
