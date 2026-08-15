@@ -366,6 +366,11 @@ vk_android_get_anb_layout_with_modifier_info(
       .handle = native_buffer->handle,
       .hal_format = native_buffer->format,
       .pixel_stride = native_buffer->stride,
+      .width = pCreateInfo->extent.width,
+      .height = pCreateInfo->extent.height,
+      .layer_count = pCreateInfo->arrayLayers,
+      .usage = native_buffer->usage3,
+      .has_usage = true,
    };
 
    return vk_gralloc_to_drm_explicit_layout(
@@ -745,6 +750,11 @@ vk_android_get_ahb_layout_with_modifier_info(
       .handle = handle,
       .pixel_stride = description.stride,
       .hal_format = description.format,
+      .width = description.width,
+      .height = description.height,
+      .layer_count = description.layers,
+      .usage = description.usage,
+      .has_usage = true,
    };
 
    return vk_gralloc_to_drm_explicit_layout(
@@ -1120,6 +1130,11 @@ get_ahb_buffer_format_properties2(
       .handle = AHardwareBuffer_getNativeHandle(buffer),
       .pixel_stride = desc.stride,
       .hal_format = desc.format,
+      .width = desc.width,
+      .height = desc.height,
+      .layer_count = desc.layers,
+      .usage = desc.usage,
+      .has_usage = true,
    };
 
    struct u_gralloc_buffer_basic_info info;

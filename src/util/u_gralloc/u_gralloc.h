@@ -23,13 +23,21 @@ extern "C" {
 
 struct u_gralloc;
 
-/* Both Vulkan and EGL API exposes HAL format / pixel stride which is required
- * by the fallback implementation.
+/* Vulkan AHB/ANB and EGL native-buffer imports expose the public buffer
+ * description alongside the native handle.  Width, height, and layer_count
+ * may be zero for callers which cannot provide them; metadata backends use
+ * non-zero values to cross-check allocator-reported plane geometry.  Usage is
+ * valid only when has_usage is set because zero is itself a valid usage.
  */
 struct u_gralloc_buffer_handle {
    const native_handle_t *handle;
    int hal_format;
    int pixel_stride;
+   uint32_t width;
+   uint32_t height;
+   uint32_t layer_count;
+   uint64_t usage;
+   bool has_usage;
 };
 
 struct u_gralloc_modifier_plane_layout {
