@@ -44,6 +44,11 @@ struct tu_descriptor_set_binding_layout
    /* The size in bytes of each Vulkan descriptor. */
    uint32_t size;
 
+   /* Number of image/sampler hardware descriptor pairs used by one
+    * combined image sampler.  All other descriptor types use one.
+    */
+   uint8_t plane_count;
+
    uint32_t offset;
 
    /* Byte offset in the array of dynamic descriptors (offsetted by

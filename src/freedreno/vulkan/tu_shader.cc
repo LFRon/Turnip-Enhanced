@@ -20,6 +20,7 @@
 #include "ir3/ir3_nir.h"
 #include "tu_descriptor_set.h"
 #include "tu_device.h"
+#include "tu_formats.h"
 #include "tu_lrz.h"
 #include "tu_pipeline.h"
 #include "tu_rmv.h"
@@ -382,13 +383,13 @@ lower_vulkan_resource_index(struct tu_device *dev, nir_builder *b,
       base = nir_imm_int(b, binding_layout->offset / (4 * FDL6_TEX_CONST_DWORDS));
 
    unsigned stride = binding_layout->size / (4 * FDL6_TEX_CONST_DWORDS);
-   assert(util_is_power_of_two_nonzero(stride));
-   nir_def *shift = nir_imm_int(b, util_logbase2(stride));
+   assert(stride > 0);
+   nir_def *stride_def = nir_imm_int(b, stride);
 
    nir_def *def = nir_vec3(b, nir_imm_int(b, set),
                                nir_iadd(b, base,
-                                        nir_ishl(b, vulkan_idx, shift)),
-                               shift);
+                                        nir_imul(b, vulkan_idx, stride_def)),
+                               stride_def);
 
    nir_def_replace(&instr->def, def);
 }
@@ -398,13 +399,13 @@ lower_vulkan_resource_reindex(nir_builder *b, nir_intrinsic_instr *instr)
 {
    nir_def *old_index = instr->src[0].ssa;
    nir_def *delta = instr->src[1].ssa;
-   nir_def *shift = nir_channel(b, old_index, 2);
+   nir_def *stride = nir_channel(b, old_index, 2);
 
    nir_def *new_index =
       nir_vec3(b, nir_channel(b, old_index, 0),
                nir_iadd(b, nir_channel(b, old_index, 1),
-                        nir_ishl(b, delta, shift)),
-               shift);
+                        nir_imul(b, delta, stride)),
+               stride);
 
    nir_def_replace(&instr->def, new_index);
 }
@@ -414,7 +415,7 @@ lower_load_vulkan_descriptor(nir_builder *b, nir_intrinsic_instr *intrin)
 {
    nir_def *old_index = intrin->src[0].ssa;
    /* Loading the descriptor happens as part of the load/store instruction so
-    * this is a no-op. We just need to turn the shift into an offset of 0.
+    * this is a no-op. We just need to turn the stride into an offset of 0.
     */
    nir_def *new_index =
       nir_vec3(b, nir_channel(b, old_index, 0),
@@ -964,6 +965,321 @@ lower_tex_ycbcr(const struct vk_ycbcr_conversion_state *ycbcr_sampler,
    builder->cursor = nir_before_instr(&tex->instr);
 }
 
+static const struct vk_ycbcr_conversion_state *
+lookup_software_ycbcr_conversion(const void *_layout, uint32_t set,
+                                 uint32_t binding, uint32_t array_index)
+{
+   const struct tu_pipeline_layout *layout =
+      (const struct tu_pipeline_layout *)_layout;
+
+   if (set == VK_NIR_YCBCR_SET_IMMUTABLE_SAMPLERS)
+      return NULL;
+
+   assert(set < layout->num_sets && layout->set[set].layout);
+   const struct tu_descriptor_set_layout *set_layout =
+      layout->set[set].layout;
+   assert(binding < set_layout->binding_count);
+
+   const struct tu_descriptor_set_binding_layout *binding_layout =
+      &set_layout->binding[binding];
+   const struct vk_ycbcr_conversion_state *conversions =
+      tu_immutable_ycbcr_samplers(set_layout, binding_layout);
+   if (!conversions)
+      return NULL;
+
+   array_index = MIN2(array_index, binding_layout->array_size - 1);
+   const struct vk_ycbcr_conversion_state *conversion =
+      &conversions[array_index];
+
+   return tu_format_uses_software_ycbcr(conversion->format) ?
+             conversion : NULL;
+}
+
+enum tu_software_ycbcr_metadata {
+   TU_SOFTWARE_YCBCR_WIDTH,
+   TU_SOFTWARE_YCBCR_HEIGHT,
+};
+
+static const struct vk_ycbcr_conversion_state *
+lookup_software_ycbcr_conversion_for_tex(
+   const struct tu_pipeline_layout *layout, const nir_tex_instr *tex)
+{
+   const int texture_src_idx =
+      nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+   if (texture_src_idx < 0)
+      return NULL;
+
+   nir_deref_instr *deref =
+      nir_src_as_deref(tex->src[texture_src_idx].src);
+   nir_variable *var = nir_deref_instr_get_variable(deref);
+   uint32_t array_index = 0;
+
+   if (deref->deref_type != nir_deref_type_var) {
+      assert(deref->deref_type == nir_deref_type_array);
+      if (!nir_src_is_const(deref->arr.index))
+         return NULL;
+      array_index = nir_src_as_uint(deref->arr.index);
+   }
+
+   return lookup_software_ycbcr_conversion(
+      layout, var->data.descriptor_set, var->data.binding, array_index);
+}
+
+static nir_def *
+build_software_ycbcr_buffer_size(nir_builder *b, nir_tex_instr *origin,
+                                 uint32_t descriptor_plane)
+{
+   const int texture_src_idx =
+      nir_tex_instr_src_index(origin, nir_tex_src_texture_deref);
+   assert(texture_src_idx >= 0);
+
+   nir_tex_instr *txs = nir_tex_instr_create(b->shader, 2);
+   txs->op = nir_texop_txs;
+   txs->sampler_dim = GLSL_SAMPLER_DIM_BUF;
+   txs->dest_type = nir_type_int32;
+   txs->texture_index = origin->texture_index;
+   txs->texture_non_uniform = origin->texture_non_uniform;
+   txs->src[0] = nir_tex_src_for_ssa(
+      nir_tex_src_texture_deref,
+      origin->src[texture_src_idx].src.ssa);
+   txs->src[1] = nir_tex_src_for_ssa(
+      nir_tex_src_plane, nir_imm_int(b, descriptor_plane));
+
+   nir_def_init(&txs->instr, &txs->def,
+                nir_tex_instr_dest_size(txs), 32);
+   nir_builder_instr_insert(b, &txs->instr);
+   return &txs->def;
+}
+
+static nir_def *
+build_software_ycbcr_plane_fetch(nir_builder *b, nir_tex_instr *origin,
+                                 uint32_t plane, nir_def *offset)
+{
+   const int texture_src_idx =
+      nir_tex_instr_src_index(origin, nir_tex_src_texture_deref);
+   assert(texture_src_idx >= 0 && plane < TU_MAX_PLANE_COUNT);
+
+   nir_tex_instr *fetch = nir_tex_instr_create(b->shader, 3);
+   fetch->op = nir_texop_txf;
+   fetch->sampler_dim = GLSL_SAMPLER_DIM_BUF;
+   fetch->dest_type = origin->dest_type;
+   fetch->coord_components = 1;
+   fetch->texture_index = origin->texture_index;
+   fetch->texture_non_uniform = origin->texture_non_uniform;
+   fetch->src[0] = nir_tex_src_for_ssa(
+      nir_tex_src_texture_deref,
+      origin->src[texture_src_idx].src.ssa);
+   fetch->src[1] = nir_tex_src_for_ssa(nir_tex_src_coord, offset);
+   fetch->src[2] = nir_tex_src_for_ssa(
+      nir_tex_src_plane, nir_imm_int(b, plane));
+
+   nir_def_init(&fetch->instr, &fetch->def,
+                nir_tex_instr_dest_size(fetch), origin->def.bit_size);
+   nir_builder_instr_insert(b, &fetch->instr);
+
+   if (fetch->def.num_components == origin->def.num_components)
+      return &fetch->def;
+
+   assert(fetch->def.num_components > origin->def.num_components);
+   return nir_trim_vector(b, &fetch->def, origin->def.num_components);
+}
+
+static nir_def *
+build_software_ycbcr_plane_sample(nir_builder *b, nir_tex_instr *tex,
+                                  uint32_t plane, bool linear_filter)
+{
+   const int coord_src_idx =
+      nir_tex_instr_src_index(tex, nir_tex_src_coord);
+   if (coord_src_idx < 0 || tex->is_array || tex->is_shadow || tex->is_sparse)
+      return NULL;
+
+   nir_def *logical_width = nir_umax_imm(
+      b, build_software_ycbcr_buffer_size(
+            b, tex, TU_MAX_PLANE_COUNT + TU_SOFTWARE_YCBCR_WIDTH),
+      1);
+   nir_def *logical_height = nir_umax_imm(
+      b, build_software_ycbcr_buffer_size(
+            b, tex, TU_MAX_PLANE_COUNT + TU_SOFTWARE_YCBCR_HEIGHT),
+      1);
+   nir_def *plane_width = plane ?
+      nir_umax_imm(b, nir_ushr_imm(b, logical_width, 1), 1) :
+      logical_width;
+   nir_def *plane_height = plane ?
+      nir_umax_imm(b, nir_ushr_imm(b, logical_height, 1), 1) :
+      logical_height;
+   nir_def *plane_size =
+      build_software_ycbcr_buffer_size(b, tex, plane);
+   nir_def *plane_pitch = nir_udiv(b, plane_size, plane_height);
+   nir_def *max_x = nir_iadd_imm(b, plane_width, -1);
+   nir_def *max_y = nir_iadd_imm(b, plane_height, -1);
+   nir_def *zero = nir_imm_int(b, 0);
+   nir_def *coord = tex->src[coord_src_idx].src.ssa;
+
+   if (tex->op == nir_texop_txf) {
+      nir_def *x = nir_i2i32(b, nir_channel(b, coord, 0));
+      nir_def *y = nir_i2i32(b, nir_channel(b, coord, 1));
+      x = nir_iclamp(b, x, zero, max_x);
+      y = nir_iclamp(b, y, zero, max_y);
+      return build_software_ycbcr_plane_fetch(
+         b, tex, plane, nir_iadd(b, nir_imul(b, y, plane_pitch), x));
+   }
+
+   if (nir_tex_instr_src_type(tex, coord_src_idx) != nir_type_float)
+      return NULL;
+
+   switch (tex->op) {
+   case nir_texop_tex:
+   case nir_texop_txb:
+   case nir_texop_txl:
+   case nir_texop_txd:
+      break;
+   default:
+      return NULL;
+   }
+
+   const unsigned coord_bit_size = coord->bit_size;
+   nir_def *width_f = nir_u2fN(b, plane_width, coord_bit_size);
+   nir_def *height_f = nir_u2fN(b, plane_height, coord_bit_size);
+   nir_def *x_f = nir_fmul(b, nir_channel(b, coord, 0), width_f);
+   nir_def *y_f = nir_fmul(b, nir_channel(b, coord, 1), height_f);
+
+   if (!linear_filter) {
+      nir_def *x = nir_f2i32(b, nir_ffloor(b, x_f));
+      nir_def *y = nir_f2i32(b, nir_ffloor(b, y_f));
+      x = nir_iclamp(b, x, zero, max_x);
+      y = nir_iclamp(b, y, zero, max_y);
+      return build_software_ycbcr_plane_fetch(
+         b, tex, plane, nir_iadd(b, nir_imul(b, y, plane_pitch), x));
+   }
+
+   x_f = nir_fadd_imm(b, x_f, -0.5);
+   y_f = nir_fadd_imm(b, y_f, -0.5);
+   nir_def *x_floor = nir_ffloor(b, x_f);
+   nir_def *y_floor = nir_ffloor(b, y_f);
+   nir_def *frac_x = nir_fsub(b, x_f, x_floor);
+   nir_def *frac_y = nir_fsub(b, y_f, y_floor);
+   nir_def *x0 = nir_f2i32(b, x_floor);
+   nir_def *y0 = nir_f2i32(b, y_floor);
+   nir_def *x1 = nir_iadd_imm(b, x0, 1);
+   nir_def *y1 = nir_iadd_imm(b, y0, 1);
+
+   x0 = nir_iclamp(b, x0, zero, max_x);
+   y0 = nir_iclamp(b, y0, zero, max_y);
+   x1 = nir_iclamp(b, x1, zero, max_x);
+   y1 = nir_iclamp(b, y1, zero, max_y);
+
+   nir_def *s00 = build_software_ycbcr_plane_fetch(
+      b, tex, plane, nir_iadd(b, nir_imul(b, y0, plane_pitch), x0));
+   nir_def *s10 = build_software_ycbcr_plane_fetch(
+      b, tex, plane, nir_iadd(b, nir_imul(b, y0, plane_pitch), x1));
+   nir_def *s01 = build_software_ycbcr_plane_fetch(
+      b, tex, plane, nir_iadd(b, nir_imul(b, y1, plane_pitch), x0));
+   nir_def *s11 = build_software_ycbcr_plane_fetch(
+      b, tex, plane, nir_iadd(b, nir_imul(b, y1, plane_pitch), x1));
+
+   if (frac_x->bit_size != tex->def.bit_size) {
+      frac_x = nir_f2fN(b, frac_x, tex->def.bit_size);
+      frac_y = nir_f2fN(b, frac_y, tex->def.bit_size);
+   }
+
+   nir_def *result =
+      nir_flrp(b, nir_flrp(b, s00, s10, frac_x),
+               nir_flrp(b, s01, s11, frac_x), frac_y);
+
+   /* This pass runs after the initial ir3_optimize_loop(), which marks flrp
+    * lowering complete even when no flrp existed.  Make the later
+    * ir3_finalize_nir() lower the interpolation operations emitted above
+    * before IR3 compilation.
+    */
+   b->shader->info.flrp_lowered = false;
+
+   return result;
+}
+
+static bool
+lower_software_ycbcr_tex(nir_builder *b, nir_tex_instr *tex, void *data)
+{
+   const struct tu_pipeline_layout *layout =
+      (const struct tu_pipeline_layout *)data;
+   const struct vk_ycbcr_conversion_state *conversion =
+      lookup_software_ycbcr_conversion_for_tex(layout, tex);
+   if (!conversion || tex->sampler_dim == GLSL_SAMPLER_DIM_BUF)
+      return false;
+
+   const int plane_src_idx =
+      nir_tex_instr_src_index(tex, nir_tex_src_plane);
+   if (plane_src_idx < 0) {
+      b->cursor = nir_before_instr(&tex->instr);
+
+      if (tex->op == nir_texop_txs) {
+         nir_def *components[4];
+         components[0] = build_software_ycbcr_buffer_size(
+            b, tex, TU_MAX_PLANE_COUNT + TU_SOFTWARE_YCBCR_WIDTH);
+         components[1] = build_software_ycbcr_buffer_size(
+            b, tex, TU_MAX_PLANE_COUNT + TU_SOFTWARE_YCBCR_HEIGHT);
+         for (uint32_t i = 2; i < tex->def.num_components; i++)
+            components[i] = nir_imm_int(b, 1);
+
+         nir_def_replace(&tex->def,
+                         nir_vec(b, components, tex->def.num_components));
+         return true;
+      }
+
+      if (tex->op == nir_texop_query_levels) {
+         nir_def_replace(&tex->def, nir_imm_int(b, 1));
+         return true;
+      }
+
+      if (tex->op == nir_texop_lod) {
+         nir_def_replace(&tex->def,
+                         nir_imm_zero(b, tex->def.num_components,
+                                      tex->def.bit_size));
+         return true;
+      }
+
+      /* nir_vk_lower_ycbcr_tex() leaves the replaced source instruction
+       * behind until DCE.  Remove it now so it cannot be lowered against the
+       * buffer descriptor without the per-plane addressing above.
+       */
+      if (nir_def_is_unused(&tex->def)) {
+         nir_instr_remove(&tex->instr);
+         return true;
+      }
+
+      return false;
+   }
+
+   assert(nir_src_is_const(tex->src[plane_src_idx].src));
+   const uint32_t plane = nir_src_as_uint(tex->src[plane_src_idx].src);
+   assert(plane < TU_MAX_PLANE_COUNT);
+   b->cursor = nir_before_instr(&tex->instr);
+
+   nir_def *result = build_software_ycbcr_plane_sample(
+      b, tex, plane, conversion->chroma_filter == VK_FILTER_LINEAR);
+   if (!result) {
+      /* Unsupported operations are not valid for this restricted Android
+       * YCbCr path.  Return a deterministic value instead of allowing an
+       * ordinary 2D fetch to use an arbitrary-pitch buffer descriptor.
+       */
+      result = nir_imm_zero(b, tex->def.num_components, tex->def.bit_size);
+   }
+
+   nir_def_replace(&tex->def, result);
+   return true;
+}
+
+static bool
+tu_nir_lower_software_ycbcr(nir_shader *nir,
+                            const struct tu_pipeline_layout *layout)
+{
+   bool progress = nir_vk_lower_ycbcr_tex(
+      nir, lookup_software_ycbcr_conversion, layout);
+   progress |= nir_shader_tex_pass(nir, lower_software_ycbcr_tex,
+                                   nir_metadata_control_flow,
+                                   (void *)layout);
+   return progress;
+}
+
 static void
 lower_tex_immutable(struct tu_device *dev,
                     struct tu_shader *shader,
@@ -1001,7 +1317,8 @@ lower_tex_immutable(struct tu_device *dev,
       tu_immutable_ycbcr_samplers(set_layout, binding);
    if (ycbcr_samplers) {
       const struct vk_ycbcr_conversion_state *ycbcr_sampler = ycbcr_samplers + array_index;
-      lower_tex_ycbcr(ycbcr_sampler, builder, tex);
+      if (!tu_format_uses_software_ycbcr(ycbcr_sampler->format))
+         lower_tex_ycbcr(ycbcr_sampler, builder, tex);
    }
 
    const struct tu_sampler *samplers =
@@ -1044,11 +1361,25 @@ lower_tex_impl(nir_builder *b, nir_tex_instr *tex, struct tu_device *dev,
           uint32_t read_only_input_attachments, bool dynamic_renderpass,
           bool ref)
 {
+   uint32_t plane = 0;
+   uint32_t combined_descriptor_offset = 0;
+   int plane_src_idx = nir_tex_instr_src_index(tex, nir_tex_src_plane);
+   if (plane_src_idx >= 0) {
+      assert(nir_src_is_const(tex->src[plane_src_idx].src));
+      plane = nir_src_as_uint(tex->src[plane_src_idx].src);
+      assert(plane < 2 * TU_MAX_PLANE_COUNT);
+      combined_descriptor_offset = plane < TU_MAX_PLANE_COUNT ?
+         2 * plane : 2 * (plane - TU_MAX_PLANE_COUNT) + 1;
+      nir_tex_instr_remove_src(tex, plane_src_idx);
+   }
+
    bool descriptor_valid = true;
    int sampler_src_idx = nir_tex_instr_src_index(tex, ref ? nir_tex_src_sampler_2_deref : nir_tex_src_sampler_deref);
    if (sampler_src_idx >= 0) {
       nir_deref_instr *deref = nir_src_as_deref(tex->src[sampler_src_idx].src);
-      nir_def *bindless = build_bindless(dev, b, deref, 1, shader, layout,
+      nir_def *bindless = build_bindless(dev, b, deref,
+                                         combined_descriptor_offset + 1,
+                                         shader, layout,
                                          read_only_input_attachments,
                                          dynamic_renderpass,
                                          &descriptor_valid);
@@ -1059,7 +1390,9 @@ lower_tex_impl(nir_builder *b, nir_tex_instr *tex, struct tu_device *dev,
    int tex_src_idx = nir_tex_instr_src_index(tex, ref ? nir_tex_src_texture_2_deref : nir_tex_src_texture_deref);
    if (tex_src_idx >= 0) {
       nir_deref_instr *deref = nir_src_as_deref(tex->src[tex_src_idx].src);
-      nir_def *bindless = build_bindless(dev, b, deref, 0, shader, layout,
+      nir_def *bindless = build_bindless(dev, b, deref,
+                                         combined_descriptor_offset,
+                                         shader, layout,
                                          read_only_input_attachments,
                                          dynamic_renderpass,
                                          &descriptor_valid);
@@ -3585,6 +3918,7 @@ tu_shader_create(struct tu_device *dev,
    }
 
    struct ir3_const_allocations const_allocs = {};
+   NIR_PASS(_, nir, tu_nir_lower_software_ycbcr, layout);
    NIR_PASS(_, nir, tu_lower_io, dev, shader, layout,
             key->read_only_input_attachments, key->dynamic_renderpass,
             &const_allocs);
