@@ -5755,6 +5755,61 @@ tu_end_load_store_cond_exec(struct tu_cmd_buffer *cmd,
    tu_cs_emit_qw(cs, global_iova(cmd, dbg_one));
 }
 
+static bool
+tu_attachment_gmem_edge_unaligned(struct tu_cmd_buffer *cmd, uint32_t a,
+                                  bool require_image_edge_y_alignment)
+{
+   struct tu_physical_device *phys_dev = cmd->device->physical_device;
+   const struct tu_image_view *iview = cmd->state.attachments[a];
+
+   unsigned render_area_count =
+      cmd->state.per_layer_render_area ? cmd->state.pass->num_views : 1;
+
+   /* With subsampling, this calculation does not apply.  The dedicated FDM
+    * paths already handle edge clipping, and unpadded Android imports are
+    * never created with a subsampled layout.
+    */
+   if (iview->image->vk.create_flags & VK_IMAGE_CREATE_SUBSAMPLED_BIT_EXT)
+      return false;
+
+   for (unsigned i = 0; i < render_area_count; i++) {
+      const VkRect2D *render_area = &cmd->state.render_areas[i];
+      uint32_t x1 = render_area->offset.x;
+      uint32_t y1 = render_area->offset.y;
+      uint32_t x2 = x1 + render_area->extent.width;
+      uint32_t y2 = y1 + render_area->extent.height;
+
+      /* At an image edge, an event blit may round the access out to the GMEM
+       * granularity.  An exact-size Android import has no implicit tail rows;
+       * it also has no implicit row padding beyond its explicit pitch.  Keep
+       * the horizontal fast path only when that pitch mathematically covers
+       * the aligned edge.
+       */
+      bool need_x2_align = x2 != iview->view.width;
+      if (!need_x2_align &&
+          iview->image->android_external_no_gmem_padding) {
+         const struct fdl_layout *layout = &iview->image->layout[0];
+         const uint64_t aligned_width =
+            DIV_ROUND_UP((uint64_t)x2, phys_dev->info->gmem_align_w) *
+            phys_dev->info->gmem_align_w;
+         const uint64_t required_pitch = aligned_width * layout->cpp;
+         need_x2_align = required_pitch > layout->pitch0;
+      }
+
+      const bool need_y2_align =
+         y2 != iview->view.height || iview->view.need_y2_align ||
+         require_image_edge_y_alignment;
+
+      if (x1 % phys_dev->info->gmem_align_w ||
+          (x2 % phys_dev->info->gmem_align_w && need_x2_align) ||
+          y1 % phys_dev->info->gmem_align_h ||
+          (y2 % phys_dev->info->gmem_align_h && need_y2_align))
+         return true;
+   }
+
+   return false;
+}
+
 template <chip CHIP>
 void
 tu_load_gmem_attachment(struct tu_cmd_buffer *cmd,
@@ -5778,6 +5833,10 @@ tu_load_gmem_attachment(struct tu_cmd_buffer *cmd,
    if (!load_common && !load_stencil)
       return;
 
+   const bool bounded_external_load =
+      iview->image->android_external_no_gmem_padding &&
+      tu_attachment_gmem_edge_unaligned(cmd, a, true);
+
    trace_start_gmem_load(&cmd->rp_trace, cs, cmd, attachment->format, force_load);
 
    /* If attachment will be cleared by vkCmdClearAttachments - it is likely
@@ -5791,8 +5850,7 @@ tu_load_gmem_attachment(struct tu_cmd_buffer *cmd,
    if (cond_exec)
       tu_begin_load_store_cond_exec(cmd, cs, true);
 
-   if (TU_DEBUG(3D_LOAD) ||
-       cmd->state.pass->has_fdm ||
+   if (TU_DEBUG(3D_LOAD) || bounded_external_load || cmd->state.pass->has_fdm ||
        /* Replicating unresolve seems to not work and the blob never uses it.
         */
        (a != gmem_a)) {
@@ -5982,44 +6040,14 @@ store_3d_blit(struct tu_cmd_buffer *cmd,
 static bool
 tu_attachment_store_unaligned(struct tu_cmd_buffer *cmd, uint32_t a)
 {
-   struct tu_physical_device *phys_dev = cmd->device->physical_device;
    const struct tu_image_view *iview = cmd->state.attachments[a];
 
    /* Unaligned store is incredibly rare in CTS, we have to force it to test. */
    if (TU_DEBUG(UNALIGNED_STORE))
       return true;
 
-   unsigned render_area_count =
-      cmd->state.per_layer_render_area ? cmd->state.pass->num_views : 1;
-
-   /* With subsampling, the formula below doesn't work, but we already
-    * conditionally use A2D for the unaligned blits at the edge. Just return
-    * false here.
-    */
-   if (iview->image->vk.create_flags & VK_IMAGE_CREATE_SUBSAMPLED_BIT_EXT)
-      return false;
-
-   for (unsigned i = 0; i < render_area_count; i++) {
-      const VkRect2D *render_area = &cmd->state.render_areas[i];
-      uint32_t x1 = render_area->offset.x;
-      uint32_t y1 = render_area->offset.y;
-      uint32_t x2 = x1 + render_area->extent.width;
-      uint32_t y2 = y1 + render_area->extent.height;
-      /* x2/y2 can be unaligned if equal to the size of the image, since it will
-       * write into padding space. The one exception is linear levels which don't
-       * have the required y padding in the layout (except for the last level)
-       */
-      bool need_y2_align =
-         y2 != iview->view.height || iview->view.need_y2_align;
-
-      if (x1 % phys_dev->info->gmem_align_w ||
-          (x2 % phys_dev->info->gmem_align_w && x2 != iview->view.width) ||
-          y1 % phys_dev->info->gmem_align_h ||
-          (y2 % phys_dev->info->gmem_align_h && need_y2_align))
-         return true;
-   }
-
-   return false;
+   return tu_attachment_gmem_edge_unaligned(
+      cmd, a, iview->image->android_external_no_gmem_padding);
 }
 
 /* The fast path cannot handle mismatched mutability. */
