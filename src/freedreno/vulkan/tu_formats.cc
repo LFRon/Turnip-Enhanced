@@ -248,7 +248,8 @@ tu_physical_device_get_format_properties(
          if (ycbcr_info->n_planes > 1) {
             optimal |= VK_FORMAT_FEATURE_2_COSITED_CHROMA_SAMPLES_BIT |
                        VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_YCBCR_CONVERSION_LINEAR_FILTER_BIT;
-            if (physical_device->info->props.has_separate_chroma_filter)
+            if (physical_device->info->props.has_separate_chroma_filter &&
+                !tu_format_uses_software_ycbcr(vk_format))
                optimal |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_YCBCR_CONVERSION_SEPARATE_RECONSTRUCTION_FILTER_BIT;
          }
       } else {
@@ -1057,7 +1058,9 @@ tu_GetPhysicalDeviceImageFormatProperties2(
    }
 
    if (ycbcr_props)
-      ycbcr_props->combinedImageSamplerDescriptorCount = 1;
+      ycbcr_props->combinedImageSamplerDescriptorCount =
+         tu_format_uses_software_ycbcr(base_info->format) ?
+            TU_MAX_PLANE_COUNT : 1;
 
    if (hic_props) {
       /* This should match tu_image_init() as much as possible given the
