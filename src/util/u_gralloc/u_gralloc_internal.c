@@ -61,6 +61,14 @@ get_fourcc_yuv(int native, enum chroma_order chroma_order, int chroma_step)
 bool
 is_hal_format_yuv(int native)
 {
+   /* P010 needs explicit plane-component metadata and must never fall back to
+    * the packed-RGB path.  Do not add it to droid_yuv_formats: android_ycbcr
+    * alone cannot describe the 10 bits stored at bit offset 6 in each
+    * 16-bit component.
+    */
+   if (native == HAL_PIXEL_FORMAT_YCBCR_P010)
+      return true;
+
    for (int i = 0; i < ARRAY_SIZE(droid_yuv_formats); ++i)
       if (droid_yuv_formats[i].native == native)
          return true;
