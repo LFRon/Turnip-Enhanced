@@ -329,12 +329,26 @@ tu_image_view_init(struct tu_device *device,
    }
 }
 
+static bool
+tu_is_p010_format(VkFormat format)
+{
+   switch (format) {
+   case VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16:
+   case VK_FORMAT_R10X6_UNORM_PACK16:
+   case VK_FORMAT_R10X6G10X6_UNORM_2PACK16:
+      return true;
+   default:
+      return false;
+   }
+}
+
 bool
 tiling_possible(VkFormat format)
 {
    if (format == VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM ||
        format == VK_FORMAT_G8B8G8R8_422_UNORM ||
-       format == VK_FORMAT_B8G8R8G8_422_UNORM)
+       format == VK_FORMAT_B8G8R8G8_422_UNORM ||
+       tu_is_p010_format(format))
       return false;
 
    return true;
@@ -373,7 +387,8 @@ ubwc_possible(struct tu_device *device,
     */
    if (vk_format_is_compressed(format) ||
        format == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 ||
-       format == VK_FORMAT_S8_UINT)
+       format == VK_FORMAT_S8_UINT ||
+       tu_is_p010_format(format))
       return false;
 
    /* In copy_format, we treat snorm as unorm to avoid clamping.  But snorm

@@ -69,6 +69,7 @@ static const struct fd6_format formats[PIPE_FORMAT_COUNT] = {
    _TC(S8_UINT,    8_UINT,                      WZYX),
 
    /* 16-bit */
+   _T_(X6R10_UNORM, P010_Y,                     WZYX),
    VTC(R16_UNORM,   16_UNORM,                   WZYX),
    VTC(R16_SNORM,   16_SNORM,                   WZYX),
    VTC(R16_UINT,    16_UINT,                    WZYX),
@@ -134,6 +135,7 @@ static const struct fd6_format formats[PIPE_FORMAT_COUNT] = {
    VT_(B8G8R8_SINT,    8_8_8_SINT,              WXYZ),
 
    /* 32-bit */
+   _T_(X6R10X6G10_UNORM, P010_UV,               WZYX),
    V__(R32_UNORM,   32_UNORM,                   WZYX),
    V__(R32_SNORM,   32_SNORM,                   WZYX),
    VTC(R32_UINT,    32_UINT,                    WZYX),
@@ -386,6 +388,7 @@ static const struct fd6_format formats[PIPE_FORMAT_COUNT] = {
    _T_(R8_G8B8_420_UNORM, R8_G8B8_2PLANE_420_UNORM, WZYX), /* Gallium NV12 */
    _T_(G8_B8R8_420_UNORM, R8_G8B8_2PLANE_420_UNORM, WZYX), /* Vulkan NV12 */
    _T_(G8_B8_R8_420_UNORM, R8_G8_B8_3PLANE_420_UNORM, WZYX),
+   _T_(X6G10_X6B10X6R10_420_UNORM, P010, WZYX), /* Vulkan P010 */
 };
 /* clang-format on */
 
