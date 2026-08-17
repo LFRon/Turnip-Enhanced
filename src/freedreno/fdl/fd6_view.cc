@@ -24,6 +24,20 @@ fdl6_tex_type(enum fdl_view_type type, bool storage)
       A6XX_TEX_2D : (enum a6xx_tex_type) type;
 }
 
+static bool
+fdl6_is_multiplanar_yuv_format(enum pipe_format format)
+{
+   switch (format) {
+   case PIPE_FORMAT_R8_G8B8_420_UNORM:
+   case PIPE_FORMAT_G8_B8R8_420_UNORM:
+   case PIPE_FORMAT_G8_B8_R8_420_UNORM:
+   case PIPE_FORMAT_X6G10_X6B10X6R10_420_UNORM:
+      return true;
+   default:
+      return false;
+   }
+}
+
 void
 fdl6_format_swiz(enum pipe_format format, bool has_z24uint_s8uint,
                  unsigned char *format_swiz)
@@ -45,6 +59,7 @@ fdl6_format_swiz(enum pipe_format format, bool has_z24uint_s8uint,
    case PIPE_FORMAT_B8G8_R8G8_UNORM:
    case PIPE_FORMAT_G8_B8R8_420_UNORM:
    case PIPE_FORMAT_G8_B8_R8_420_UNORM:
+   case PIPE_FORMAT_X6G10_X6B10X6R10_420_UNORM:
       /* These formats are currently only used for Vulkan, and border colors
        * aren't allowed on these formats in Vulkan because, from the
        * description of VkImageViewCreateInfo:
@@ -281,9 +296,7 @@ fdl6_view_init(struct fdl6_view *view, const struct fdl_layout **layouts,
       if (layout->tile_all)
          view->descriptor[3] |= A6XX_TEX_MEMOBJ_3_TILE_ALL;
 
-      if (args->format == PIPE_FORMAT_R8_G8B8_420_UNORM ||
-          args->format == PIPE_FORMAT_G8_B8R8_420_UNORM ||
-          args->format == PIPE_FORMAT_G8_B8_R8_420_UNORM) {
+      if (fdl6_is_multiplanar_yuv_format(args->format)) {
          /* chroma offset re-uses MIPLVLS bits */
          assert(args->level_count == 1);
          if (args->chroma_offsets[0] == FDL_CHROMA_LOCATION_MIDPOINT)
@@ -369,9 +382,7 @@ fdl6_view_init(struct fdl6_view *view, const struct fdl_layout **layouts,
                       A8XX_TEX_MEMOBJ_6_MIN_LINE_OFFSET(layout->pitchalign - 6) |
                       A8XX_TEX_MEMOBJ_6_MIPLVLS(args->level_count - 1);
 
-      if (args->format == PIPE_FORMAT_R8_G8B8_420_UNORM ||
-          args->format == PIPE_FORMAT_G8_B8R8_420_UNORM ||
-          args->format == PIPE_FORMAT_G8_B8_R8_420_UNORM) {
+      if (fdl6_is_multiplanar_yuv_format(args->format)) {
          uint64_t base_addr[3];
 
          if (ubwc_enabled) {

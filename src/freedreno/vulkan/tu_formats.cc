@@ -398,7 +398,8 @@ tu_physical_device_get_format_properties(
        /* We don't actually support tiling for this format, but we need to
         * fake it as it's required by VK_KHR_sampler_ycbcr_conversion.
         */
-       vk_format != VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM) {
+       vk_format != VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM &&
+       vk_format != VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16) {
       optimal = 0;
    }
 
