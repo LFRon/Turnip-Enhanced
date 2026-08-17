@@ -96,6 +96,9 @@ constexpr int QTI_HANDLE_NUM_FDS = 2;
 constexpr int QTI_MODERN_HANDLE_NUM_INTS = 24;
 constexpr int QTI_LEGACY_BASE_HANDLE_NUM_INTS = 22;
 constexpr int QTI_LEGACY_RESERVED_HANDLE_NUM_INTS = 23;
+constexpr int QTI_LEGACY_TWO_OPTIONAL_WORDS_HANDLE_NUM_INTS = 24;
+constexpr int QTI_LEGACY_THREE_OPTIONAL_WORDS_HANDLE_NUM_INTS = 25;
+constexpr int QTI_LEGACY_ALL_OPTIONAL_WORDS_HANDLE_NUM_INTS = 26;
 constexpr int32_t QTI_HANDLE_MAGIC =
    ('g' << 24) | ('m' << 16) | ('s' << 8) | 'm';
 
@@ -428,9 +431,21 @@ static const qti_legacy_handle_profile *
 qti_get_legacy_handle_profile(const native_handle_t *handle)
 {
    static constexpr qti_legacy_handle_profile profiles[] = {
-      /* SM8250-family LineageOS builds enable reserved_size. */
+      /*
+       * The public SM8150/SM8250 private_handle_t keeps this entire common
+       * prefix stable and conditionally appends reserved_size (one word),
+       * custom_content_md_reserved_size (one word), and the UBWCP
+       * linear_size/format pair.  We never inspect those optional fields;
+       * enumerate every layout produced by that header instead of treating a
+       * valid build-time tail as a different core ABI.
+       */
+      {QTI_LEGACY_ALL_OPTIONAL_WORDS_HANDLE_NUM_INTS,
+       "four-optional-words"},
+      {QTI_LEGACY_THREE_OPTIONAL_WORDS_HANDLE_NUM_INTS,
+       "three-optional-words"},
+      {QTI_LEGACY_TWO_OPTIONAL_WORDS_HANDLE_NUM_INTS,
+       "two-optional-words"},
       {QTI_LEGACY_RESERVED_HANDLE_NUM_INTS, "reserved-size"},
-      /* Preserve compatibility with otherwise identical older builds. */
       {QTI_LEGACY_BASE_HANDLE_NUM_INTS, "base"},
    };
 
