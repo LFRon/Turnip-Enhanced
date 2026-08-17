@@ -126,6 +126,14 @@ constexpr uint32_t QTI_HANDLE_FLAG_UBWC_ALIGNED_PI =
    UINT32_C(0x40000000);
 constexpr uint32_t QTI_HANDLE_FLAG_SECURE_BUFFER = UINT32_C(0x00000400);
 
+/* The public QTI display stack uses this legacy modifier bit to describe the
+ * 16-bit container used by P010.  Its numeric value was later assigned to
+ * DRM_FORMAT_MOD_QCOM_TILED2, so it must only be interpreted as DX after an
+ * exact QTI P010 format and plane-layout match.
+ */
+constexpr uint64_t QTI_DRM_FORMAT_MODIFIER_DX =
+   fourcc_mod_code(QCOM, 0x2);
+
 /* QTI's private 8-bit NV12 UBWC format.  This is a gralloc software-format
  * ABI gate, not a GPU-model gate: any QTI stack using this format still has
  * to pass all of the plane geometry and allocation-layout checks below.
@@ -144,6 +152,10 @@ constexpr int32_t QTI_HAL_PIXEL_FORMAT_NV21_ZSL = INT32_C(0x113);
 constexpr int32_t QTI_HAL_PIXEL_FORMAT_YCRCB_420_SP_VENUS = INT32_C(0x114);
 constexpr int32_t QTI_HAL_PIXEL_FORMAT_NV12_HEIF = INT32_C(0x116);
 constexpr int32_t QTI_HAL_PIXEL_FORMAT_NV12_LINEAR_FLEX = INT32_C(0x125);
+constexpr int32_t QTI_HAL_PIXEL_FORMAT_YCBCR_420_P010 =
+   HAL_PIXEL_FORMAT_YCBCR_P010;
+constexpr int32_t QTI_HAL_PIXEL_FORMAT_YCBCR_420_P010_VENUS =
+   INT32_C(0x7fa30c0a);
 constexpr int32_t QTI_HAL_PIXEL_FORMAT_RGBA_5551 = INT32_C(6);
 constexpr int32_t QTI_HAL_PIXEL_FORMAT_RGBA_4444 = INT32_C(7);
 constexpr int32_t QTI_HAL_PIXEL_FORMAT_BGRX_8888 = INT32_C(0x112);
@@ -688,6 +700,45 @@ is_420sp_chroma_plane(const PlaneLayout &layout, bool cr_first,
 }
 
 static bool
+is_p010_luma_plane(const PlaneLayout &layout)
+{
+   if (layout.sampleIncrementInBits != 16 ||
+       layout.horizontalSubsampling != 1 ||
+       layout.verticalSubsampling != 1 || layout.components.size() != 1)
+      return false;
+
+   const PlaneLayoutComponent &component = layout.components[0];
+   return is_standard_component(component, PLANE_COMPONENT_Y) &&
+          component.offsetInBits == 6 && component.sizeInBits == 10;
+}
+
+static bool
+is_p010_chroma_plane(const PlaneLayout &layout)
+{
+   if (layout.sampleIncrementInBits != 32 ||
+       layout.horizontalSubsampling != 2 ||
+       layout.verticalSubsampling != 2 || layout.components.size() != 2)
+      return false;
+
+   bool found_cb = false;
+   bool found_cr = false;
+   for (const PlaneLayoutComponent &component : layout.components) {
+      if (is_standard_component(component, PLANE_COMPONENT_CB) &&
+          component.offsetInBits == 6 && component.sizeInBits == 10) {
+         found_cb = true;
+      } else if (is_standard_component(component, PLANE_COMPONENT_CR) &&
+                 component.offsetInBits == 22 &&
+                 component.sizeInBits == 10) {
+         found_cr = true;
+      } else {
+         return false;
+      }
+   }
+
+   return found_cb && found_cr;
+}
+
+static bool
 is_standard_rgb_plane(const PlaneLayout &layout)
 {
    if (layout.components.size() < 3 || layout.components.size() > 4 ||
@@ -881,6 +932,59 @@ is_yv12_plane(const PlaneLayout &layout, int64_t component_type,
    const PlaneLayoutComponent &component = layout.components[0];
    return is_standard_component(component, component_type) &&
           component.offsetInBits == 0 && component.sizeInBits == 8;
+}
+
+static bool
+normalize_qti_p010_layouts(
+   const std::vector<PlaneLayout> &layouts,
+   const struct u_gralloc_buffer_handle *hnd,
+   std::vector<PlaneLayout> *normalized)
+{
+   if (layouts.size() != 2)
+      return false;
+
+   const PlaneLayout *y = nullptr;
+   const PlaneLayout *uv = nullptr;
+   for (const PlaneLayout &layout : layouts) {
+      const PlaneLayout **plane = nullptr;
+      if (is_p010_luma_plane(layout))
+         plane = &y;
+      else if (is_p010_chroma_plane(layout))
+         plane = &uv;
+      else
+         return false;
+
+      if (*plane)
+         return false;
+      *plane = &layout;
+   }
+
+   if (!y || !uv || (y->widthInSamples & 1) ||
+       (y->heightInSamples & 1) ||
+       uv->widthInSamples != y->widthInSamples / 2 ||
+       uv->heightInSamples != y->heightInSamples / 2 ||
+       y->strideInBytes != uv->strideInBytes ||
+       (y->strideInBytes & 1) || y->offsetInBytes != 0 ||
+       static_cast<uint64_t>(uv->offsetInBytes) !=
+          static_cast<uint64_t>(y->totalSizeInBytes))
+      return false;
+
+   /* Standard metadata and AHardwareBuffer describe the logical extent;
+    * QTI PlaneLayout may additionally include aligned rows in totalSize.
+    * Require an exact logical match when the caller supplied that extent,
+    * while retaining the already-validated aligned allocation footprint.
+    */
+   if ((hnd->width &&
+        static_cast<uint64_t>(y->widthInSamples) != hnd->width) ||
+       (hnd->height &&
+        static_cast<uint64_t>(y->heightInSamples) != hnd->height))
+      return false;
+
+   normalized->clear();
+   normalized->reserve(2);
+   normalized->push_back(*y);
+   normalized->push_back(*uv);
+   return true;
 }
 
 static bool
@@ -1396,6 +1500,7 @@ enum class qti_yuv_layout_kind {
    NV12_LINEAR,
    NV21_LINEAR,
    YV12_LINEAR,
+   P010_LINEAR,
    NV12_UBWC,
 };
 
@@ -1431,6 +1536,10 @@ qti_get_yuv_format_profile(int32_t format)
        qti_yuv_layout_kind::NV21_LINEAR},
       {HAL_PIXEL_FORMAT_YV12, DRM_FORMAT_YVU420,
        qti_yuv_layout_kind::YV12_LINEAR},
+      {QTI_HAL_PIXEL_FORMAT_YCBCR_420_P010, DRM_FORMAT_P010,
+       qti_yuv_layout_kind::P010_LINEAR},
+      {QTI_HAL_PIXEL_FORMAT_YCBCR_420_P010_VENUS, DRM_FORMAT_P010,
+       qti_yuv_layout_kind::P010_LINEAR},
       {QTI_HAL_PIXEL_FORMAT_YCBCR_420_SP_VENUS_UBWC, DRM_FORMAT_NV12,
        qti_yuv_layout_kind::NV12_UBWC},
    };
@@ -1706,6 +1815,78 @@ qti_legacy_validate_semiplanar_layout(
    return qti_legacy_pointer_matches(handle_info.base, cb_offset,
                                      ycbcr[0].cb) &&
           qti_legacy_pointer_matches(handle_info.base, cr_offset,
+                                     ycbcr[0].cr);
+}
+
+static bool
+qti_legacy_validate_p010_layout(
+   const qti_legacy_handle_info &handle_info,
+   const LegacyQtiPlaneLayoutInfo *layouts,
+   const struct android_ycbcr (&ycbcr)[2])
+{
+   const LegacyQtiPlaneLayoutInfo &y = layouts[0];
+   const LegacyQtiPlaneLayoutInfo &uv = layouts[1];
+
+   if ((handle_info.unaligned_width & 1) ||
+       (handle_info.unaligned_height & 1) ||
+       handle_info.width > INT_MAX / 2)
+      return false;
+
+   const uint64_t expected_stride_bytes =
+      static_cast<uint64_t>(handle_info.width) * 2;
+   const uint64_t y_rows =
+      static_cast<uint64_t>(handle_info.unaligned_height);
+   const uint64_t uv_rows = y_rows / 2;
+
+   /* The public SM8150 helper reports the standard P010 chroma scanline
+    * count as the full aligned height while its byte range correctly stores
+    * half-height 4:2:0 chroma.  Validate the logical AOSP P010 footprint
+    * against the bounded range instead of trusting that one inconsistent
+    * diagnostic field.  The Venus variant reports the half height directly.
+    */
+   if (y.component != QTI_LEGACY_PLANE_COMPONENT_Y ||
+       uv.component != (QTI_LEGACY_PLANE_COMPONENT_CB |
+                        QTI_LEGACY_PLANE_COMPONENT_CR) ||
+       y.horizontal_subsampling != 0 || y.vertical_subsampling != 0 ||
+       uv.horizontal_subsampling != 1 || uv.vertical_subsampling != 1 ||
+       y.step != 2 || uv.step != 4 || y.stride != handle_info.width ||
+       uv.stride != handle_info.width || y.stride_bytes <= 0 ||
+       uv.stride_bytes <= 0 ||
+       static_cast<uint64_t>(y.stride_bytes) != expected_stride_bytes ||
+       static_cast<uint64_t>(uv.stride_bytes) != expected_stride_bytes ||
+       y.scanlines < handle_info.unaligned_height ||
+       uv.scanlines < handle_info.unaligned_height / 2 ||
+       !qti_legacy_plane_range_fits(y, handle_info.allocation_size) ||
+       !qti_legacy_plane_range_fits(uv, handle_info.allocation_size) ||
+       y.offset > handle_info.declared_size ||
+       y.size > handle_info.declared_size - y.offset ||
+       uv.offset > handle_info.declared_size ||
+       uv.size > handle_info.declared_size - uv.offset ||
+       y_rows > y.size / expected_stride_bytes ||
+       uv_rows > uv.size / expected_stride_bytes || y.offset != 0 ||
+       static_cast<uint64_t>(uv.offset) !=
+          static_cast<uint64_t>(y.offset) + y.size ||
+       !qti_legacy_ranges_do_not_overlap(layouts, 2) ||
+       !qti_legacy_ycbcr_is_empty(ycbcr[1]) ||
+       ycbcr[0].ystride != static_cast<size_t>(y.stride_bytes) ||
+       ycbcr[0].cstride != static_cast<size_t>(uv.stride_bytes) ||
+       ycbcr[0].chroma_step != 4 ||
+       !qti_legacy_pointer_matches(handle_info.base, y.offset, ycbcr[0].y) ||
+       !qti_legacy_pointer_matches(handle_info.base, uv.offset,
+                                   ycbcr[0].cb))
+      return false;
+
+   if (uv.offset > UINT32_MAX - 2)
+      return false;
+
+   /* CopyPlaneLayoutInfotoAndroidYcbcr() advances Cr by one byte for every
+    * semiplanar format, including P010.  Accept that public-helper result as
+    * well as the correct next 16-bit sample address; neither pointer is used
+    * to derive the Vulkan plane layout.
+    */
+   return qti_legacy_pointer_matches(handle_info.base, uv.offset + 1,
+                                     ycbcr[0].cr) ||
+          qti_legacy_pointer_matches(handle_info.base, uv.offset + 2,
                                      ycbcr[0].cr);
 }
 
@@ -2102,6 +2283,13 @@ qti_get_legacy_plane_layout_buffer_basic_info(
       if (valid)
          return qti_copy_legacy_yv12_layout(hnd->handle, layouts, out);
       break;
+   case qti_yuv_layout_kind::P010_LINEAR:
+      valid = plane_count == 2 &&
+              qti_legacy_validate_p010_layout(handle_info, layouts, ycbcr);
+      if (valid)
+         return qti_copy_legacy_semiplanar_layout(
+            hnd->handle, *format, layouts, out);
+      break;
    case qti_yuv_layout_kind::NV12_UBWC:
       valid = plane_count == 4 &&
               qti_legacy_validate_nv12_ubwc_layout(handle_info, layouts,
@@ -2430,6 +2618,38 @@ qti_get_modern_buffer_basic_info(
       authoritative_fourcc
          ? authoritative_fourcc
          : (format_profile ? format_profile->drm_fourcc : 0);
+
+   if (format_profile &&
+       format_profile->layout == qti_yuv_layout_kind::P010_LINEAR &&
+       normalize_qti_p010_layouts(layouts, &validated_hnd, &normalized)) {
+      /* QTI's public GetDRMFormat() predates DRM_FORMAT_P010 and describes
+       * the same linear allocation as NV12 plus its private DX bit.  That bit
+       * now aliases QCOM_TILED2, so normalize it only after the HAL format
+       * and every AOSP P010 component field have independently matched.
+       */
+      const bool standard_metadata =
+         authoritative_fourcc == DRM_FORMAT_P010 &&
+         authoritative_modifier == DRM_FORMAT_MOD_LINEAR;
+      const bool legacy_qti_metadata =
+         authoritative_fourcc == DRM_FORMAT_NV12 &&
+         authoritative_modifier == QTI_DRM_FORMAT_MODIFIER_DX;
+      if ((has_authoritative_private_flags &&
+           (!standard_metadata && !legacy_qti_metadata)) ||
+          (has_authoritative_private_flags &&
+           (authoritative_private_flags & QTI_HANDLE_FLAG_UBWC_ALIGNED))) {
+         mesa_logw_once("QTI gralloc P010 FourCC/modifier/flags disagree "
+                        "with its plane layout");
+         return -EINVAL;
+      }
+
+      out->drm_fourcc = DRM_FORMAT_P010;
+      out->modifier = DRM_FORMAT_MOD_LINEAR;
+      const int ret = copy_linear_layout(hnd->handle, normalized,
+                                         allocation_size, out);
+      if (ret)
+         mesa_logw_once("Unsupported or inconsistent QTI P010 plane layout");
+      return ret;
+   }
 
    if ((!effective_fourcc || effective_fourcc == DRM_FORMAT_YVU420) &&
        (!has_authoritative_private_flags ||
