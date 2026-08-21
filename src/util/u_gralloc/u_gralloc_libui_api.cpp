@@ -208,6 +208,13 @@ constexpr char QTI_GET_MODERN_COLOR_SPACE_SYMBOL[] =
    "_ZN7gralloc25GetColorSpaceFromMetadataEPN10qtigralloc16private_handle_tEPi";
 constexpr char QTI_GET_LEGACY_YUV_UBWC_PLANE_INFO_SYMBOL[] =
    "_ZN7gralloc21GetYuvUbwcSPPlaneInfoEjjiPNS_15PlaneLayoutInfoE";
+/* The SM8150/SDM845 public gralloc exports the same helper name with a
+ * different, narrower signature that fills an android_ycbcr in-place instead
+ * of the newer PlaneLayoutInfo array.  Both ABIs coexist in the wild, so each
+ * one is loaded by its exact mangled symbol.
+ */
+constexpr char QTI_GET_LEGACY_YCB_CR_UBWC_PLANE_INFO_SYMBOL[] =
+   "_ZN7gralloc25GetYuvUbwcSPPlaneInfoEjjjiP13android_ycbcr";
 constexpr char QTI_GET_LEGACY_YUV_PLANE_INFO_SYMBOL[] =
    "_ZN7gralloc15GetYUVPlaneInfoEPK16private_handle_tP13android_ycbcr";
 constexpr char QTI_GET_LEGACY_YUV_PLANE_LAYOUTS_SYMBOL[] =
@@ -276,6 +283,14 @@ using GetQtiPlaneLayouts =
 using GetQtiMetadataValue = int32_t (*)(void *, int64_t, void *);
 using GetLegacyQtiYuvUbwcPlaneInfo =
    void (*)(uint32_t, uint32_t, int, LegacyQtiPlaneLayoutInfo *);
+/* SM8150/SDM845 variant: GetYuvUbwcSPPlaneInfo(base, width, height,
+ * color_format, struct android_ycbcr *).  The first argument is the GPU
+ * address base; on the legacy handle ABI that base equals the handle base,
+ * which the caller already validates, so the result is used as an
+ * authoritative geometry hint for the data planes of an NV12 UBWC buffer.
+ */
+using GetLegacyQtiYcbcrUbwcPlaneInfo =
+   void (*)(uint64_t, uint32_t, uint32_t, int, struct android_ycbcr *);
 using GetLegacyQtiYuvPlaneInfo =
    int (*)(const native_handle_t *, struct android_ycbcr *);
 using GetLegacyQtiYuvPlaneLayouts =
@@ -325,6 +340,7 @@ struct qti_metadata_gralloc {
    GetQtiPlaneLayouts get_plane_layouts;
    GetQtiMetadataValue get_metadata_value;
    GetLegacyQtiYuvUbwcPlaneInfo get_legacy_yuv_ubwc_plane_info;
+   GetLegacyQtiYcbcrUbwcPlaneInfo get_legacy_ycbcr_ubwc_plane_info;
    GetLegacyQtiYuvPlaneInfo get_legacy_yuv_plane_info;
    GetLegacyQtiYuvPlaneLayouts get_legacy_yuv_plane_layouts;
    GetLegacyQtiRgbPlaneLayouts get_legacy_rgb_plane_layouts;
@@ -411,6 +427,30 @@ load_qti_legacy_nv12_ubwc_api(void *library, qti_metadata_gralloc *gr)
       return false;
 
    gr->get_legacy_yuv_ubwc_plane_info = get_yuv_ubwc_plane_info;
+   gr->get_legacy_yuv_plane_info = get_yuv_plane_info;
+   return true;
+}
+
+static bool
+load_qti_legacy_ycbcr_ubwc_api(void *library, qti_metadata_gralloc *gr)
+{
+   /* SM8150/SDM845 public gralloc ABI.  GetYuvUbwcSPPlaneInfo fills an
+    * android_ycbcr (not a PlaneLayoutInfo array) and takes the base as its
+    * first argument, while GetYUVPlaneInfo is the same handle-aware helper as
+    * the other legacy backends.  Both exact symbols must exist before this
+    * backend is selected; absence only means this revision is not SM8150/
+    * SDM845 and the caller falls through to a newer backend.
+    */
+   GetLegacyQtiYcbcrUbwcPlaneInfo get_ycbcr_ubwc_plane_info = nullptr;
+   GetLegacyQtiYuvPlaneInfo get_yuv_plane_info = nullptr;
+   if (!load_function(library,
+                      QTI_GET_LEGACY_YCB_CR_UBWC_PLANE_INFO_SYMBOL,
+                      &get_ycbcr_ubwc_plane_info) ||
+       !load_function(library, QTI_GET_LEGACY_YUV_PLANE_INFO_SYMBOL,
+                      &get_yuv_plane_info))
+      return false;
+
+   gr->get_legacy_ycbcr_ubwc_plane_info = get_ycbcr_ubwc_plane_info;
    gr->get_legacy_yuv_plane_info = get_yuv_plane_info;
    return true;
 }
@@ -2502,6 +2542,201 @@ qti_get_legacy_nv12_ubwc_buffer_basic_info(
 }
 
 static int
+qti_get_legacy_ycbcr_ubwc_buffer_basic_info(
+   qti_metadata_gralloc *gr, struct u_gralloc_buffer_handle *hnd,
+   struct u_gralloc_buffer_basic_info *out)
+{
+   if (!hnd || !hnd->handle)
+      return -EINVAL;
+
+   if (!qti_legacy_handle_is_compatible(hnd->handle)) {
+      /* Loading the legacy helper does not prove that every handle in the
+       * process uses its private ABI.  Unknown/ambiguous handles must not
+       * re-enter fallback's IMPLEMENTATION_DEFINED RGB heuristic.
+       */
+      if (can_use_fallback_for_known_non_yuv(hnd))
+         return qti_fallback_get_buffer_basic_info(gr, hnd, out);
+      return -EINVAL;
+   }
+
+   const native_handle_t *handle = hnd->handle;
+   qti_legacy_handle_info handle_info = {};
+   if (!qti_get_legacy_handle_info(handle, &handle_info))
+      return -EINVAL;
+
+   const int contract_result =
+      qti_validate_legacy_buffer_contract(handle_info, hnd);
+   if (contract_result)
+      return contract_result;
+
+   /* This is the SM8150/SDM845 private gralloc ABI, selected purely by the
+    * exact mangled symbols of the handle-aware helper and the android_ycbcr
+    * variant of GetYuvUbwcSPPlaneInfo().  It is a software-ABI gate, not a
+    * GPU or device-model gate: any stack exporting the same symbols uses this
+    * backend.
+    */
+   const qti_yuv_format_profile *format =
+      qti_get_yuv_format_profile(handle_info.format);
+   if (!format || !qti_legacy_description_matches(hnd, *format))
+      return -EINVAL;
+
+   struct android_ycbcr ycbcr[2] = {};
+   if (gr->get_legacy_yuv_plane_info(handle, ycbcr) != 0 ||
+       !qti_legacy_ycbcr_is_empty(ycbcr[1]))
+      return -EINVAL;
+
+   const uint32_t flags = static_cast<uint32_t>(handle_info.flags);
+   if (flags & QTI_HANDLE_FLAG_UBWC_ALIGNED_PI)
+      return -ENOTSUP;
+
+   /* The SM8150/SDM845 android_ycbcr helper reports the data-plane geometry
+    * but not the leading UBWC metadata sizes.  Turnip requires those
+    * authoritative metadata/data ranges for a QCOM_COMPRESSED import (see the
+    * gralloc/Turnip modifier layout cross-check in tu_image.c), and deriving
+    * them would mean re-implementing the vendor VENUS layout formula.  Refuse
+    * a compressed allocation rather than guess its metadata or silently treat
+    * it as linear.
+    */
+   if (flags & QTI_HANDLE_FLAG_UBWC_ALIGNED) {
+      mesa_logw_once("Unsupported QTI NV12 UBWC allocation without "
+                     "authoritative metadata on the legacy ycbcr ABI");
+      return -ENOTSUP;
+   }
+
+   if (flags & QTI_HANDLE_FLAG_SECURE_BUFFER)
+      return -ENOTSUP;
+
+   const uint64_t y_off = reinterpret_cast<uintptr_t>(ycbcr[0].y);
+   const uint64_t cb_off = reinterpret_cast<uintptr_t>(ycbcr[0].cb);
+   const uint64_t cr_off = reinterpret_cast<uintptr_t>(ycbcr[0].cr);
+
+   const uint64_t base = static_cast<uint64_t>(handle_info.base);
+   const uint64_t alloc = handle_info.allocation_size;
+   const uint64_t declared = handle_info.declared_size;
+   const auto in_range = [base, alloc, declared](uint64_t off, uint64_t bytes) {
+      if (off < base || bytes == 0 || bytes > alloc)
+         return false;
+      const uint64_t rel = off - base;
+      return rel <= declared && bytes <= alloc - rel &&
+             bytes <= declared - rel;
+   };
+
+   const uint64_t width = static_cast<uint64_t>(handle_info.unaligned_width);
+   const uint64_t height = static_cast<uint64_t>(handle_info.unaligned_height);
+   const uint64_t aligned_width =
+      static_cast<uint64_t>(handle_info.width);
+   const uint64_t aligned_height =
+      static_cast<uint64_t>(handle_info.height);
+   if (width == 0 || height == 0 || aligned_width < width ||
+       aligned_height < height)
+      return -EINVAL;
+
+   const uint64_t ystride = static_cast<uint64_t>(ycbcr[0].ystride);
+   const uint64_t cstride = static_cast<uint64_t>(ycbcr[0].cstride);
+   const uint64_t chroma_step = static_cast<uint64_t>(ycbcr[0].chroma_step);
+   if (ystride == 0 || cstride == 0 || ystride < width)
+      return -EINVAL;
+
+   /* GetYuvSPPlaneInfo() yields stride == aligned width for both planes and a
+    * chroma_step of 2 for NV12/NV21.  YV12 uses chroma_step 1 and a separate
+    * Cb/Cr.  Any other chroma_step (3 = TP10, 4 = P010, ...) is not handled by
+    * this backend and stays fail-closed.
+    */
+   const bool yv12 = chroma_step == 1;
+   const bool semiplanar = chroma_step == 2;
+   if (!semiplanar && !yv12)
+      return -ENOTSUP;
+
+   /* Reject NV21/other private formats whose profile does not match the
+    * chroma geometry reported by the helper before trusting any pointer.
+    */
+   const bool nv21 = format->layout == qti_yuv_layout_kind::NV21_LINEAR;
+   if (semiplanar && format->layout != qti_yuv_layout_kind::NV12_LINEAR &&
+       format->layout != qti_yuv_layout_kind::NV21_LINEAR)
+      return -EINVAL;
+   if (yv12 && format->layout != qti_yuv_layout_kind::YV12_LINEAR)
+      return -EINVAL;
+
+   if (semiplanar) {
+      /* The handle-aware helper derives the Y and interleaved UV offsets from
+       * the handle's aligned dimensions, exactly like GetYuvSPPlaneInfo().
+       * The Y plane starts at base; UV immediately follows Y.
+       */
+      if (y_off != base)
+         return -EINVAL;
+
+      /* ystride is the aligned row length; the helper used the aligned height
+       * when computing the UV base, so the Y plane extends over aligned rows.
+       */
+      const uint64_t y_size = ystride * aligned_height;
+      if (y_size > UINT64_MAX - base)
+         return -EINVAL;
+
+      const uint64_t expected_uv_off = y_off + y_size;
+      const uint64_t uv_start = cr_off < cb_off ? cr_off : cb_off;
+      if (uv_start != expected_uv_off)
+         return -EINVAL;
+
+      /* Cb and Cr are interleaved, exactly one byte apart. */
+      const uint64_t delta =
+         cb_off > cr_off ? cb_off - cr_off : cr_off - cb_off;
+      if (delta != 1)
+         return -EINVAL;
+
+      const uint64_t uv_rel = uv_start - base;
+      const uint64_t uv_size =
+         cstride * ((aligned_height + 1) / 2);
+      if (uv_rel > INT_MAX || !in_range(uv_start, uv_size))
+         return -EINVAL;
+
+      out->drm_fourcc = nv21 ? DRM_FORMAT_NV21 : DRM_FORMAT_NV12;
+      out->modifier = DRM_FORMAT_MOD_LINEAR;
+      out->num_planes = 2;
+      out->fds[0] = out->fds[1] = handle->data[0];
+      out->offsets[0] = 0;
+      out->offsets[1] = static_cast<int>(uv_rel);
+      out->strides[0] = static_cast<int>(ystride);
+      out->strides[1] = static_cast<int>(cstride);
+      return 0;
+   }
+
+   /* YV12: Y at base, Cr immediately after Y, Cb after Cr.  The chroma stride
+    * is 16-byte aligned by the Android YV12 contract.  The helper derives all
+    * plane bases from the handle's aligned dimensions.
+    */
+   if (y_off != base || (ystride & 15) != 0)
+      return -EINVAL;
+
+   const uint64_t y_size = ystride * aligned_height;
+   const uint64_t c_size = cstride * ((aligned_height + 1) / 2);
+   if (y_size > UINT64_MAX - base || c_size > UINT64_MAX - (base + y_size) ||
+       cr_off != y_off + y_size || cb_off != cr_off + c_size ||
+       cstride < (width + 1) / 2 || !in_range(y_off, y_size) ||
+       !in_range(cr_off, c_size) || !in_range(cb_off, c_size))
+      return -EINVAL;
+
+   const uint64_t cr_rel = cr_off - base;
+   const uint64_t cb_rel = cb_off - base;
+   if (cr_rel > INT_MAX || cb_rel > INT_MAX)
+      return -EINVAL;
+
+   out->drm_fourcc = DRM_FORMAT_YVU420;
+   out->modifier = DRM_FORMAT_MOD_LINEAR;
+   out->num_planes = 3;
+   out->fds[0] = out->fds[1] = out->fds[2] = handle->data[0];
+   /* DRM_FORMAT_YVU420 is physical Y-Cr-Cb; vk_android swaps back to Vulkan's
+    * logical Y-Cb-Cr order.
+    */
+   out->offsets[0] = 0;
+   out->offsets[1] = static_cast<int>(cr_rel);
+   out->offsets[2] = static_cast<int>(cb_rel);
+   out->strides[0] = static_cast<int>(ystride);
+   out->strides[1] = static_cast<int>(cstride);
+   out->strides[2] = static_cast<int>(cstride);
+   return 0;
+}
+
+static int
 qti_get_modern_buffer_basic_info(
    qti_metadata_gralloc *gr, struct u_gralloc_buffer_handle *hnd,
    struct u_gralloc_buffer_basic_info *out)
@@ -2778,6 +3013,23 @@ static constexpr qti_metadata_backend qti_metadata_backends[] = {
       .handle_is_compatible = qti_legacy_handle_is_compatible,
       .get_buffer_basic_info =
          qti_get_legacy_nv12_ubwc_buffer_basic_info,
+   },
+   {
+      /* SM8150/SDM845 private gralloc ABI.  Selected by the exact mangled
+       * symbols of the android_ycbcr variant of GetYuvUbwcSPPlaneInfo() and
+       * the handle-aware GetYUVPlaneInfo(); both are required.  It restores
+       * authoritative NV12/NV21/YV12 linear imports for gralloc stacks that
+       * expose neither the modern AIDL PlaneLayout API nor the newer
+       * BufferInfo/PlaneLayoutInfo helpers.  This is a software-ABI gate, not
+       * a GPU-model gate.
+       */
+      .name = "legacy ycbcr handle",
+      .color_space_symbol = QTI_GET_LEGACY_COLOR_SPACE_SYMBOL,
+      .supports_swapchain_ubwc = false,
+      .load = load_qti_legacy_ycbcr_ubwc_api,
+      .handle_is_compatible = qti_legacy_handle_is_compatible,
+      .get_buffer_basic_info =
+         qti_get_legacy_ycbcr_ubwc_buffer_basic_info,
    },
 };
 
