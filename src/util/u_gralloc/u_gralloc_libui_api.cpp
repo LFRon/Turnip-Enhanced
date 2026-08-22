@@ -183,6 +183,8 @@ constexpr int64_t STANDARD_METADATA_PIXEL_FORMAT_MODIFIER = 8;
 constexpr int64_t STANDARD_METADATA_USAGE = 9;
 constexpr int64_t STANDARD_METADATA_ALLOCATION_SIZE = 10;
 constexpr int64_t STANDARD_METADATA_PROTECTED_CONTENT = 11;
+constexpr int64_t QTI_METADATA_ALIGNED_WIDTH_IN_PIXELS = 10014;
+constexpr int64_t QTI_METADATA_ALIGNED_HEIGHT_IN_PIXELS = 10015;
 
 /* Public QTI Mapper metadata.  HWC uses this immutable field to distinguish
  * ordinary UBWC from UBWC-PI; PlaneLayout and the generic QCOM DRM modifier do
@@ -547,6 +549,8 @@ struct qti_standard_buffer_metadata {
    uint32_t drm_fourcc;
    uint64_t modifier;
    uint64_t allocation_size;
+   uint32_t aligned_width;
+   uint32_t aligned_height;
    bool protected_content;
    uint32_t private_flags;
 };
@@ -597,6 +601,8 @@ qti_get_standard_buffer_metadata(
     * 32-bit write and also remains correct if a newer helper fixes the width.
     */
    uint64_t allocation_size = 0;
+   uint64_t aligned_width = 0;
+   uint64_t aligned_height = 0;
    uint64_t protected_content = 0;
    uint32_t private_flags = 0;
    void *handle = const_cast<native_handle_t *>(hnd->handle);
@@ -610,22 +616,29 @@ qti_get_standard_buffer_metadata(
                               &requested_format) != 0 ||
        gr->get_metadata_value(handle, STANDARD_METADATA_PIXEL_FORMAT_FOURCC,
                               &drm_fourcc) != 0 ||
-       gr->get_metadata_value(handle, STANDARD_METADATA_PIXEL_FORMAT_MODIFIER,
-                              &modifier) != 0 ||
-       gr->get_metadata_value(handle, STANDARD_METADATA_USAGE, &usage) != 0 ||
-       gr->get_metadata_value(handle, STANDARD_METADATA_ALLOCATION_SIZE,
-                              &allocation_size) != 0 ||
-       gr->get_metadata_value(handle, STANDARD_METADATA_PROTECTED_CONTENT,
-                              &protected_content) != 0 ||
-       gr->get_metadata_value(handle, QTI_METADATA_PRIVATE_FLAGS,
-                              &private_flags) != 0)
+        gr->get_metadata_value(handle, STANDARD_METADATA_PIXEL_FORMAT_MODIFIER,
+                               &modifier) != 0 ||
+        gr->get_metadata_value(handle, STANDARD_METADATA_USAGE, &usage) != 0 ||
+        gr->get_metadata_value(handle, STANDARD_METADATA_ALLOCATION_SIZE,
+                               &allocation_size) != 0 ||
+        gr->get_metadata_value(handle, QTI_METADATA_ALIGNED_WIDTH_IN_PIXELS,
+                               &aligned_width) != 0 ||
+        gr->get_metadata_value(handle, QTI_METADATA_ALIGNED_HEIGHT_IN_PIXELS,
+                               &aligned_height) != 0 ||
+        gr->get_metadata_value(handle, STANDARD_METADATA_PROTECTED_CONTENT,
+                               &protected_content) != 0 ||
+        gr->get_metadata_value(handle, QTI_METADATA_PRIVATE_FLAGS,
+                               &private_flags) != 0)
       return false;
 
-   if (width == 0 || width > UINT32_MAX || height == 0 ||
-       height > UINT32_MAX || layer_count != 1 ||
-       modifier == DRM_FORMAT_MOD_INVALID || allocation_size == 0 ||
-       allocation_size > dma_buf_size || protected_content > 1)
-      return false;
+    if (width == 0 || width > UINT32_MAX || height == 0 ||
+        height > UINT32_MAX || layer_count != 1 ||
+        modifier == DRM_FORMAT_MOD_INVALID || allocation_size == 0 ||
+        allocation_size > dma_buf_size || aligned_width == 0 ||
+        aligned_width > UINT32_MAX || aligned_height == 0 ||
+        aligned_height > UINT32_MAX || aligned_width < width ||
+        aligned_height < height || protected_content > 1)
+       return false;
 
    const bool usage_is_protected = usage & GRALLOC_USAGE_PROTECTED;
    const bool flags_are_protected =
@@ -642,17 +655,19 @@ qti_get_standard_buffer_metadata(
        (hnd->layer_count && hnd->layer_count != layer_count))
       return false;
 
-   *metadata = {
-      .width = static_cast<uint32_t>(width),
-      .height = static_cast<uint32_t>(height),
-      .layer_count = static_cast<uint32_t>(layer_count),
-      .requested_format = requested_format,
-      .drm_fourcc = drm_fourcc,
-      .modifier = modifier,
-      .allocation_size = allocation_size,
-      .protected_content = protected_content != 0,
-      .private_flags = private_flags,
-   };
+    *metadata = {
+       .width = static_cast<uint32_t>(width),
+       .height = static_cast<uint32_t>(height),
+       .layer_count = static_cast<uint32_t>(layer_count),
+       .requested_format = requested_format,
+       .drm_fourcc = drm_fourcc,
+       .modifier = modifier,
+       .allocation_size = allocation_size,
+       .aligned_width = static_cast<uint32_t>(aligned_width),
+       .aligned_height = static_cast<uint32_t>(aligned_height),
+       .protected_content = protected_content != 0,
+       .private_flags = private_flags,
+    };
 
    *validated_hnd = *hnd;
    validated_hnd->width = metadata->width;
@@ -1029,8 +1044,10 @@ normalize_qti_p010_layouts(
 
 static bool
 normalize_qti_yv12_layouts(const std::vector<PlaneLayout> &layouts,
-                           int32_t hal_format,
-                           std::vector<PlaneLayout> *normalized)
+                             int32_t hal_format, uint32_t width,
+                             uint32_t height, uint32_t aligned_width,
+                             uint32_t aligned_height,
+                             std::vector<PlaneLayout> *normalized)
 {
    if (hal_format != HAL_PIXEL_FORMAT_YV12 || layouts.size() != 3)
       return false;
@@ -1055,36 +1072,44 @@ normalize_qti_yv12_layouts(const std::vector<PlaneLayout> &layouts,
       *plane = &layout;
    }
 
-   if (!y || !cb || !cr || (y->widthInSamples & 1) ||
-       (y->heightInSamples & 1) ||
-       cb->widthInSamples != y->widthInSamples / 2 ||
+   if (!y || !cb || !cr || width == 0 || height == 0 ||
+       aligned_width == 0 || aligned_height == 0 || (width & 1) ||
+       (height & 1) || (aligned_width & 1) || (aligned_height & 1) ||
+       aligned_width < width || aligned_height < height ||
+       y->widthInSamples != width || y->heightInSamples != height ||
+       y->strideInBytes < aligned_width ||
+       cb->widthInSamples != width / 2 ||
        cr->widthInSamples != cb->widthInSamples ||
-       cb->heightInSamples != y->heightInSamples / 2 ||
+       cb->heightInSamples != height / 2 ||
        cr->heightInSamples != cb->heightInSamples ||
-       y->strideInBytes < y->widthInSamples ||
        cb->strideInBytes < cb->widthInSamples ||
        cr->strideInBytes != cb->strideInBytes)
       return false;
 
    const uint64_t y_stride = static_cast<uint64_t>(y->strideInBytes);
+   const uint64_t cb_stride = static_cast<uint64_t>(cb->strideInBytes);
+   const uint64_t cr_stride = static_cast<uint64_t>(cr->strideInBytes);
    const uint64_t y_height = static_cast<uint64_t>(y->heightInSamples);
-   const uint64_t chroma_stride = (y_stride / 2 + 15) & ~UINT64_C(15);
    const uint64_t chroma_height = y_height / 2;
 
-   if ((y_stride & 15) != 0 ||
-       static_cast<uint64_t>(cb->strideInBytes) != chroma_stride ||
+   if ((y_stride & 15) != 0 || (cb_stride & 15) != 0 ||
+       cb_stride != cr_stride || cb_stride < y_stride / 2 ||
+       cb_stride < cb->widthInSamples ||
        y_height > UINT64_MAX / y_stride ||
-       chroma_height > UINT64_MAX / chroma_stride)
+       chroma_height > UINT64_MAX / cb_stride)
       return false;
 
-   const uint64_t y_size = y_stride * y_height;
-   const uint64_t chroma_size = chroma_stride * chroma_height;
-   if (y_size > UINT64_MAX - chroma_size ||
-       static_cast<uint64_t>(y->totalSizeInBytes) != y_size ||
-       static_cast<uint64_t>(cb->totalSizeInBytes) != chroma_size ||
+   const uint64_t min_y_size = y_stride * y_height;
+   const uint64_t min_chroma_size = cb_stride * chroma_height;
+   const uint64_t y_size = static_cast<uint64_t>(y->totalSizeInBytes);
+   const uint64_t chroma_size =
+      static_cast<uint64_t>(cb->totalSizeInBytes);
+   if (y_size < min_y_size || chroma_size < min_chroma_size ||
        static_cast<uint64_t>(cr->totalSizeInBytes) != chroma_size ||
-       y->offsetInBytes != 0 ||
+       y->offsetInBytes != 0 || cr->offsetInBytes < y->offsetInBytes ||
+       cb->offsetInBytes < cr->offsetInBytes ||
        static_cast<uint64_t>(cr->offsetInBytes) != y_size ||
+       y_size > UINT64_MAX - chroma_size ||
        static_cast<uint64_t>(cb->offsetInBytes) != y_size + chroma_size)
       return false;
 
@@ -2774,10 +2799,10 @@ qti_get_modern_buffer_basic_info(
    uint64_t authoritative_modifier = DRM_FORMAT_MOD_INVALID;
    uint32_t authoritative_private_flags = 0;
    bool has_authoritative_private_flags = false;
+   qti_standard_buffer_metadata metadata = {};
    struct u_gralloc_buffer_handle validated_hnd = *hnd;
 
    if (gr->get_metadata_value) {
-      qti_standard_buffer_metadata metadata = {};
       if (!qti_get_standard_buffer_metadata(gr, hnd, dma_buf_size, &metadata,
                                             &validated_hnd)) {
          mesa_logw_once("QTI gralloc returned inconsistent standard metadata");
@@ -2886,24 +2911,48 @@ qti_get_modern_buffer_basic_info(
       return ret;
    }
 
-   if ((!effective_fourcc || effective_fourcc == DRM_FORMAT_YVU420) &&
-       (!has_authoritative_private_flags ||
-        authoritative_modifier == DRM_FORMAT_MOD_LINEAR) &&
-       normalize_qti_yv12_layouts(layouts, actual_format, &normalized)) {
-      if (has_authoritative_private_flags &&
-          (authoritative_private_flags & QTI_HANDLE_FLAG_UBWC_ALIGNED)) {
+   if (has_authoritative_private_flags &&
+       authoritative_modifier == DRM_FORMAT_MOD_LINEAR &&
+       (!effective_fourcc || effective_fourcc == DRM_FORMAT_YVU420)) {
+      if ((authoritative_private_flags &
+           QTI_HANDLE_FLAG_UBWC_ALIGNED)) {
          mesa_logw_once("QTI gralloc UBWC flag disagrees with its YV12 "
                         "plane layout");
          return -EINVAL;
       }
 
+      if (normalize_qti_yv12_layouts(
+              layouts, actual_format, metadata.width,
+              metadata.height, metadata.aligned_width,
+              metadata.aligned_height, &normalized)) {
+         out->drm_fourcc = DRM_FORMAT_YVU420;
+         out->modifier = DRM_FORMAT_MOD_LINEAR;
+
+         const int ret = copy_linear_layout(
+            hnd->handle, normalized, allocation_size, out);
+         if (ret)
+            mesa_logw_once(
+               "Unsupported or inconsistent QTI YV12 plane layout");
+         return ret;
+      }
+   }
+
+   if ((!effective_fourcc || effective_fourcc == DRM_FORMAT_YVU420) &&
+       effective_fourcc != DRM_FORMAT_NV12 &&
+       effective_fourcc != DRM_FORMAT_NV21 &&
+       !has_authoritative_private_flags &&
+       normalize_qti_yv12_layouts(
+          layouts, actual_format, validated_hnd.width,
+          validated_hnd.height, validated_hnd.width,
+          validated_hnd.height, &normalized)) {
       out->drm_fourcc = DRM_FORMAT_YVU420;
       out->modifier = DRM_FORMAT_MOD_LINEAR;
 
-      const int ret = copy_linear_layout(hnd->handle, normalized,
-                                         allocation_size, out);
+      const int ret = copy_linear_layout(
+         hnd->handle, normalized, allocation_size, out);
       if (ret)
-         mesa_logw_once("Unsupported or inconsistent QTI YV12 plane layout");
+         mesa_logw_once(
+            "Unsupported or inconsistent QTI YV12 plane layout");
       return ret;
    }
 

@@ -578,24 +578,30 @@ tu_is_android_yv12_import(struct tu_image *image, uint64_t modifier, const VkSub
    const uint64_t cr_pitch = plane_layouts[2].rowPitch;
 
    if (!y_pitch || !cb_pitch || y_pitch > UINT32_MAX || cb_pitch > UINT32_MAX || cr_pitch != cb_pitch ||
-       y_pitch < image->vk.extent.width || cb_pitch < image->vk.extent.width / 2 || (y_pitch & 15) ||
-       cb_pitch != ((y_pitch / 2 + 15) & ~UINT64_C(15)))
+       y_pitch < image->vk.extent.width || cb_pitch < y_pitch / 2 ||
+       cb_pitch < image->vk.extent.width / 2 || (y_pitch & 15) ||
+       (cb_pitch & 15))
       return false;
 
    const uint64_t height = image->vk.extent.height;
    if (height > UINT64_MAX / y_pitch || height / 2 > UINT64_MAX / cb_pitch)
       return false;
 
-   const uint64_t y_size = y_pitch * height;
-   const uint64_t chroma_size = cb_pitch * (height / 2);
-   if (y_size > UINT32_MAX || chroma_size > (UINT32_MAX - y_size) / 2)
+   const uint64_t min_y_size = y_pitch * height;
+   const uint64_t min_chroma_size = cb_pitch * (height / 2);
+   const uint64_t y_size = plane_layouts[2].offset;
+   if (plane_layouts[1].offset < y_size)
+      return false;
+
+   const uint64_t chroma_size = plane_layouts[1].offset - y_size;
+   if (y_size < min_y_size || chroma_size < min_chroma_size ||
+       y_size > UINT32_MAX || chroma_size > (UINT32_MAX - y_size) / 2)
       return false;
 
    /* vk_android has already changed DRM Y-V-U plane order into Vulkan's
     * logical Y-U-V order at this point.
     */
-   return plane_layouts[0].offset == 0 && plane_layouts[2].offset == y_size &&
-          plane_layouts[1].offset == y_size + chroma_size;
+   return plane_layouts[0].offset == 0;
 }
 
 static bool
