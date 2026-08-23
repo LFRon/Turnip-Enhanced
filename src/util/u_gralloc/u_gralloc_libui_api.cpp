@@ -93,12 +93,27 @@ constexpr size_t MAX_MAPPER_PLANE_COUNT = 8;
 constexpr size_t MAX_COMPONENTS_PER_PLANE = 8;
 
 constexpr int QTI_HANDLE_NUM_FDS = 2;
-constexpr int QTI_MODERN_HANDLE_NUM_INTS = 24;
 constexpr int QTI_LEGACY_BASE_HANDLE_NUM_INTS = 22;
 constexpr int QTI_LEGACY_RESERVED_HANDLE_NUM_INTS = 23;
 constexpr int QTI_LEGACY_TWO_OPTIONAL_WORDS_HANDLE_NUM_INTS = 24;
 constexpr int QTI_LEGACY_THREE_OPTIONAL_WORDS_HANDLE_NUM_INTS = 25;
 constexpr int QTI_LEGACY_ALL_OPTIONAL_WORDS_HANDLE_NUM_INTS = 26;
+/* The LineageOS 23.2 SM8550 open-source gralloc (android_hardware_qcom_display
+ * lineage-23.2-caf-sm8550) is built without any GRALLOC_HANDLE_HAS_* macro, so
+ * its private_handle_t carries 22 ints (the common prefix only).  Stacks that
+ * enable GRALLOC_HANDLE_HAS_RESERVED_SIZE and/or
+ * GRALLOC_HANDLE_HAS_CUSTOM_CONTENT_MD_RESERVED_SIZE grow the tail by one word
+ * each (23/24 ints), and newer stacks (SM8650 / pineapple, used by OnePlus 12
+ * etc.) additionally enable GRALLOC_HANDLE_HAS_UBWCP_FORMAT, which appends
+ * linear_size + ubwcp_format and makes the handle 26 ints.  Every layout keeps
+ * the same common prefix (magic/flags/width/height/...), so the modern backend
+ * accepts the whole 22..26 range; the legacy profile table below already
+ * enumerates 22..26 for the older ABIs.
+ */
+constexpr int QTI_MODERN_HANDLE_NUM_INTS =
+   QTI_LEGACY_BASE_HANDLE_NUM_INTS;
+constexpr int QTI_MODERN_HANDLE_MAX_NUM_INTS =
+   QTI_LEGACY_ALL_OPTIONAL_WORDS_HANDLE_NUM_INTS;
 constexpr int32_t QTI_HANDLE_MAGIC =
    ('g' << 24) | ('m' << 16) | ('s' << 8) | 'm';
 
@@ -460,14 +475,26 @@ load_qti_legacy_ycbcr_ubwc_api(void *library, qti_metadata_gralloc *gr)
 static bool
 qti_modern_handle_is_compatible(const native_handle_t *handle)
 {
-   /* This is the private_handle_t ABI validated by the supplied SM8550 QTI
-    * gralloc stack.  It is a runtime software-ABI gate, not a GPU-model gate:
-    * no QTI entry point is called unless the incoming handle matches it.
+   /* This is the private_handle_t ABI validated by the QTI gralloc stack.  It
+    * is a runtime software-ABI gate, not a GPU-model gate: no QTI entry point
+    * is called unless the incoming handle matches it.
+    *
+    * The int count varies by build: LineageOS 23.2 SM8550 (astonc, the open
+    * android_hardware_qcom_display stack) builds without any
+    * GRALLOC_HANDLE_HAS_* macro and uses 22 ints; stacks that enable the
+    * reserved/custom-content macros grow to 23/24 ints, and SM8650
+    * (pineapple) additionally enables GRALLOC_HANDLE_HAS_UBWCP_FORMAT and
+    * uses 26 ints.  Every layout shares the same common prefix, so accept the
+    * whole 22..26 range.  The modern backend only ever passes the handle
+    * through to vendor GetMetaDataValue()/GetPlaneLayout(), which parse the
+    * handle themselves, so accepting the wider range does not change any
+    * field interpretation here.
     */
    return sizeof(void *) == 8 && handle &&
           handle->version == sizeof(native_handle_t) &&
           handle->numFds == QTI_HANDLE_NUM_FDS &&
-          handle->numInts == QTI_MODERN_HANDLE_NUM_INTS &&
+          handle->numInts >= QTI_MODERN_HANDLE_NUM_INTS &&
+          handle->numInts <= QTI_MODERN_HANDLE_MAX_NUM_INTS &&
           handle->data[handle->numFds] == QTI_HANDLE_MAGIC;
 }
 
@@ -616,29 +643,38 @@ qti_get_standard_buffer_metadata(
                               &requested_format) != 0 ||
        gr->get_metadata_value(handle, STANDARD_METADATA_PIXEL_FORMAT_FOURCC,
                               &drm_fourcc) != 0 ||
-        gr->get_metadata_value(handle, STANDARD_METADATA_PIXEL_FORMAT_MODIFIER,
-                               &modifier) != 0 ||
-        gr->get_metadata_value(handle, STANDARD_METADATA_USAGE, &usage) != 0 ||
-        gr->get_metadata_value(handle, STANDARD_METADATA_ALLOCATION_SIZE,
-                               &allocation_size) != 0 ||
-        gr->get_metadata_value(handle, QTI_METADATA_ALIGNED_WIDTH_IN_PIXELS,
-                               &aligned_width) != 0 ||
-        gr->get_metadata_value(handle, QTI_METADATA_ALIGNED_HEIGHT_IN_PIXELS,
-                               &aligned_height) != 0 ||
-        gr->get_metadata_value(handle, STANDARD_METADATA_PROTECTED_CONTENT,
-                               &protected_content) != 0 ||
-        gr->get_metadata_value(handle, QTI_METADATA_PRIVATE_FLAGS,
-                               &private_flags) != 0)
+       gr->get_metadata_value(handle, STANDARD_METADATA_PIXEL_FORMAT_MODIFIER,
+                              &modifier) != 0 ||
+       gr->get_metadata_value(handle, STANDARD_METADATA_USAGE, &usage) != 0 ||
+       gr->get_metadata_value(handle, STANDARD_METADATA_ALLOCATION_SIZE,
+                              &allocation_size) != 0 ||
+       gr->get_metadata_value(handle, STANDARD_METADATA_PROTECTED_CONTENT,
+                              &protected_content) != 0 ||
+       gr->get_metadata_value(handle, QTI_METADATA_PRIVATE_FLAGS,
+                              &private_flags) != 0)
       return false;
 
-    if (width == 0 || width > UINT32_MAX || height == 0 ||
-        height > UINT32_MAX || layer_count != 1 ||
-        modifier == DRM_FORMAT_MOD_INVALID || allocation_size == 0 ||
-        allocation_size > dma_buf_size || aligned_width == 0 ||
-        aligned_width > UINT32_MAX || aligned_height == 0 ||
-        aligned_height > UINT32_MAX || aligned_width < width ||
-        aligned_height < height || protected_content > 1)
-       return false;
+   /* QTI aligned dimensions are optional metadata.  Buffers produced by
+    * video/encoder paths (e.g. HAL_PIXEL_FORMAT_YCbCr_420_SP_VENUS_UBWC)
+    * may lack them entirely; in that case fall back to the logical extent
+    * so the import is not rejected before the format-specific handlers run.
+    */
+   if (gr->get_metadata_value(handle, QTI_METADATA_ALIGNED_WIDTH_IN_PIXELS,
+                              &aligned_width) != 0 ||
+       aligned_width < width || aligned_width > UINT32_MAX) {
+      aligned_width = width;
+   }
+   if (gr->get_metadata_value(handle, QTI_METADATA_ALIGNED_HEIGHT_IN_PIXELS,
+                              &aligned_height) != 0 ||
+       aligned_height < height || aligned_height > UINT32_MAX) {
+      aligned_height = height;
+   }
+
+   if (width == 0 || width > UINT32_MAX || height == 0 ||
+       height > UINT32_MAX || layer_count != 1 ||
+       modifier == DRM_FORMAT_MOD_INVALID || allocation_size == 0 ||
+       allocation_size > dma_buf_size || protected_content > 1)
+      return false;
 
    const bool usage_is_protected = usage & GRALLOC_USAGE_PROTECTED;
    const bool flags_are_protected =
@@ -655,7 +691,7 @@ qti_get_standard_buffer_metadata(
        (hnd->layer_count && hnd->layer_count != layer_count))
       return false;
 
-    *metadata = {
+   *metadata = {
        .width = static_cast<uint32_t>(width),
        .height = static_cast<uint32_t>(height),
        .layer_count = static_cast<uint32_t>(layer_count),
