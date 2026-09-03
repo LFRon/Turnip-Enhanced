@@ -126,13 +126,6 @@ tu_format_for_aspect(enum pipe_format format, VkImageAspectFlags aspect_mask)
 }
 
 static bool
-tu_is_r8g8(enum pipe_format format)
-{
-   return (util_format_get_blocksize(format) == 2) &&
-          (util_format_get_nr_components(format) == 2);
-}
-
-static bool
 tu_is_r8g8_compatible(enum pipe_format format)
 {
    return (util_format_get_blocksize(format) == 2) &&
@@ -497,7 +490,7 @@ format_list_reinterprets_r8g8_r16(enum pipe_format format, const VkImageFormatLi
    for (uint32_t i = 0; i < fmt_list->viewFormatCount; i++) {
       enum pipe_format format =
          vk_format_to_pipe_format(fmt_list->pViewFormats[i]);
-      if (tu_is_r8g8(format))
+      if (fdl_format_is_r8g8(format))
          has_r8g8 = true;
       else
          has_non_r8g8 = true;
@@ -847,7 +840,7 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
    }
 
    /* Whether a view of the image with an R8G8 format could be made. */
-   bool has_r8g8 = tu_is_r8g8(vk_format_to_pipe_format(image->vk.format));
+   bool has_r8g8 = fdl_format_is_r8g8(vk_format_to_pipe_format(image->vk.format));
 
    /* With AHB, we could be asked to create an image with VK_IMAGE_TILING_LINEAR
     * but gralloc doesn't know this.  So if we are explicitly told that it is

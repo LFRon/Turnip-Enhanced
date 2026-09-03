@@ -3720,7 +3720,7 @@ static bool
 image_is_r8g8(struct tu_image *image)
 {
    return image->layout[0].cpp == 2 &&
-      vk_format_get_nr_components(image->vk.format) == 2;
+      fdl_format_is_r8g8(vk_format_to_pipe_format(image->vk.format));
 }
 
 template <chip CHIP>
