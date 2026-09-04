@@ -396,6 +396,16 @@ fdl6_view_init(struct fdl6_view *view, const struct fdl_layout **layouts,
 
          if (ubwc_enabled) {
             descriptor[4] |= A8XX_TEX_MEMOBJ_4_FLAG;
+            /* Multi-planar descriptors replace the single-plane flag-buffer
+             * address with per-plane combined metadata+data bases, but the
+             * UBWC metadata row pitch stays a required field for both
+             * planes (a8xx_descriptors.xml marks it DESC_MULTI_PLANE).
+             * NV12-family planes derive the second plane's metadata pitch
+             * from the first one, so the plane-0 pitch is sufficient.
+             * Leaving it zero makes UBWC decode of imported video planes
+             * read garbage metadata on A8XX.
+             */
+            descriptor[5] |= A8XX_TEX_MEMOBJ_5_FLAG_BUFFER_PITCH(ubwc_pitch);
          }
 
          descriptor[4] |= A8XX_TEX_MEMOBJ_4_BASE_U_LO(base_addr[1]);
