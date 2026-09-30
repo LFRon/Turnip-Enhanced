@@ -1,0 +1,11 @@
+[build_machine]
+c = ['ccache', 'clang']
+cpp = ['ccache', 'clang++']
+ar = 'llvm-ar'
+strip = 'llvm-strip'
+c_ld = 'ld.lld'
+cpp_ld = 'ld.lld'
+system = 'linux'
+cpu_family = 'x86_64'
+cpu = 'x86_64'
+endian = 'little'

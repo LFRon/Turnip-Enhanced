@@ -9,6 +9,8 @@
 
 #include "tu_image.h"
 
+#include <inttypes.h>
+
 #include "drm-uapi/drm_fourcc.h"
 
 #include "util/format/u_format.h"
@@ -893,11 +895,15 @@ tu_android_get_wsi_memory(struct tu_device *dev,
 
    VkImageDrmFormatModifierExplicitCreateInfoEXT eci;
    VkSubresourceLayout a_plane_layouts[TU_MAX_PLANE_COUNT];
-   result = vk_android_get_anb_layout(img->vk.android_deferred_create_info,
-                                      &eci, a_plane_layouts,
-                                      TU_MAX_PLANE_COUNT);
+   result = vk_android_get_anb_layout(
+      img->vk.android_deferred_create_info, &eci, a_plane_layouts,
+      TU_MAX_PLANE_COUNT);
    if (result != VK_SUCCESS)
       return result;
+
+   if (eci.drmFormatModifierPlaneCount !=
+       tu6_plane_count(img->vk.android_deferred_create_info->format))
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
 
    VkExternalMemoryImageCreateInfo external_info = {
       .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
@@ -1007,6 +1013,12 @@ tu_CreateImage(VkDevice _device,
          pCreateInfo, &eci, a_plane_layouts, TU_MAX_PLANE_COUNT);
       if (result != VK_SUCCESS)
          goto fail;
+
+      if (eci.drmFormatModifierPlaneCount !=
+          tu6_plane_count(pCreateInfo->format)) {
+         result = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+         goto fail;
+      }
 
       plane_layouts = a_plane_layouts;
       modifier = eci.drmFormatModifier;
@@ -1416,7 +1428,9 @@ tu_GetDeviceImageMemoryRequirements(
    struct tu_image image = {0};
 
    vk_image_init(&device->vk, &image.vk, pInfo->pCreateInfo);
-   TU_CALLX(device, tu_image_init)(device, &image, pInfo->pCreateInfo, DRM_FORMAT_MOD_INVALID, NULL, TU_IMAGE_ID_NONE);
+   TU_CALLX(device, tu_image_init)(device, &image, pInfo->pCreateInfo,
+                                   DRM_FORMAT_MOD_INVALID, NULL,
+                                   TU_IMAGE_ID_NONE);
 
    tu_get_image_memory_requirements(device, &image, pMemoryRequirements);
 }
@@ -1433,7 +1447,9 @@ tu_GetDeviceImageSparseMemoryRequirements(
    struct tu_image image = {0};
 
    vk_image_init(&device->vk, &image.vk, pInfo->pCreateInfo);
-   TU_CALLX(device, tu_image_init)(device, &image, pInfo->pCreateInfo, DRM_FORMAT_MOD_INVALID, NULL, TU_IMAGE_ID_NONE);
+   TU_CALLX(device, tu_image_init)(device, &image, pInfo->pCreateInfo,
+                                   DRM_FORMAT_MOD_INVALID, NULL,
+                                   TU_IMAGE_ID_NONE);
 
    tu_get_image_sparse_memory_requirements(device, &image,
                                            pSparseMemoryRequirementCount,
@@ -1524,7 +1540,9 @@ tu_GetDeviceImageSubresourceLayoutKHR(VkDevice _device,
    struct tu_image image = {0};
 
    vk_image_init(&device->vk, &image.vk, pInfo->pCreateInfo);
-   TU_CALLX(device, tu_image_init)(device, &image, pInfo->pCreateInfo, DRM_FORMAT_MOD_INVALID, NULL, TU_IMAGE_ID_NONE);
+   TU_CALLX(device, tu_image_init)(device, &image, pInfo->pCreateInfo,
+                                   DRM_FORMAT_MOD_INVALID, NULL,
+                                   TU_IMAGE_ID_NONE);
 
    tu_get_image_subresource_layout(&image, pInfo->pSubresource, pLayout);
 }
@@ -1759,4 +1777,3 @@ tu_bind_sparse_image(struct tu_device *device, void *submit,
                          prev_bo_offset, bind_range);
    }
 }
-
