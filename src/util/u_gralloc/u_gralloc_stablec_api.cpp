@@ -22,6 +22,9 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <dirent.h>
+
+#include <string>
 #include <vector>
 
 #include "drm-uapi/drm_fourcc.h"
@@ -488,11 +491,29 @@ const struct u_gralloc_ops stablec_gralloc_ops = {
    stablec_destroy,
 };
 
-/* Known IMapper stable-C vendor implementations.  The suffix is the
- * `mapper` passthrough instance name; dlopen resolves it through the
- * vendor linker namespace of the loaded Vulkan HAL.
+/*
+ * Vendor IMapper stable-C libraries are declared as native HALs in the
+ * device VINTF manifest (see hardware/interfaces/graphics/mapper/stable-c
+ * README): /vendor/lib[64]/hw/mapper.<instance>.so where <instance> is the
+ * declared passthrough instance name.  Discover them the same way libui
+ * does, and additionally scan the vendor hw module directories so devices
+ * whose manifest layout differs are still covered.  A short built-in list
+ * is the last resort, and every failure is logged so the selection is
+ * observable in a bugreport.
  */
-constexpr const char *MAPPER_SUFFIX_CANDIDATES[] = {
+constexpr const char *VINTF_MANIFEST_PATHS[] = {
+   "/vendor/etc/vintf/manifest.xml",
+   "/vendor/etc/vintf/manifest_odm.xml",
+   "/odm/etc/vintf/manifest.xml",
+};
+
+constexpr const char *MAPPER_HW_DIRS[] = {
+   "/vendor/lib64/hw",
+   "/odm/lib64/hw",
+   "/vendor/lib/hw",
+};
+
+constexpr const char *MAPPER_SUFFIX_FALLBACKS[] = {
    "qti",
    "snapalloc",
    "minigbm",
@@ -503,46 +524,158 @@ constexpr const char *MAPPER_SUFFIX_CANDIDATES[] = {
    "mediatek",
 };
 
+void
+push_unique(std::vector<std::string> *list, const std::string &value)
+{
+   for (const auto &existing : *list) {
+      if (existing == value)
+         return;
+   }
+   list->push_back(value);
+}
+
+std::string
+trim(const std::string &value)
+{
+   size_t begin = value.find_first_not_of(" \t\r\n");
+   size_t end = value.find_last_not_of(" \t\r\n");
+   if (begin == std::string::npos)
+      return {};
+   return value.substr(begin, end - begin + 1);
+}
+
+void
+collect_mapper_instances_from_manifest(const char *path,
+                                       std::vector<std::string> *out)
+{
+   FILE *f = fopen(path, "re");
+   if (!f)
+      return;
+
+   fseek(f, 0, SEEK_END);
+   long size = ftell(f);
+   fseek(f, 0, SEEK_SET);
+   if (size <= 0 || size > 512 * 1024) {
+      fclose(f);
+      return;
+   }
+
+   std::vector<char> buf((size_t)size + 1, 0);
+   if (fread(buf.data(), 1, (size_t)size, f) != (size_t)size) {
+      fclose(f);
+      return;
+   }
+   fclose(f);
+
+   /* Scan <hal ...>...</hal> blocks and pick native entries whose name is
+    * "mapper", collecting every declared <instance>.
+    */
+   const char *cursor = buf.data();
+   while (const char *hal = strstr(cursor, "<hal ")) {
+      const char *hal_end = strstr(hal, "</hal>");
+      if (!hal_end)
+         break;
+
+      std::string block(hal, (size_t)(hal_end - hal));
+      if (block.find("format=\"native\"") != std::string::npos &&
+          block.find("<name>mapper</name>") != std::string::npos) {
+         const char *p = block.c_str();
+         while (const char *inst = strstr(p, "<instance>")) {
+            const char *inst_end = strstr(inst, "</instance>");
+            if (!inst_end)
+               break;
+            push_unique(out, trim(std::string(inst + 10, (size_t)(inst_end - inst - 10))));
+            p = inst_end + 11;
+         }
+      }
+
+      cursor = hal_end + 6;
+   }
+}
+
+void
+collect_mapper_suffixes_from_hw_dirs(std::vector<std::string> *out)
+{
+   for (const char *dir : MAPPER_HW_DIRS) {
+      DIR *d = opendir(dir);
+      if (!d)
+         continue;
+
+      const size_t prefix_len = strlen("mapper.");
+      while (struct dirent *e = readdir(d)) {
+         const char *name = e->d_name;
+         size_t len = strlen(name);
+         if (len <= prefix_len + 3 || strncmp(name, "mapper.", prefix_len) != 0 ||
+             strcmp(name + len - 3, ".so") != 0)
+            continue;
+         push_unique(out, std::string(name + prefix_len, len - prefix_len - 3));
+      }
+      closedir(d);
+   }
+}
+
+struct stablec_gralloc *
+try_load_mapper(const char *path)
+{
+   void *so = dlopen(path, RTLD_NOW | RTLD_LOCAL);
+   if (!so)
+      return nullptr;
+
+   auto load = (AIMapper_loadIMapperFn)dlsym(so, "AIMapper_loadIMapper");
+   if (!load) {
+      dlclose(so);
+      return nullptr;
+   }
+
+   AIMapper *mapper = nullptr;
+   if (load(&mapper) != AIMAPPER_ERROR_NONE || !mapper ||
+       mapper->version < AIMAPPER_VERSION_5) {
+      dlclose(so);
+      return nullptr;
+   }
+
+   struct stablec_gralloc *gr =
+      (struct stablec_gralloc *)calloc(1, sizeof(*gr));
+   if (!gr) {
+      dlclose(so);
+      return nullptr;
+   }
+
+   gr->so = so;
+   gr->mapper = mapper;
+   gr->base.ops = stablec_gralloc_ops;
+   gr->base.type = U_GRALLOC_TYPE_STABLEC;
+
+   mesa_logi("AIMapper stable-C v%u loaded from %s", mapper->version, path);
+   return gr;
+}
+
 } /* anonymous namespace */
 
 extern "C" struct u_gralloc *
 u_gralloc_stablec_api_create(void)
 {
-   for (const char *suffix : MAPPER_SUFFIX_CANDIDATES) {
-      char soname[128];
-      snprintf(soname, sizeof(soname), "mapper.%s.so", suffix);
+   std::vector<std::string> suffixes;
+   for (const char *manifest : VINTF_MANIFEST_PATHS)
+      collect_mapper_instances_from_manifest(manifest, &suffixes);
+   collect_mapper_suffixes_from_hw_dirs(&suffixes);
+   for (const char *fallback : MAPPER_SUFFIX_FALLBACKS)
+      push_unique(&suffixes, fallback);
 
-      void *so = dlopen(soname, RTLD_NOW | RTLD_LOCAL);
-      if (!so)
-         continue;
-
-      auto load = (AIMapper_loadIMapperFn)dlsym(so, "AIMapper_loadIMapper");
-      if (!load) {
-         dlclose(so);
-         continue;
+   for (const auto &suffix : suffixes) {
+      char path[256];
+      for (const char *dir : MAPPER_HW_DIRS) {
+         snprintf(path, sizeof(path), "%s/mapper.%s.so", dir, suffix.c_str());
+         if (struct stablec_gralloc *gr = try_load_mapper(path))
+            return &gr->base;
       }
 
-      AIMapper *mapper = nullptr;
-      if (load(&mapper) != AIMAPPER_ERROR_NONE || !mapper ||
-          mapper->version < AIMAPPER_VERSION_5) {
-         dlclose(so);
-         continue;
-      }
-
-      struct stablec_gralloc *gr = (struct stablec_gralloc *)calloc(
-         1, sizeof(*gr));
-      if (!gr) {
-         dlclose(so);
-         return NULL;
-      }
-
-      gr->so = so;
-      gr->mapper = mapper;
-      gr->base.ops = stablec_gralloc_ops;
-      gr->base.type = U_GRALLOC_TYPE_STABLEC;
-
-      return &gr->base;
+      snprintf(path, sizeof(path), "mapper.%s.so", suffix.c_str());
+      if (struct stablec_gralloc *gr = try_load_mapper(path))
+         return &gr->base;
    }
 
+   mesa_logw("No AIMapper stable-C HAL found (checked VINTF manifests and %zu suffix candidates)",
+             suffixes.size());
    return NULL;
 }
