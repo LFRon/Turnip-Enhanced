@@ -1105,6 +1105,14 @@ get_ahb_buffer_format_properties2(
    case DRM_FORMAT_NV12:
       external_format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
       break;
+   case DRM_FORMAT_NV21:
+      /* Vulkan has no native VU two-plane format.  Reuse the NV12 plane
+       * representation and swap Cb/Cr through the conversion component map.
+       */
+      external_format = VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
+      p->samplerYcbcrConversionComponents.r = VK_COMPONENT_SWIZZLE_B;
+      p->samplerYcbcrConversionComponents.b = VK_COMPONENT_SWIZZLE_R;
+      break;
    case DRM_FORMAT_P010:
       external_format = VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16;
       break;
