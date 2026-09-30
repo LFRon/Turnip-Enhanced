@@ -2219,13 +2219,22 @@ tu6_init_static_regs(struct tu_device *dev, struct tu_cs *cs, enum tu_static_reg
        * events are required.
        */
 
-      enum a7xx_concurrent_resolve_mode resolve_mode = CONCURRENT_RESOLVE_MODE_2;
-      if (TU_DEBUG(NO_CONCURRENT_RESOLVES))
-         resolve_mode = CONCURRENT_RESOLVE_MODE_DISABLED;
+      /* Concurrent (un)resolves let the resolve engine run ahead of the command
+       * stream, so every operation that depends on a grouped (un)resolve has to
+       * be ordered against it explicitly. Getting that wrong has caused
+       * corruption more than once (see 2817a286e04 and e3d477a04fb), and the
+       * modes are not enabled by the reference driver, so keep them disabled by
+       * default. The debug options re-enable them for experiments.
+       */
+      enum a7xx_concurrent_resolve_mode resolve_mode =
+         CONCURRENT_RESOLVE_MODE_DISABLED;
+      if (TU_DEBUG(CONCURRENT_RESOLVES))
+         resolve_mode = CONCURRENT_RESOLVE_MODE_2;
 
-      enum a7xx_concurrent_unresolve_mode unresolve_mode = CONCURRENT_UNRESOLVE_MODE_FULL;
-      if (TU_DEBUG(NO_CONCURRENT_UNRESOLVES))
-         unresolve_mode = CONCURRENT_UNRESOLVE_MODE_DISABLED;
+      enum a7xx_concurrent_unresolve_mode unresolve_mode =
+         CONCURRENT_UNRESOLVE_MODE_DISABLED;
+      if (TU_DEBUG(CONCURRENT_UNRESOLVES))
+         unresolve_mode = CONCURRENT_UNRESOLVE_MODE_FULL;
 
       tu_cs_emit_regs(cs, RB_CCU_CNTL(A7XX,
          .gmem_fast_clear_disable =

@@ -665,7 +665,7 @@ Additionally, not all ``TU_DEBUG`` options can be toggled at runtime, the follow
 are supported at the moment: ``nir``, ``nobin``, ``sysmem``, ``gmem``, ``forcebin``,
 ``layout``, ``nolrz``, ``nolrzfc``, ``perf``, ``flushall``, ``syncdraw``,
 ``rast_order``, ``unaligned_store``, ``log_skip_gmem_ops``, ``3d_load``, ``fdm``,
-``noconcurrentresolves``, ``noconcurrentunresolves``, ``nobinmerging``.
+``concurrentresolves``, ``concurrentunresolves``, ``nobinmerging``.
 
 Some of these options will behave differently when toggled at runtime, for example:
 ``nolrz`` will still result in LRZ allocation which would not happen if the option
