@@ -35,4 +35,8 @@ bool tu6_mutable_format_list_ubwc_compatible(const struct fd_dev_info *info,
 bool tu_format_linear_filtering_supported(struct tu_physical_device *physical_device,
                                           VkFormat vk_format);
 
+bool tu_external_format_resolve_supported(const struct fd_dev_info *info,
+                                          VkFormat format,
+                                          enum a6xx_tile_mode tile_mode);
+
 #endif /* TU_FORMATS_H */
