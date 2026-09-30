@@ -70,6 +70,20 @@ u_gralloc_create(enum u_gralloc_type type)
          u_gralloc_cache[type].u_gralloc->type = u_grallocs[i].type;
          u_gralloc_cache[type].refcount = 1;
 
+         if (type == U_GRALLOC_TYPE_AUTO) {
+            const char *name = "unknown";
+            switch (u_grallocs[i].type) {
+            case U_GRALLOC_TYPE_CROS:     name = "cros"; break;
+            case U_GRALLOC_TYPE_GRALLOC4: name = "imapper4/5"; break;
+            case U_GRALLOC_TYPE_LIBDRM:   name = "libdrm"; break;
+            case U_GRALLOC_TYPE_QCOM:     name = "gralloc1-qcom"; break;
+            case U_GRALLOC_TYPE_FALLBACK: name = "fallback"; break;
+            case U_GRALLOC_TYPE_STABLEC:  name = "imapper-stable-c"; break;
+            default: break;
+            }
+            mesa_logi("u_gralloc: auto-selected backend: %s", name);
+         }
+
          out_gralloc = u_gralloc_cache[type].u_gralloc;
          goto out;
       }
