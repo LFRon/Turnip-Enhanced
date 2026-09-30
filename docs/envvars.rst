@@ -2355,10 +2355,10 @@ Turnip driver environment variables
       Force GMEM loads via 3D engine.
    ``fdm``
       Force enable fragment density map for all renderpasses.
-   ``noconcurrentresolves``
-      Disable concurrent resolves.
-   ``noconcurrentunresolves``
-      Disable concurrent unresolves.
+   ``concurrentresolves``
+      Enable hardware concurrent resolves (disabled by default).
+   ``concurrentunresolves``
+      Enable hardware concurrent unresolves (disabled by default).
    ``nobinmerging``
       Disable bin merging (used for FDM).
    ``perfcraw``
