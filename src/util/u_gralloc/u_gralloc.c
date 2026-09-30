@@ -23,6 +23,13 @@ static const struct u_grallocs {
    enum u_gralloc_type type;
    struct u_gralloc *(*create)();
 } u_grallocs[] = {
+#ifdef USE_IMAPPER_STABLEC_API
+   /* Prefer the VINTF-stable AIMapper C interface on Android 15+; it is
+    * the documented gralloc 5 metadata transport and requires no
+    * GPU-specific knowledge.
+    */
+   {.type = U_GRALLOC_TYPE_STABLEC, .create = u_gralloc_stablec_api_create},
+#endif /* USE_IMAPPER_STABLEC_API */
    /* Prefer the CrOS API as it is significantly faster than IMapper4 */
    {.type = U_GRALLOC_TYPE_CROS, .create = u_gralloc_cros_api_create},
 #ifdef USE_IMAPPER4_METADATA_API
