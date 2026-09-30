@@ -69,6 +69,19 @@ vk_android_get_ugralloc(void)
    call_once(&once, vk_android_init_ugralloc_once);
    return _gralloc;
 }
+bool
+vk_android_gralloc_supports_explicit_yuv_layout(void)
+{
+   switch (u_gralloc_get_type(vk_android_get_ugralloc())) {
+   case U_GRALLOC_TYPE_STABLEC:
+   case U_GRALLOC_TYPE_GRALLOC4:
+   case U_GRALLOC_TYPE_CROS:
+      return true;
+   default:
+      return false;
+   }
+}
+
 
 static int vk_android_hal_open(const struct hw_module_t *mod, const char *id,
                                struct hw_device_t **dev);
