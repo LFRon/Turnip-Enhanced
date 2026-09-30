@@ -44,8 +44,8 @@ static const struct debug_control tu_debug_options[] = {
    { "fdm", TU_DEBUG_FDM },
    { "rd", TU_DEBUG_RD },
    { "hiprio", TU_DEBUG_HIPRIO },
-   { "noconcurrentresolves", TU_DEBUG_NO_CONCURRENT_RESOLVES },
-   { "noconcurrentunresolves", TU_DEBUG_NO_CONCURRENT_UNRESOLVES },
+   { "concurrentresolves", TU_DEBUG_CONCURRENT_RESOLVES },
+   { "concurrentunresolves", TU_DEBUG_CONCURRENT_UNRESOLVES },
    { "dumpas", TU_DEBUG_DUMPAS },
    { "nobinmerging", TU_DEBUG_NO_BIN_MERGING },
    { "perfcraw", TU_DEBUG_PERFCRAW },
@@ -72,7 +72,7 @@ const uint64_t tu_runtime_debug_flags =
    TU_DEBUG_PERF | TU_DEBUG_FLUSHALL | TU_DEBUG_SYNCDRAW |
    TU_DEBUG_RAST_ORDER | TU_DEBUG_UNALIGNED_STORE |
    TU_DEBUG_LOG_SKIP_GMEM_OPS | TU_DEBUG_3D_LOAD | TU_DEBUG_FDM |
-   TU_DEBUG_NO_CONCURRENT_RESOLVES | TU_DEBUG_NO_CONCURRENT_UNRESOLVES |
+   TU_DEBUG_CONCURRENT_RESOLVES | TU_DEBUG_CONCURRENT_UNRESOLVES |
    TU_DEBUG_NO_BIN_MERGING;
 
 os_file_notifier_t tu_debug_notifier;
