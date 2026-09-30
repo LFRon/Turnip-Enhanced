@@ -31,6 +31,18 @@ elif dep_android_mapper4.found()
   deps_for_u_gralloc += dep_android_mapper4
 endif
 
+inc_u_gralloc_stablec = []
+if with_platform_android and get_option('platform-sdk-version') >= 35
+  # The IMapper stable-C (AIMapper) HAL is the documented gralloc 5
+  # metadata transport.  Its interface header is vendored under
+  # stablec/include unmodified from AOSP hardware/interfaces.
+  files_u_gralloc += files('u_gralloc_stablec_api.cpp')
+  c_args_for_u_gralloc += '-DUSE_IMAPPER_STABLEC_API'
+  cpp_args_for_u_gralloc += '-DUSE_IMAPPER_STABLEC_API'
+  inc_u_gralloc_stablec += include_directories('stablec/include')
+  options_for_u_gralloc += 'cpp_std=c++17'
+endif
+
 if with_freedreno_vk or with_gallium_freedreno
   c_args_for_u_gralloc += '-DHAS_FREEDRENO'
 endif
@@ -38,7 +50,7 @@ endif
 _libmesa_u_gralloc = static_library(
   '_mesa_u_gralloc',
   [files_u_gralloc],
-  include_directories : [inc_include, inc_util],
+  include_directories : [inc_include, inc_util] + inc_u_gralloc_stablec,
   c_args : c_args_for_u_gralloc,
   cpp_args : cpp_args_for_u_gralloc,
   override_options : options_for_u_gralloc,
