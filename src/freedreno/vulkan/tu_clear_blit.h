@@ -46,6 +46,30 @@ tu_resolve_sysmem(struct tu_cmd_buffer *cmd,
                   bool per_layer_rect,
                   const VkRect2D *rect);
 
+enum tu_external_format_resolve_source {
+   /* Source components follow the logical component names of the Vulkan
+    * YCbCr format.  For G8_B8R8 this means G=Y, B=Cb, and R=Cr.
+    */
+   TU_EXTERNAL_FORMAT_RESOLVE_SOURCE_STANDARD,
+
+   /* Qualcomm's legacy VideoTxr direct-color-attachment ABI writes an
+    * already-converted YCbCr tuple to RGBA as R=Y, G=Cb, and B=Cr.
+    */
+   TU_EXTERNAL_FORMAT_RESOLVE_SOURCE_QTI_LEGACY,
+};
+
+template <chip CHIP>
+void
+tu_resolve_external_format_sysmem(struct tu_cmd_buffer *cmd,
+                                  struct tu_cs *cs,
+                                  const struct tu_image_view *src,
+                                  const struct tu_image_view *dst,
+                                  enum tu_external_format_resolve_source source,
+                                  uint32_t layer_mask,
+                                  uint32_t layers,
+                                  bool per_layer_rect,
+                                  const VkRect2D *rect);
+
 struct tu_resolve_group {
    uint32_t color_buffer_id;
    bool pending_resolves;
