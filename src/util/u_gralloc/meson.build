@@ -40,6 +40,16 @@ if with_platform_android and get_option('platform-sdk-version') >= 35
   c_args_for_u_gralloc += '-DUSE_IMAPPER_STABLEC_API'
   cpp_args_for_u_gralloc += '-DUSE_IMAPPER_STABLEC_API'
   inc_u_gralloc_stablec += include_directories('stablec/include')
+  # Gralloc 4 era devices expose the same standard metadata through the
+  # HIDL IMapper@4.0 passthrough contract (extern-C HIDL_FETCH_IMapper
+  # in the vendor hw module).  Standard-only selection: no
+  # vendor-private gralloc1 perform calls, no framework-private libui
+  # linkage; the fallback NDK/hw-module path remains for gralloc <= 3.
+  files_u_gralloc += files('u_gralloc_imapper4_pt_api.cpp')
+  c_args_for_u_gralloc += '-DUSE_IMAPPER4_PT_API'
+  cpp_args_for_u_gralloc += '-DUSE_IMAPPER4_PT_API'
+  c_args_for_u_gralloc += '-DU_GRALLOC_STRICT_STANDARD'
+  cpp_args_for_u_gralloc += '-DU_GRALLOC_STRICT_STANDARD'
   options_for_u_gralloc += 'cpp_std=c++17'
 endif
 

@@ -299,13 +299,13 @@ stablec_get_buffer_basic_info(struct u_gralloc *gralloc,
    if (!hnd || !hnd->handle || hnd->handle->numFds < 1)
       return -EINVAL;
 
+   /* Query the caller's handle directly: in every client process the
+    * framework already imported this buffer, and an extra
+    * importBuffer/freeBuffer cycle by the driver can tear down the
+    * framework's registration (observed to break SurfaceFlinger
+    * composition with the HIDL passthrough mapper).
+    */
    buffer_handle_t buffer = hnd->handle;
-   buffer_handle_t imported = nullptr;
-   const bool owns_import =
-      gr->mapper->v5.importBuffer(hnd->handle, &imported) ==
-         AIMAPPER_ERROR_NONE && imported != nullptr;
-   if (owns_import)
-      buffer = imported;
 
    int ret = -EINVAL;
    do {
@@ -337,9 +337,28 @@ stablec_get_buffer_basic_info(struct u_gralloc *gralloc,
       if (layer_count <= 0)
          layer_count = 1;
 
+      /* Vendor layout trust policy (platform-neutral): compressed
+       * modifiers never consume vendor plane geometry verbatim (vendors
+       * may omit metadata planes); geometry is reported unverified and
+       * consumers derive it from (fourcc, modifier, dims).  A "linear"
+       * modifier contradicted by a non-zero first-plane offset is
+       * flagged for consumers with authoritative layout knowledge.
+       * Plain linear buffers keep their verbatim vendor layouts.  See
+       * the passthrough backend for the same policy.
+       */
+      bool compressed = modifier != 0 &&
+                        modifier != (int64_t)DRM_FORMAT_MOD_LINEAR &&
+                        modifier != (int64_t)DRM_FORMAT_MOD_INVALID;
+
       std::vector<PlaneLayout> planes;
-      if (!get_standard_plane_layouts(gr, buffer, &planes))
-         break;
+      bool have_planes = get_standard_plane_layouts(gr, buffer, &planes);
+      bool contradictory = false;
+      if (have_planes && !compressed && planes[0].offsetInBytes != 0) {
+         contradictory = true;
+         have_planes = false;
+      }
+      if (compressed)
+         have_planes = false;
 
       memset(out, 0, sizeof(*out));
       out->drm_fourcc = fourcc;
@@ -347,33 +366,54 @@ stablec_get_buffer_basic_info(struct u_gralloc *gralloc,
          modifier == (int64_t)DRM_FORMAT_MOD_INVALID
             ? DRM_FORMAT_MOD_INVALID
             : (uint64_t)modifier;
-      out->num_planes = (int)planes.size();
       out->alloc_size = (uint64_t)allocation_size;
       out->layer_count = (uint64_t)layer_count;
 
       const int numFds = hnd->handle->numFds;
-      for (int i = 0; i < out->num_planes; i++) {
-         const PlaneLayout &plane = planes[i];
-         if (plane.offsetInBytes < 0 || plane.offsetInBytes > INT32_MAX ||
-             plane.strideInBytes <= 0 || plane.strideInBytes > INT32_MAX) {
-            ret = -EINVAL;
-            break;
+      if (have_planes) {
+         out->num_planes = (int)planes.size();
+         for (int i = 0; i < out->num_planes; i++) {
+            const PlaneLayout &plane = planes[i];
+            if (plane.offsetInBytes < 0 || plane.offsetInBytes > INT32_MAX ||
+                plane.strideInBytes <= 0 || plane.strideInBytes > INT32_MAX) {
+               ret = -EINVAL;
+               break;
+            }
+            out->offsets[i] = (int)plane.offsetInBytes;
+            out->strides[i] = (int)plane.strideInBytes;
+            /* Multi-planar gralloc buffers share the first dma-buf unless
+             * the handle provides one fd per plane.
+             */
+            out->fds[i] =
+               (numFds == out->num_planes) ? hnd->handle->data[i]
+                                            : hnd->handle->data[0];
          }
-         out->offsets[i] = (int)plane.offsetInBytes;
-         out->strides[i] = (int)plane.strideInBytes;
-         /* Multi-planar gralloc buffers share the first dma-buf unless the
-          * handle provides one fd per plane.
+      } else {
+         /*
+          * PLANE_LAYOUTS is optional per the stable-C contract.  Expose
+          * only the guaranteed scalar keys; consumers derive geometry
+          * (the Adreno driver recomputes layouts) or fail closed.
           */
-         out->fds[i] =
-            (numFds == out->num_planes) ? hnd->handle->data[i]
-                                         : hnd->handle->data[0];
+         if (hnd->pixel_stride > 0) {
+            out->num_planes = (fourcc == DRM_FORMAT_NV21 ||
+                               fourcc == DRM_FORMAT_NV12 ||
+                               fourcc == DRM_FORMAT_P010)
+                                 ? 2
+                                 : 1;
+            if (fourcc == DRM_FORMAT_YVU420)
+               out->num_planes = 3;
+            out->offsets[0] = 0;
+            out->strides[0] = hnd->pixel_stride;
+            for (int i = 0; i < out->num_planes; i++)
+               out->fds[i] = hnd->handle->data[0];
+         }
+         out->flags |= U_GRALLOC_BUFFER_INFO_PLANES_UNVERIFIED;
       }
+      if (contradictory)
+         out->flags |= U_GRALLOC_BUFFER_INFO_PLANES_CONTRADICTORY;
       if (ret != -EINVAL)
          ret = 0;
    } while (0);
-
-   if (owns_import)
-      gr->mapper->v5.freeBuffer(imported);
 
    return ret;
 }
@@ -386,12 +426,6 @@ stablec_get_buffer_color_info(struct u_gralloc *gralloc,
    struct stablec_gralloc *gr = (struct stablec_gralloc *)gralloc;
 
    buffer_handle_t buffer = hnd->handle;
-   buffer_handle_t imported = nullptr;
-   const bool owns_import =
-      gr->mapper->v5.importBuffer(hnd->handle, &imported) ==
-         AIMAPPER_ERROR_NONE && imported != nullptr;
-   if (owns_import)
-      buffer = imported;
 
    /* Defaults match the legacy behavior: Rec.601, narrow range, siting at
     * the midpoint.
@@ -456,9 +490,6 @@ stablec_get_buffer_color_info(struct u_gralloc *gralloc,
       }
    }
 
-   if (owns_import)
-      gr->mapper->v5.freeBuffer(imported);
-
    return 0;
 }
 
@@ -501,10 +532,20 @@ const struct u_gralloc_ops stablec_gralloc_ops = {
  * is the last resort, and every failure is logged so the selection is
  * observable in a bugreport.
  */
+/* New-style device manifests split entries into per-HAL fragments under
+ * /vendor/etc/vintf/manifest/.  Collect every *.xml from each directory
+ * (main files first, fragments second) so the mapper instance lookup is
+ * complete regardless of manifest layout.
+ */
 constexpr const char *VINTF_MANIFEST_PATHS[] = {
    "/vendor/etc/vintf/manifest.xml",
    "/vendor/etc/vintf/manifest_odm.xml",
    "/odm/etc/vintf/manifest.xml",
+};
+
+constexpr const char *VINTF_MANIFEST_DIRS[] = {
+   "/vendor/etc/vintf/manifest",
+   "/odm/etc/vintf/manifest",
 };
 
 constexpr const char *MAPPER_HW_DIRS[] = {
@@ -630,6 +671,10 @@ try_load_mapper(const char *path)
    AIMapper *mapper = nullptr;
    if (load(&mapper) != AIMAPPER_ERROR_NONE || !mapper ||
        mapper->version < AIMAPPER_VERSION_5) {
+      /* The stable-C function table only exists from version 5 up
+       * (AIMapper_Version in the vendored IMapper.h); mapper@2.0-4.0
+       * devices use the HIDL contract backend instead.
+       */
       dlclose(so);
       return nullptr;
    }
@@ -658,6 +703,20 @@ u_gralloc_stablec_api_create(void)
    std::vector<std::string> suffixes;
    for (const char *manifest : VINTF_MANIFEST_PATHS)
       collect_mapper_instances_from_manifest(manifest, &suffixes);
+   for (const char *dir : VINTF_MANIFEST_DIRS) {
+      DIR *d = opendir(dir);
+      if (!d)
+         continue;
+      while (struct dirent *e = readdir(d)) {
+         size_t len = strlen(e->d_name);
+         if (len > 4 && strcmp(e->d_name + len - 4, ".xml") == 0) {
+            char path[512];
+            snprintf(path, sizeof(path), "%s/%s", dir, e->d_name);
+            collect_mapper_instances_from_manifest(path, &suffixes);
+         }
+      }
+      closedir(d);
+   }
    collect_mapper_suffixes_from_hw_dirs(&suffixes);
    for (const char *fallback : MAPPER_SUFFIX_FALLBACKS)
       push_unique(&suffixes, fallback);
