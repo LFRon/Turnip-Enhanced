@@ -871,8 +871,56 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
 }
 TU_GENX(tu_image_init);
 
+/*
+ * Cross-check the DRM fourcc reported by gralloc metadata against the
+ * Vulkan multi-planar format chosen at image creation.  Only pairings whose
+ * plane layout fdl can derive authoritatively from (fourcc, modifier,
+ * dimensions) are accepted by the unverified-plane recovery below;
+ * everything else fails closed.
+ */
+bool
+tu_drm_fourcc_matches_format(VkFormat vk_format, uint32_t fourcc)
+{
+   /* External-format images are created with VK_FORMAT_UNDEFINED and
+    * resolve their real format from the AHB properties (which are
+    * derived from this very fourcc), so accept it here; the concrete
+    * layout is validated when fdl computes it from the resolved format.
+    */
+   if (vk_format == VK_FORMAT_UNDEFINED)
+      return true;
+
+   switch (fourcc) {
+   case DRM_FORMAT_NV12:
+   case DRM_FORMAT_NV21:
+      /* NV21 shares the NV12 two-plane layout; the Cb/Cr order is handled
+       * by the ycbcr conversion swizzle, not by plane geometry.
+       */
+      return vk_format == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
+   case DRM_FORMAT_YVU420:
+      return vk_format == VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM;
+   case fourcc_code('A', 'B', '2', '4'): /* AB24 = RGBA byte order */
+   case fourcc_code('X', 'B', '2', '4'): /* XB24 = RGBX byte order */
+      return vk_format == VK_FORMAT_R8G8B8A8_UNORM;
+   case fourcc_code('A', 'R', '3', '0'): /* AR30 = BGRA bit order */
+   case fourcc_code('X', 'R', '3', '0'):
+      return vk_format == VK_FORMAT_A2R10G10B10_UNORM_PACK32;
+   case fourcc_code('A', 'B', '1', '6'): /* AB16 float */
+   case fourcc_code('X', 'B', '1', '6'):
+      return vk_format == VK_FORMAT_R16G16B16A16_SFLOAT;
+   case DRM_FORMAT_RGB565:
+      return vk_format == VK_FORMAT_R5G6B5_UNORM_PACK16;
+   case DRM_FORMAT_BGR565:
+      return vk_format == VK_FORMAT_B5G6R5_UNORM_PACK16;
+   case DRM_FORMAT_AYUV:
+      return vk_format == VK_FORMAT_R8G8B8A8_UNORM;
+   default:
+      return false;
+   }
+}
+
 /* Deferred ANB image support for ANB v8+ aliased images. */
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
+
 static VkResult
 tu_android_get_wsi_memory(struct tu_device *dev,
                           const VkBindImageMemoryInfo *bind_info,
@@ -895,15 +943,64 @@ tu_android_get_wsi_memory(struct tu_device *dev,
 
    VkImageDrmFormatModifierExplicitCreateInfoEXT eci;
    VkSubresourceLayout a_plane_layouts[TU_MAX_PLANE_COUNT];
+   const VkSubresourceLayout *plane_layouts = a_plane_layouts;
+   uint64_t modifier;
+
    result = vk_android_get_anb_layout(
       img->vk.android_deferred_create_info, &eci, a_plane_layouts,
       TU_MAX_PLANE_COUNT);
-   if (result != VK_SUCCESS)
+   if (result == VK_ERROR_FEATURE_NOT_PRESENT) {
+      /*
+       * The gralloc metadata transport identified the buffer but could not
+       * supply authoritative plane geometry (typical for UBWC on gralloc-4
+       * era vendors).  Recover the DRM format/modifier through the same
+       * standardized query and let fdl compute the layout from
+       * (fourcc, modifier, dimensions) exactly as it does for the
+       * driver's own allocations.  Anything inconsistent fails closed.
+       */
+      struct vk_android_drm_format_info drm;
+      if (vk_android_get_anb_drm_format(
+             img->vk.android_deferred_create_info, &drm) != VK_SUCCESS ||
+          !drm.planes_unverified ||
+          !tu_drm_fourcc_matches_format(
+             img->vk.android_deferred_create_info->format, drm.drm_fourcc)) {
+         mesa_loge("tu: ANB recovery rejected (vk_format=%d fourcc=0x%x "
+                   "modifier=0x%llx unverified=%d)",
+                   (int)img->vk.android_deferred_create_info->format,
+                   drm.drm_fourcc, (unsigned long long)drm.modifier,
+                   (int)drm.planes_unverified);
+         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+      }
+
+      /* The transport marked the geometry unverified (compressed UBWC on
+       * gralloc-4 era vendors): the driver's own layout library is the
+       * authority for the plane count and layout of the recovered
+       * (fourcc, modifier) pair, exactly as for its own allocations.
+       * A contradicted "linear" claim is Adreno UBWC metadata preceding
+       * the payload.
+       */
+      eci.drmFormatModifierPlaneCount = (uint32_t)tu6_plane_count(
+         img->vk.android_deferred_create_info->format);
+      modifier = drm.planes_contradictory ? DRM_FORMAT_MOD_QCOM_COMPRESSED
+                                          : drm.modifier;
+      eci.drmFormatModifier = modifier;
+      plane_layouts = NULL;
+   } else if (result != VK_SUCCESS) {
       return result;
+   } else {
+      modifier = eci.drmFormatModifier;
+   }
 
    if (eci.drmFormatModifierPlaneCount !=
-       tu6_plane_count(img->vk.android_deferred_create_info->format))
+       tu6_plane_count(img->vk.android_deferred_create_info->format)) {
+      mesa_loge("tu: ANB plane count mismatch (vendor=%u driver=%u "
+                "modifier=0x%llx)",
+                eci.drmFormatModifierPlaneCount,
+                (unsigned)tu6_plane_count(
+                   img->vk.android_deferred_create_info->format),
+                (unsigned long long)eci.drmFormatModifier);
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }
 
    VkExternalMemoryImageCreateInfo external_info = {
       .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
@@ -914,7 +1011,7 @@ tu_android_get_wsi_memory(struct tu_device *dev,
 
    result = TU_CALLX(dev, tu_image_init)(
       dev, img, img->vk.android_deferred_create_info,
-      eci.drmFormatModifier, a_plane_layouts, TU_IMAGE_ID_ASSIGN);
+      modifier, plane_layouts, TU_IMAGE_ID_ASSIGN);
    if (result != VK_SUCCESS)
       return result;
 
@@ -1011,17 +1108,48 @@ tu_CreateImage(VkDevice _device,
    if (vk_image_is_android_native_buffer(&image->vk)) {
       result = vk_android_get_anb_layout(
          pCreateInfo, &eci, a_plane_layouts, TU_MAX_PLANE_COUNT);
-      if (result != VK_SUCCESS)
+      if (result == VK_ERROR_FEATURE_NOT_PRESENT) {
+         /* Vendor metadata resolved the buffer's DRM format/modifier but
+          * did not supply geometry we consume (compressed layouts are
+          * recomputed by fdl; see tu_android_get_wsi_memory).
+          */
+         struct vk_android_drm_format_info drm;
+         if (vk_android_get_anb_drm_format(pCreateInfo, &drm) != VK_SUCCESS ||
+             !drm.planes_unverified ||
+             !tu_drm_fourcc_matches_format(pCreateInfo->format,
+                                           drm.drm_fourcc)) {
+            mesa_loge("tu: ANB create recovery rejected (vk_format=%d "
+                      "fourcc=0x%x modifier=0x%llx)",
+                      (int)pCreateInfo->format, drm.drm_fourcc,
+                      (unsigned long long)drm.modifier);
+            result = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+            goto fail;
+         }
+         eci.drmFormatModifierPlaneCount =
+            (uint32_t)tu6_plane_count(pCreateInfo->format);
+         /* contradicted "linear" == Adreno UBWC metadata region (see the
+          * bind-site recovery for the same policy).
+          */
+         modifier = drm.planes_contradictory ? DRM_FORMAT_MOD_QCOM_COMPRESSED
+                                             : drm.modifier;
+         eci.drmFormatModifier = modifier;
+         plane_layouts = NULL;
+      } else if (result != VK_SUCCESS) {
          goto fail;
-
-      if (eci.drmFormatModifierPlaneCount !=
-          tu6_plane_count(pCreateInfo->format)) {
-         result = VK_ERROR_INVALID_EXTERNAL_HANDLE;
-         goto fail;
+      } else {
+         if (eci.drmFormatModifierPlaneCount !=
+             tu6_plane_count(pCreateInfo->format)) {
+            mesa_loge("tu: ANB create plane count mismatch (vendor=%u "
+                      "driver=%u modifier=0x%llx)",
+                      eci.drmFormatModifierPlaneCount,
+                      (unsigned)tu6_plane_count(pCreateInfo->format),
+                      (unsigned long long)eci.drmFormatModifier);
+            result = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+            goto fail;
+         }
+         plane_layouts = a_plane_layouts;
+         modifier = eci.drmFormatModifier;
       }
-
-      plane_layouts = a_plane_layouts;
-      modifier = eci.drmFormatModifier;
    }
 
    result = TU_CALLX(device, tu_image_init)(device, image, pCreateInfo,

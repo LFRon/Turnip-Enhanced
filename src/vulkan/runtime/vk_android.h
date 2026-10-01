@@ -39,11 +39,39 @@ struct u_gralloc;
 struct vk_device;
 struct vk_image;
 
+/*
+ * Result of the standard gralloc metadata query used to recover the DRM
+ * format/modifier of an ANB/AHB import when the metadata transport does not
+ * provide authoritative plane geometry (planes_unverified).  Consumers may
+ * recompute plane layouts from (drm_fourcc, modifier, dimensions) with
+ * their own layout library.
+ */
+struct vk_android_drm_format_info {
+   uint32_t drm_fourcc;
+   uint64_t modifier;
+   uint32_t plane_count;
+   bool planes_unverified;
+   /* The vendor geometry contradicts its own modifier claim (e.g.
+    * "linear" with a non-zero first-plane offset).  Consumers with
+    * authoritative layout knowledge may reinterpret the modifier.
+    */
+   bool planes_contradictory;
+};
+
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
 
 struct u_gralloc *vk_android_get_ugralloc(void);
 
 bool vk_android_gralloc_supports_explicit_yuv_layout(void);
+
+VkResult
+vk_android_get_anb_drm_format(const VkImageCreateInfo *pCreateInfo,
+                              struct vk_android_drm_format_info *out);
+
+VkResult
+vk_android_get_ahb_drm_format(struct AHardwareBuffer *buffer,
+                              VkFormat vk_format,
+                              struct vk_android_drm_format_info *out);
 
 VkResult vk_android_import_anb(struct vk_device *device,
                                const VkImageCreateInfo *pCreateInfo,
@@ -183,6 +211,27 @@ static inline uint64_t
 vk_android_get_front_buffer_usage(void)
 {
    return 0;
+}
+
+static inline bool
+vk_android_gralloc_supports_explicit_yuv_layout(void)
+{
+   return false;
+}
+
+static inline VkResult
+vk_android_get_anb_drm_format(const VkImageCreateInfo *pCreateInfo,
+                              struct vk_android_drm_format_info *out)
+{
+   return VK_ERROR_FEATURE_NOT_PRESENT;
+}
+
+static inline VkResult
+vk_android_get_ahb_drm_format(struct AHardwareBuffer *buffer,
+                              VkFormat vk_format,
+                              struct vk_android_drm_format_info *out)
+{
+   return VK_ERROR_FEATURE_NOT_PRESENT;
 }
 
 static inline VkFormat
