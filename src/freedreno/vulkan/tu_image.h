@@ -160,6 +160,9 @@ struct tu_frag_area {
    float height;
 };
 
+bool
+tu_drm_fourcc_matches_format(VkFormat vk_format, uint32_t drm_fourcc);
+
 void
 tu_fragment_density_map_sample(const struct tu_image_view *fdm,
                                int32_t x, int32_t y,

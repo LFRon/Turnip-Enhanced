@@ -74,12 +74,78 @@ vk_android_gralloc_supports_explicit_yuv_layout(void)
 {
    switch (u_gralloc_get_type(vk_android_get_ugralloc())) {
    case U_GRALLOC_TYPE_STABLEC:
+   /* The passthrough backend serves authoritative plane geometry from the
+    * standard PLANE_LAYOUTS key and resolves vendor formats through the
+    * same standard metadata queries; removing it from this gate makes
+    * the driver report unsupported for every vendor (UBWC) AHB format
+    * and crashes Skia's GaneshBackendTexture (FATAL).  It must stay in.
+    */
+   case U_GRALLOC_TYPE_IMAPPER4_PT:
    case U_GRALLOC_TYPE_GRALLOC4:
    case U_GRALLOC_TYPE_CROS:
       return true;
    default:
       return false;
    }
+}
+
+static VkResult
+vk_android_drm_format_of(struct u_gralloc_buffer_handle *hnd,
+                         struct vk_android_drm_format_info *out)
+{
+   struct u_gralloc_buffer_basic_info info;
+   if (u_gralloc_get_buffer_basic_info(vk_android_get_ugralloc(), hnd,
+                                        &info) != 0) {
+      mesa_loge("vk_android: gralloc metadata query failed for handle "
+                "(hal_format=0x%x pixel_stride=%d) - refusing import",
+                hnd->hal_format, hnd->pixel_stride);
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }
+
+   *out = (struct vk_android_drm_format_info){
+      .drm_fourcc = info.drm_fourcc,
+      .modifier = info.modifier,
+      .plane_count = (uint32_t)info.num_planes,
+      .planes_unverified =
+         !!(info.flags & U_GRALLOC_BUFFER_INFO_PLANES_UNVERIFIED),
+      .planes_contradictory =
+         !!(info.flags & U_GRALLOC_BUFFER_INFO_PLANES_CONTRADICTORY),
+   };
+   return VK_SUCCESS;
+}
+
+VkResult
+vk_android_get_anb_drm_format(const struct VkImageCreateInfo *pCreateInfo,
+                              struct vk_android_drm_format_info *out)
+{
+   const VkNativeBufferANDROID *anb = vk_find_struct_const(
+      pCreateInfo->pNext, NATIVE_BUFFER_ANDROID);
+   if (!anb)
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
+   struct u_gralloc_buffer_handle hnd = {
+      .handle = anb->handle,
+      .hal_format = (int) pCreateInfo->format,
+      .pixel_stride = 0,
+   };
+   return vk_android_drm_format_of(&hnd, out);
+}
+
+VkResult
+vk_android_get_ahb_drm_format(struct AHardwareBuffer *buffer,
+                              VkFormat vk_format,
+                              struct vk_android_drm_format_info *out)
+{
+   AHardwareBuffer_Desc desc;
+   AHardwareBuffer_describe(buffer, &desc);
+
+   struct u_gralloc_buffer_handle hnd = {
+      .handle = AHardwareBuffer_getNativeHandle(buffer),
+      .hal_format = (int) desc.format,
+      .pixel_stride = (int) desc.stride,
+   };
+   (void) vk_format;
+   return vk_android_drm_format_of(&hnd, out);
 }
 
 
@@ -163,6 +229,16 @@ vk_gralloc_to_drm_explicit_layout(
    if (u_gralloc_get_buffer_basic_info(u_gralloc, in_hnd, &info) != 0) {
       mesa_loge("u_gralloc_get_buffer_basic_info failed");
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }
+
+   if (info.flags & U_GRALLOC_BUFFER_INFO_PLANES_UNVERIFIED) {
+      /* The metadata transport could not supply authoritative plane
+       * geometry.  Drivers that can recompute the layout from
+       * (fourcc, modifier, dimensions) may recover via
+       * vk_android_get_anb_drm_format(); generic consumers must not use
+       * the zero-filled layouts.
+       */
+      return VK_ERROR_FEATURE_NOT_PRESENT;
    }
 
    if (info.num_planes > max_planes) {
