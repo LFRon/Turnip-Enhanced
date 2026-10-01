@@ -148,12 +148,19 @@ fallback_gralloc_get_buffer_info(struct u_gralloc *gralloc,
    out->strides[0] = stride;
 
 #ifdef HAS_FREEDRENO
+#ifndef U_GRALLOC_STRICT_STANDARD
+   /* This inspects the vendor-private qcom native handle layout; standard
+    * metadata transports (IMapper stable-C, IMapper@4.0 passthrough)
+    * expose the same information through documented keys and are used
+    * before this path is ever selected.
+    */
    uint32_t gmsm = ('g' << 24) | ('m' << 16) | ('s' << 8) | 'm';
    if (hnd->handle->numInts >= 2 && hnd->handle->data[hnd->handle->numFds] == gmsm) {
       /* This UBWC flag was introduced in a5xx. */
       bool ubwc = hnd->handle->data[hnd->handle->numFds + 1] & 0x08000000;
       out->modifier = ubwc ? DRM_FORMAT_MOD_QCOM_COMPRESSED : DRM_FORMAT_MOD_LINEAR;
    }
+#endif /* !U_GRALLOC_STRICT_STANDARD */
 #endif
 
    return 0;
