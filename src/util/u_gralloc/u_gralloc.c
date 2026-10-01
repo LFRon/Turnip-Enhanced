@@ -30,13 +30,30 @@ static const struct u_grallocs {
     */
    {.type = U_GRALLOC_TYPE_STABLEC, .create = u_gralloc_stablec_api_create},
 #endif /* USE_IMAPPER_STABLEC_API */
+#ifdef USE_IMAPPER4_PT_API
+   /* Then the gralloc 4 era HIDL IMapper@4.0 passthrough contract: the
+    * vendor-implemented android.hardware.graphics.mapper@4.0-impl*.so is
+    * loaded in-process through the documented extern-C HIDL_FETCH_IMapper
+    * entry point and queried only through standard gralloc4 metadata
+    * keys.  This mirrors how the platform reaches passthrough HALs.
+    */
+   {.type = U_GRALLOC_TYPE_IMAPPER4_PT,
+    .create = u_gralloc_imapper4_pt_api_create},
+#endif /* USE_IMAPPER4_PT_API */
+#ifndef U_GRALLOC_STRICT_STANDARD
    /* Prefer the CrOS API as it is significantly faster than IMapper4 */
    {.type = U_GRALLOC_TYPE_CROS, .create = u_gralloc_cros_api_create},
+#endif /* !U_GRALLOC_STRICT_STANDARD */
 #ifdef USE_IMAPPER4_METADATA_API
    {.type = U_GRALLOC_TYPE_GRALLOC4, .create = u_gralloc_imapper_api_create},
 #endif /* USE_IMAPPER4_METADATA_API */
+#ifndef U_GRALLOC_STRICT_STANDARD
    {.type = U_GRALLOC_TYPE_LIBDRM, .create = u_gralloc_libdrm_create},
+   /* The QCOM backend queries vendor-private gralloc1 perform codes;
+    * excluded from standard-only builds.
+    */
    {.type = U_GRALLOC_TYPE_QCOM, .create = u_gralloc_qcom_create},
+#endif /* !U_GRALLOC_STRICT_STANDARD */
    {.type = U_GRALLOC_TYPE_FALLBACK, .create = u_gralloc_fallback_create},
 };
 
@@ -79,6 +96,7 @@ u_gralloc_create(enum u_gralloc_type type)
             case U_GRALLOC_TYPE_QCOM:     name = "gralloc1-qcom"; break;
             case U_GRALLOC_TYPE_FALLBACK: name = "fallback"; break;
             case U_GRALLOC_TYPE_STABLEC:  name = "imapper-stable-c"; break;
+            case U_GRALLOC_TYPE_IMAPPER4_PT: name = "imapper4-passthrough"; break;
             default: break;
             }
             mesa_logi("u_gralloc: auto-selected backend: %s", name);
