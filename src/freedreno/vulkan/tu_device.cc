@@ -1700,9 +1700,33 @@ tu_ahb_external_format_resolve_supported(
    VkResult result = vk_android_get_ahb_layout(
       const_cast<struct AHardwareBuffer *>(buffer), &modifier_info,
       plane_layouts, TU_MAX_PLANE_COUNT);
-   if (result != VK_SUCCESS ||
-       modifier_info.drmFormatModifierPlaneCount != ycbcr_info->n_planes)
+   if (result == VK_ERROR_FEATURE_NOT_PRESENT) {
+      /*
+       * The metadata transport does not report authoritative plane
+       * geometry for this buffer (UBWC on gralloc-4 era vendors).  This
+       * capability query consumes only the modifier, so recover it from
+       * the standardized DRM-format query; the geometry question is
+       * moot here and the plane-count cross-check would reject valid
+       * UBWC buffers whose vendor layouts omit the metadata plane.
+       */
+      struct vk_android_drm_format_info drm;
+      if (vk_android_get_ahb_drm_format(
+             const_cast<struct AHardwareBuffer *>(buffer), format,
+             &drm) != VK_SUCCESS ||
+          !drm.planes_unverified ||
+          !tu_drm_fourcc_matches_format(format, drm.drm_fourcc))
+         return false;
+      /* Adreno interpretation of a contradicted "linear" claim: the
+       * leading region is UBWC metadata; the buffer is compressed.
+       */
+      modifier_info.drmFormatModifier =
+         drm.planes_contradictory ? DRM_FORMAT_MOD_QCOM_COMPRESSED
+                                  : drm.modifier;
+   } else if (result != VK_SUCCESS ||
+              modifier_info.drmFormatModifierPlaneCount !=
+                 ycbcr_info->n_planes) {
       return false;
+   }
 
    enum a6xx_tile_mode tile_mode;
    switch (modifier_info.drmFormatModifier) {
@@ -4276,12 +4300,57 @@ tu_AllocateMemory(VkDevice _device,
        vk_image_is_android_hardware_buffer(&mem->image->vk)) {
       VkImageDrmFormatModifierExplicitCreateInfoEXT eci;
       VkSubresourceLayout a_plane_layouts[TU_MAX_PLANE_COUNT];
+      const VkSubresourceLayout *plane_layouts = a_plane_layouts;
+      uint64_t modifier;
+
       result = vk_android_get_ahb_layout(
          mem->vk.ahardware_buffer, &eci, a_plane_layouts,
          TU_MAX_PLANE_COUNT);
-      if (result != VK_SUCCESS) {
+      if (result == VK_ERROR_FEATURE_NOT_PRESENT) {
+         /*
+          * The metadata transport identified the buffer but does not
+          * report authoritative plane geometry (gralloc-4 era vendors
+          * with UBWC).  Recover the DRM format through the same
+          * standardized query and let fdl compute the layout from
+          * (fourcc, modifier, dimensions), as for driver-owned
+          * allocations.  Inconsistent formats fail closed.
+          */
+         struct vk_android_drm_format_info drm;
+         if (vk_android_get_ahb_drm_format(
+                mem->vk.ahardware_buffer, mem->image->vk.format,
+                &drm) != VK_SUCCESS ||
+             !drm.planes_unverified ||
+             !tu_drm_fourcc_matches_format(mem->image->vk.format,
+                                           drm.drm_fourcc)) {
+            vk_device_memory_destroy(&device->vk, pAllocator, &mem->vk);
+            return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+         }
+
+         /* Adreno interpretation of a contradicted "linear" claim: the
+          * leading region is UBWC metadata.
+          */
+         const uint64_t recovered_modifier =
+            drm.planes_contradictory ? DRM_FORMAT_MOD_QCOM_COMPRESSED
+                                     : drm.modifier;
+
+         /* Unverified geometry: the driver's own layout library owns the
+          * plane count for the recovered (fourcc, modifier) pair.
+          */
+         eci = {
+            .sType =
+               VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
+            .drmFormatModifier = recovered_modifier,
+            .drmFormatModifierPlaneCount =
+               (uint32_t)tu6_plane_count(mem->image->vk.format),
+            .pPlaneLayouts = NULL,
+         };
+         modifier = recovered_modifier;
+         plane_layouts = NULL;
+      } else if (result != VK_SUCCESS) {
          vk_device_memory_destroy(&device->vk, pAllocator, &mem->vk);
          return result;
+      } else {
+         modifier = eci.drmFormatModifier;
       }
 
       if (eci.drmFormatModifierPlaneCount !=
@@ -4303,7 +4372,7 @@ tu_AllocateMemory(VkDevice _device,
 
       result = TU_CALLX(device, tu_image_init)(
          device, mem->image, mem->image->vk.android_deferred_create_info,
-         eci.drmFormatModifier, a_plane_layouts, TU_IMAGE_ID_ASSIGN);
+         modifier, plane_layouts, TU_IMAGE_ID_ASSIGN);
       if (result != VK_SUCCESS) {
          vk_device_memory_destroy(&device->vk, pAllocator, &mem->vk);
          return result;
