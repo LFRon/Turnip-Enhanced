@@ -31,6 +31,21 @@ struct u_gralloc_buffer_handle {
    int pixel_stride;
 };
 
+/* Flag for u_gralloc_buffer_basic_info.flags: plane offsets/strides were not
+ * authoritatively provided by the gralloc metadata service and must not be
+ * used for explicit-layout imports; scalar keys (fourcc, modifier, sizes)
+ * remain authoritative.  Consumers needing exact compressed plane geometry should
+ * recompute it with their layout library or fail closed.
+ */
+#define U_GRALLOC_BUFFER_INFO_PLANES_UNVERIFIED (1u << 0)
+
+/* Flag for u_gralloc_buffer_basic_info.flags: the vendor geometry directly
+ * contradicts the reported modifier (e.g. a "linear" buffer whose first
+ * plane does not start at offset 0).  The modifier claim is untrustworthy;
+ * consumers with authoritative layout knowledge may reinterpret it.
+ */
+#define U_GRALLOC_BUFFER_INFO_PLANES_CONTRADICTORY (1u << 1)
+
 struct u_gralloc_buffer_basic_info {
    uint32_t drm_fourcc;
    uint64_t modifier;
@@ -42,6 +57,8 @@ struct u_gralloc_buffer_basic_info {
 
    uint64_t alloc_size;
    uint64_t layer_count;
+
+   uint32_t flags;
 };
 
 struct u_gralloc_buffer_color_info {
@@ -59,6 +76,7 @@ enum u_gralloc_type {
    U_GRALLOC_TYPE_QCOM,
    U_GRALLOC_TYPE_FALLBACK,
    U_GRALLOC_TYPE_STABLEC,
+   U_GRALLOC_TYPE_IMAPPER4_PT,
    U_GRALLOC_TYPE_COUNT,
 };
 
