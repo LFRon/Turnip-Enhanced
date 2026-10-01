@@ -41,6 +41,9 @@ extern struct u_gralloc *u_gralloc_fallback_create(void);
 #ifdef USE_IMAPPER_STABLEC_API
 extern struct u_gralloc *u_gralloc_stablec_api_create(void);
 #endif
+#ifdef USE_IMAPPER4_PT_API
+extern struct u_gralloc *u_gralloc_imapper4_pt_api_create(void);
+#endif
 
 /* Helpers for legacy grallocs */
 struct android_ycbcr;
