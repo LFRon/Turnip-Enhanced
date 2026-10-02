@@ -4321,13 +4321,18 @@ tu_AllocateMemory(VkDevice _device,
           * (fourcc, modifier, dimensions), as for driver-owned
           * allocations.  Inconsistent formats fail closed.
           */
-         struct vk_android_drm_format_info drm;
+         struct vk_android_drm_format_info drm = {0};
          if (vk_android_get_ahb_drm_format(
                 mem->vk.ahardware_buffer, mem->image->vk.format,
                 &drm) != VK_SUCCESS ||
              !drm.planes_unverified ||
              !tu_drm_fourcc_matches_format(mem->image->vk.format,
                                            drm.drm_fourcc)) {
+            mesa_loge("tu: AHB recovery rejected (vk_format=%d fourcc=0x%x "
+                      "modifier=0x%llx unverified=%d)",
+                      (int)mem->image->vk.format, drm.drm_fourcc,
+                      (unsigned long long)drm.modifier,
+                      (int)drm.planes_unverified);
             vk_device_memory_destroy(&device->vk, pAllocator, &mem->vk);
             return VK_ERROR_INVALID_EXTERNAL_HANDLE;
          }

@@ -223,6 +223,13 @@ fdl6_layout_image(struct fdl_layout *layout, const struct fd_dev_info *info,
    if (explicit_layout) {
       offset = explicit_layout->offset;
       layout->pitch0 = explicit_layout->pitch;
+
+      if (explicit_layout->skip_last_level_padding &&
+          (layout->tile_mode != TILE6_LINEAR || layout->ubwc ||
+           params->mip_levels != 1 || params->array_size != 1 ||
+           params->depth0 != 1 || params->is_3d))
+         return false;
+
       if (align(layout->pitch0, 1 << layout->pitchalign) != layout->pitch0)
          return false;
    }
@@ -289,7 +296,8 @@ fdl6_layout_image(struct fdl_layout *layout, const struct fd_dev_info *info,
        * The pitch is already sufficiently aligned, but height
        * may not be. note this only matters if last level is linear
        */
-      if (level == params->mip_levels - 1)
+      if (level == params->mip_levels - 1 &&
+          !(explicit_layout && explicit_layout->skip_last_level_padding))
          nblocksy = align(nblocksy, 4);
 
       slice->offset = offset + layout->size;
