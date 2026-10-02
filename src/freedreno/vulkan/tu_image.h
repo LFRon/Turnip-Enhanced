@@ -25,6 +25,8 @@ struct tu_image
    uint64_t subsampled_metadata_offset;
    uint64_t total_size;
 
+   bool android_external_no_gmem_padding;
+
    /* Set when bound */
    uint64_t iova;
    union {

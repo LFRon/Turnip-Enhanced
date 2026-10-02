@@ -73,6 +73,8 @@ struct fdl_slice {
 struct fdl_explicit_layout {
    uint32_t offset;
    uint32_t pitch;
+
+   bool skip_last_level_padding;
 };
 
 /**
