@@ -71,6 +71,15 @@ constexpr char STANDARD_METADATA_NAME[] =
 constexpr char CHROMA_SITING_EXT_NAME[] =
    "android.hardware.graphics.common.ChromaSiting";
 
+/* android.hardware.graphics.common.PlaneLayoutComponentType (standard
+ * ExtendableType name and the Y/Cb/Cr values used to order YUV planes).
+ */
+constexpr char STANDARD_PLANE_COMPONENT_TYPE[] =
+   "android.hardware.graphics.common.PlaneLayoutComponentType";
+constexpr int64_t PLANE_COMPONENT_Y = INT64_C(1) << 0;
+constexpr int64_t PLANE_COMPONENT_CB = INT64_C(1) << 1;
+constexpr int64_t PLANE_COMPONENT_CR = INT64_C(1) << 2;
+
 /* aidl android.hardware.graphics.common.ChromaSiting */
 enum chroma_siting : int64_t {
    CHROMA_SITING_NONE = 0,
@@ -142,11 +151,16 @@ class Reader {
    }
 
    /* Consumes an ExtendableType (name + int64 value). */
+   bool read_extendable_type(std::string *name, int64_t *value)
+   {
+      return read_string(name) && read_i64(value);
+   }
+
    bool skip_extendable_type()
    {
       std::string name;
       int64_t value;
-      return read_string(&name) && read_i64(&value);
+      return read_extendable_type(&name, &value);
    }
 
  private:
@@ -242,6 +256,11 @@ struct PlaneLayout {
    int64_t totalSizeInBytes;
    int64_t horizontalSubsampling;
    int64_t verticalSubsampling;
+
+   /* Standard PlaneLayoutComponentType value when the plane has exactly one
+    * component, else -1.
+    */
+   int64_t component_value = -1;
 };
 
 bool
@@ -265,11 +284,17 @@ get_standard_plane_layouts(const struct stablec_gralloc *gr,
       if (!reader.read_i64(&num_components) || num_components < 0 ||
           num_components > 8)
          return false;
+      int64_t component_value = -1;
       for (int64_t j = 0; j < num_components; j++) {
          /* ExtendableType + offsetInBits + sizeInBits */
-         if (!reader.skip_extendable_type() || !reader.skip_i64() ||
-             !reader.skip_i64())
+         std::string component_name;
+         int64_t value = 0;
+         if (!reader.read_extendable_type(&component_name, &value) ||
+             !reader.skip_i64() || !reader.skip_i64())
             return false;
+         if (num_components == 1 &&
+             component_name == STANDARD_PLANE_COMPONENT_TYPE)
+            component_value = value;
       }
 
       PlaneLayout plane;
@@ -283,10 +308,43 @@ get_standard_plane_layouts(const struct stablec_gralloc *gr,
           !reader.read_i64(&plane.verticalSubsampling))
          return false;
 
+      plane.component_value = component_value;
       out->push_back(plane);
    }
 
    return reader.ok() && (int64_t)out->size() == num_planes;
+}
+
+/* QTI reports PlaneLayouts in logical Y-Cb-Cr order even for YV12, whose
+ * storage and DRM fourcc order is Y-Cr-Cb.  vk_android swaps the two chroma
+ * planes of DRM_FORMAT_YVU420 back into Vulkan's Y-Cb-Cr plane order, so
+ * hand it DRM order here.  Only a plain three-plane layout whose standard
+ * PlaneLayoutComponentType identifies every plane is rewritten; anything
+ * else keeps the reported order.
+ */
+static bool
+stablec_normalize_yv12_plane_order(std::vector<PlaneLayout> *planes)
+{
+   if (planes->size() != 3)
+      return false;
+
+   int y = -1, cb = -1, cr = -1;
+   for (size_t i = 0; i < planes->size(); i++) {
+      if ((*planes)[i].component_value == PLANE_COMPONENT_Y)
+         y = (int)i;
+      else if ((*planes)[i].component_value == PLANE_COMPONENT_CB)
+         cb = (int)i;
+      else if ((*planes)[i].component_value == PLANE_COMPONENT_CR)
+         cr = (int)i;
+      else
+         return false;
+   }
+   if (y < 0 || cb < 0 || cr < 0)
+      return false;
+
+   const PlaneLayout yv12[3] = { (*planes)[y], (*planes)[cr], (*planes)[cb] };
+   planes->assign(yv12, yv12 + 3);
+   return true;
 }
 
 int
@@ -359,6 +417,10 @@ stablec_get_buffer_basic_info(struct u_gralloc *gralloc,
       }
       if (compressed)
          have_planes = false;
+
+      if (have_planes && !compressed && fourcc == DRM_FORMAT_YVU420 &&
+          !stablec_normalize_yv12_plane_order(&planes))
+         mesa_logw_once("u_gralloc: YV12 plane components missing; keeping reported order");
 
       memset(out, 0, sizeof(*out));
       out->drm_fourcc = fourcc;
