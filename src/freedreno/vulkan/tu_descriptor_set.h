@@ -44,6 +44,11 @@ struct tu_descriptor_set_binding_layout
    /* The size in bytes of each Vulkan descriptor. */
    uint32_t size;
 
+   /* Number of image/sampler hardware descriptor pairs used by one
+    * combined image sampler.  All other descriptor types use one.
+    */
+   uint8_t plane_count;
+
    uint32_t offset;
 
    /* Byte offset in the array of dynamic descriptors (offsetted by
@@ -178,6 +183,11 @@ struct tu_descriptor_update_template_sampler {
 struct tu_descriptor_update_template_entry
 {
    VkDescriptorType descriptor_type;
+
+   /* Number of image/sampler descriptor pairs reserved by the binding's
+    * immutable YCbCr sampling layout (1 for all other bindings).
+    */
+   uint8_t plane_count;
 
    /* The number of descriptors to update */
    uint32_t descriptor_count;
