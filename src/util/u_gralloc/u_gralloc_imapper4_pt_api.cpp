@@ -96,6 +96,15 @@ enum standard_metadata_type : int64_t {
 constexpr char STANDARD_METADATA_NAME[] =
    "android.hardware.graphics.common.StandardMetadataType";
 
+/* android.hardware.graphics.common.PlaneLayoutComponentType (standard
+ * ExtendableType name and the Y/Cb/Cr values used to order YUV planes).
+ */
+constexpr char STANDARD_PLANE_COMPONENT_TYPE[] =
+   "android.hardware.graphics.common.PlaneLayoutComponentType";
+constexpr int64_t PLANE_COMPONENT_Y = INT64_C(1) << 0;
+constexpr int64_t PLANE_COMPONENT_CB = INT64_C(1) << 1;
+constexpr int64_t PLANE_COMPONENT_CR = INT64_C(1) << 2;
+
 /* android.hardware.graphics.mapper@4.0 Error (int32_t-backed enum). */
 enum pt_error : int32_t {
    PT_ERROR_NONE = 0,
@@ -329,7 +338,7 @@ struct PtReader {
       return true;
    }
 
-   bool skip_extendable()
+   bool read_extendable(int64_t *value, bool *standard_component_type)
    {
       int64_t name_len;
       if (!read_i64(&name_len) || name_len < 0 ||
@@ -337,15 +346,29 @@ struct PtReader {
          ok = false;
          return false;
       }
+      *standard_component_type =
+         name_len == (int64_t)(sizeof(STANDARD_PLANE_COMPONENT_TYPE) - 1) &&
+         !memcmp(pos, STANDARD_PLANE_COMPONENT_TYPE, (size_t)name_len);
       pos += (size_t)name_len;
+      return read_i64(value);
+   }
+
+   bool skip_extendable()
+   {
       int64_t value;
-      return read_i64(&value);
+      bool standard;
+      return read_extendable(&value, &standard);
    }
 };
 
 struct PtPlaneLayout {
    int64_t offsetInBytes;
    int64_t strideInBytes;
+
+   /* Standard PlaneLayoutComponentType value when the plane has exactly one
+    * component, else -1.
+    */
+   int64_t component_value = -1;
 };
 
 /* decodePlaneLayouts: int64 numPlanes, then per plane: int64
@@ -372,9 +395,14 @@ pt_get_plane_layouts(const struct pt_gralloc *gr, void *buffer,
       if (!reader.read_i64(&num_components) || num_components < 0 ||
           num_components > 8)
          return false;
+      int64_t component_value = -1;
       for (int64_t j = 0; j < num_components; j++) {
-         if (!reader.skip_extendable())
+         int64_t value;
+         bool standard_component = false;
+         if (!reader.read_extendable(&value, &standard_component))
             return false;
+         if (num_components == 1 && standard_component)
+            component_value = value;
          int64_t offset_in_bits, size_in_bits;
          if (!reader.read_i64(&offset_in_bits) ||
              !reader.read_i64(&size_in_bits))
@@ -400,10 +428,43 @@ pt_get_plane_layouts(const struct pt_gralloc *gr, void *buffer,
       if (!reader.read_i64(&v)) /* verticalSubsampling */
          return false;
 
+      plane.component_value = component_value;
       out->push_back(plane);
    }
 
    return reader.ok && (int64_t)out->size() == num_planes;
+}
+
+/* QTI reports PlaneLayouts in logical Y-Cb-Cr order even for YV12, whose
+ * storage and DRM fourcc order is Y-Cr-Cb.  vk_android swaps the two chroma
+ * planes of DRM_FORMAT_YVU420 back into Vulkan's Y-Cb-Cr plane order, so
+ * hand it DRM order here.  Only a plain three-plane layout whose standard
+ * PlaneLayoutComponentType identifies every plane is rewritten; anything
+ * else keeps the reported order.
+ */
+static bool
+pt_normalize_yv12_plane_order(std::vector<PtPlaneLayout> *planes)
+{
+   if (planes->size() != 3)
+      return false;
+
+   int y = -1, cb = -1, cr = -1;
+   for (size_t i = 0; i < planes->size(); i++) {
+      if ((*planes)[i].component_value == PLANE_COMPONENT_Y)
+         y = (int)i;
+      else if ((*planes)[i].component_value == PLANE_COMPONENT_CB)
+         cb = (int)i;
+      else if ((*planes)[i].component_value == PLANE_COMPONENT_CR)
+         cr = (int)i;
+      else
+         return false;
+   }
+   if (y < 0 || cb < 0 || cr < 0)
+      return false;
+
+   const PtPlaneLayout yv12[3] = { (*planes)[y], (*planes)[cr], (*planes)[cb] };
+   planes->assign(yv12, yv12 + 3);
+   return true;
 }
 
 /*
@@ -487,6 +548,10 @@ pt_get_buffer_basic_info(struct u_gralloc *gralloc,
       }
       if (compressed)
          have_planes = false;
+
+      if (have_planes && !compressed && fourcc == DRM_FORMAT_YVU420 &&
+          !pt_normalize_yv12_plane_order(&planes))
+         mesa_logw_once("u_gralloc: YV12 plane components missing; keeping reported order");
 
       memset(out, 0, sizeof(*out));
       out->drm_fourcc = fourcc;
