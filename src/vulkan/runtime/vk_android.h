@@ -56,6 +56,12 @@ struct vk_android_drm_format_info {
     * authoritative layout knowledge may reinterpret the modifier.
     */
    bool planes_contradictory;
+   /* The standard FOURCC key was absent or DRM_FORMAT_INVALID.  The
+    * consumer must resolve the format from the platform buffer format
+    * (format equivalence) and only accept shapes whose plane layout is
+    * unambiguous without a fourcc.
+    */
+   bool fourcc_unverified;
 };
 
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
