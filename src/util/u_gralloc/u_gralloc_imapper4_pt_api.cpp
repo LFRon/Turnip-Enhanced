@@ -88,6 +88,7 @@ enum standard_metadata_type : int64_t {
    MD_USAGE = 9,
    MD_ALLOCATION_SIZE = 10,
    MD_PROTECTED_CONTENT = 11,
+   MD_COMPRESSION = 12,
    MD_CHROMA_SITING = 14,
    MD_PLANE_LAYOUTS = 15,
    MD_DATASPACE = 17,
@@ -361,6 +362,29 @@ struct PtReader {
    }
 };
 
+/* Reads the standard ExtendableType (name string + int64 value) payload of a
+ * key whose value space is an extendable enum, e.g. COMPRESSION.  Only the
+ * numeric value is returned; the standard enum backing value NONE is 0, and a
+ * non-zero value under any (vendor) type name still means "not NONE".
+ */
+bool
+pt_get_extendable_value(const struct pt_gralloc *gr, void *buffer, int64_t key,
+                        int64_t *out)
+{
+   std::vector<uint8_t> payload;
+   if (!pt_get_blob(gr, buffer, key, &payload))
+      return false;
+
+   PtReader reader{payload.data(), payload.data() + payload.size()};
+   int64_t value;
+   bool standard_component_type;
+   if (!reader.read_extendable(&value, &standard_component_type) || !reader.ok)
+      return false;
+
+   *out = value;
+   return true;
+}
+
 struct PtPlaneLayout {
    int64_t offsetInBytes;
    int64_t strideInBytes;
@@ -494,17 +518,21 @@ pt_get_buffer_basic_info(struct u_gralloc *gralloc,
    int ret = -EINVAL;
    do {
       uint32_t fourcc = 0;
-      if (!pt_get_uint32(gr, imported, MD_PIXEL_FORMAT_FOURCC, &fourcc) ||
-          fourcc == 0) {
-         /* Vendors must map every allocatable format to a DRM fourcc; an
-          * empty answer means the standard key is incomplete for this
-          * buffer's (often camera/video) HAL format.  Fail closed rather
-          * than hand downstream a bogus zero fourcc.
+      bool fourcc_known =
+         pt_get_uint32(gr, imported, MD_PIXEL_FORMAT_FOURCC, &fourcc) &&
+         fourcc != 0;
+      if (!fourcc_known) {
+         /* PIXEL_FORMAT_FOURCC is optional standard metadata: an
+          * implementation may leave it unsupported, or report
+          * DRM_FORMAT_INVALID, for a format it does not map (observed with
+          * FP16 on gralloc-4 era vendors).  Report the absence through the
+          * flags instead of refusing the buffer; consumers resolve the
+          * format from the platform-level buffer format and fail closed
+          * if they cannot.
           */
-         static int refused;
-         if (refused++ < 16)
-            mesa_loge("u_gralloc: mapper returned no DRM fourcc for a buffer (vendor standard metadata incomplete)");
-         break;
+         mesa_logw_once("u_gralloc: no DRM fourcc in the standard metadata; "
+                        "buffer format must be resolved by the consumer");
+         fourcc = 0;
       }
 
       int64_t modifier = -1;
@@ -521,6 +549,21 @@ pt_get_buffer_basic_info(struct u_gralloc *gralloc,
            layer_count <= 0)
           layer_count = 1;
 
+      const bool modifier_claims_linear =
+         modifier == 0 || modifier == (int64_t)DRM_FORMAT_MOD_INVALID;
+
+      /* Cross-check a linear/unknown modifier claim against the independent
+       * standard COMPRESSION key: a non-NONE value means the buffer is
+       * compressed, so the modifier claim must not be trusted and the
+       * vendor plane geometry must not be consumed verbatim.
+       */
+      bool metadata_compressed = false;
+      if (modifier_claims_linear) {
+         int64_t compression = 0;
+         if (pt_get_extendable_value(gr, imported, MD_COMPRESSION, &compression))
+            metadata_compressed = compression != 0;
+      }
+
       /*
         * Vendor layout trust policy (platform-neutral):
         *  - any compressed (non-linear, non-invalid) modifier: vendor
@@ -529,19 +572,18 @@ pt_get_buffer_basic_info(struct u_gralloc *gralloc,
         *    report the modifier verbatim and leave the geometry
         *    unverified so consumers derive the layout from
         *    (fourcc, modifier, dims) with their own authoritative rules,
-        *  - a "linear" modifier paired with a first plane that does not
-        *    start at offset 0 is self-contradictory: flag it (leaving
+        *  - a "linear" modifier contradicted either by the independent
+        *    COMPRESSION metadata or by a first plane that does not start
+        *    at offset 0 is self-contradictory: flag it (leaving
         *    interpretation to consumers that have authoritative layout
         *    knowledge), and
         *  - plain linear buffers keep their verbatim vendor layouts.
         */
-      bool compressed = modifier != 0 &&
-                        modifier != (int64_t)DRM_FORMAT_MOD_LINEAR &&
-                        modifier != (int64_t)DRM_FORMAT_MOD_INVALID;
+      const bool compressed = !modifier_claims_linear || metadata_compressed;
 
       std::vector<PtPlaneLayout> planes;
       bool have_planes = pt_get_plane_layouts(gr, imported, &planes);
-      bool contradictory = false;
+      bool contradictory = metadata_compressed;
       if (have_planes && !compressed && planes[0].offsetInBytes != 0) {
          contradictory = true;
          have_planes = false;
@@ -560,6 +602,8 @@ pt_get_buffer_basic_info(struct u_gralloc *gralloc,
                          : (uint64_t)modifier;
       out->alloc_size = (uint64_t)allocation_size;
       out->layer_count = (uint64_t)layer_count;
+      if (!fourcc_known)
+         out->flags |= U_GRALLOC_BUFFER_INFO_FOURCC_UNVERIFIED;
 
       if (have_planes) {
          out->num_planes = (int)planes.size();
