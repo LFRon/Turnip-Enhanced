@@ -164,6 +164,17 @@ struct tu_frag_area {
 bool
 tu_drm_fourcc_matches_format(VkFormat vk_format, uint32_t drm_fourcc);
 
+struct vk_android_drm_format_info;
+
+/* Whether a recovery may derive a layout from the reported metadata: a
+ * verified fourcc keeps the pre-existing acceptance; a zero fourcc must be
+ * accompanied by the standard-metadata "unverified" signal and a modifier
+ * the driver's layout library defines authoritatively (linear or Adreno
+ * UBWC), because anything else cannot be proven and must fail closed.
+ */
+bool
+tu_recovered_layout_is_provable(const struct vk_android_drm_format_info *drm);
+
 void
 tu_fragment_density_map_sample(const struct tu_image_view *fdm,
                                int32_t x, int32_t y,

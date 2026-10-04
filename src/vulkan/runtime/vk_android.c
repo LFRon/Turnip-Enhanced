@@ -110,6 +110,8 @@ vk_android_drm_format_of(struct u_gralloc_buffer_handle *hnd,
          !!(info.flags & U_GRALLOC_BUFFER_INFO_PLANES_UNVERIFIED),
       .planes_contradictory =
          !!(info.flags & U_GRALLOC_BUFFER_INFO_PLANES_CONTRADICTORY),
+      .fourcc_unverified =
+         !!(info.flags & U_GRALLOC_BUFFER_INFO_FOURCC_UNVERIFIED),
    };
    return VK_SUCCESS;
 }
@@ -239,6 +241,29 @@ vk_gralloc_to_drm_explicit_layout(
        * the zero-filled layouts.
        */
       return VK_ERROR_FEATURE_NOT_PRESENT;
+   }
+
+   if (info.flags & U_GRALLOC_BUFFER_INFO_FOURCC_UNVERIFIED) {
+      if (info.num_planes > 1) {
+         /* Multi-plane layouts cannot be mapped onto a Vulkan multi-planar
+          * format without knowing the DRM plane order, which only the
+          * fourcc key carries.  Refuse rather than present planes in an
+          * order the consumer would misinterpret.
+          */
+         mesa_loge("gralloc metadata has no DRM fourcc for a %d-plane buffer",
+                   info.num_planes);
+         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+      }
+
+      if (info.modifier == (uint64_t)DRM_FORMAT_MOD_INVALID) {
+         /* DRM_FORMAT_MOD_INVALID means the tiling is unknown and the
+          * format identity could not be cross-checked through the fourcc:
+          * nothing is left to prove the layout with.
+          */
+         mesa_loge("gralloc metadata has no DRM fourcc and an unknown "
+                   "modifier");
+         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+      }
    }
 
    if (info.num_planes > max_planes) {
@@ -1183,6 +1208,16 @@ get_ahb_buffer_format_properties2(
    if (u_gralloc_get_buffer_basic_info(vk_android_get_ugralloc(), &gr_handle,
                                        &info) != 0) {
       mesa_loge("Failed to get u_gralloc_buffer_basic_info");
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+   }
+
+   if (info.flags & U_GRALLOC_BUFFER_INFO_FOURCC_UNVERIFIED) {
+      /* This path only resolves AHB formats absent from the Vulkan format
+       * equivalence table, which requires the DRM fourcc.  The standard
+       * metadata did not provide one; the format cannot be resolved.
+       */
+      mesa_loge("AHB format 0x%x has no DRM fourcc in the standard metadata",
+                desc.format);
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
    }
 

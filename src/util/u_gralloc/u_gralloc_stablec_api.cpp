@@ -369,14 +369,26 @@ stablec_get_buffer_basic_info(struct u_gralloc *gralloc,
    do {
       std::vector<uint8_t> blob;
       size_t offset = 0;
-      uint32_t fourcc;
-      if (!query_standard_metadata(gr, buffer, MD_PIXEL_FORMAT_FOURCC, &blob,
-                                   &offset))
-         break;
-      {
+      uint32_t fourcc = 0;
+      bool fourcc_known = false;
+      if (query_standard_metadata(gr, buffer, MD_PIXEL_FORMAT_FOURCC, &blob,
+                                  &offset)) {
          Reader r(blob.data() + offset, blob.size() - offset);
-         if (!r.read_u32(&fourcc) || !r.ok())
-            break;
+         if (r.read_u32(&fourcc) && r.ok() && fourcc != 0)
+            fourcc_known = true;
+         else
+            fourcc = 0;
+      }
+      if (!fourcc_known) {
+         /* PIXEL_FORMAT_FOURCC is optional standard metadata: an
+          * implementation may leave it unsupported, or report
+          * DRM_FORMAT_INVALID, for a format it does not map.  Report the
+          * absence through the flags instead of refusing the buffer;
+          * consumers resolve the format from the platform-level buffer
+          * format and fail closed if they cannot.
+          */
+         mesa_logw_once("u_gralloc: no DRM fourcc in the standard metadata; "
+                        "buffer format must be resolved by the consumer");
       }
 
       int64_t modifier = -1;
@@ -395,22 +407,43 @@ stablec_get_buffer_basic_info(struct u_gralloc *gralloc,
       if (layer_count <= 0)
          layer_count = 1;
 
+      const bool modifier_claims_linear =
+         modifier == 0 || modifier == (int64_t)DRM_FORMAT_MOD_INVALID;
+
+      /* Cross-check a linear/unknown modifier claim against the independent
+       * standard COMPRESSION key: a non-NONE value means the buffer is
+       * compressed, so the modifier claim must not be trusted and the
+       * vendor plane geometry must not be consumed verbatim.
+       */
+      bool metadata_compressed = false;
+      if (modifier_claims_linear) {
+         std::vector<uint8_t> cblob;
+         size_t coffset = 0;
+         if (query_standard_metadata(gr, buffer, MD_COMPRESSION, &cblob,
+                                     &coffset)) {
+            Reader r(cblob.data() + coffset, cblob.size() - coffset);
+            std::string name;
+            int64_t value;
+            if (r.read_extendable_type(&name, &value) && r.ok())
+               metadata_compressed = value != 0;
+         }
+      }
+
       /* Vendor layout trust policy (platform-neutral): compressed
        * modifiers never consume vendor plane geometry verbatim (vendors
        * may omit metadata planes); geometry is reported unverified and
        * consumers derive it from (fourcc, modifier, dims).  A "linear"
-       * modifier contradicted by a non-zero first-plane offset is
-       * flagged for consumers with authoritative layout knowledge.
-       * Plain linear buffers keep their verbatim vendor layouts.  See
-       * the passthrough backend for the same policy.
+       * modifier contradicted either by the independent COMPRESSION
+       * metadata or by a non-zero first-plane offset is flagged for
+       * consumers with authoritative layout knowledge.  Plain linear
+       * buffers keep their verbatim vendor layouts.  See the passthrough
+       * backend for the same policy.
        */
-      bool compressed = modifier != 0 &&
-                        modifier != (int64_t)DRM_FORMAT_MOD_LINEAR &&
-                        modifier != (int64_t)DRM_FORMAT_MOD_INVALID;
+      const bool compressed = !modifier_claims_linear || metadata_compressed;
 
       std::vector<PlaneLayout> planes;
       bool have_planes = get_standard_plane_layouts(gr, buffer, &planes);
-      bool contradictory = false;
+      bool contradictory = metadata_compressed;
       if (have_planes && !compressed && planes[0].offsetInBytes != 0) {
          contradictory = true;
          have_planes = false;
@@ -430,6 +463,8 @@ stablec_get_buffer_basic_info(struct u_gralloc *gralloc,
             : (uint64_t)modifier;
       out->alloc_size = (uint64_t)allocation_size;
       out->layer_count = (uint64_t)layer_count;
+      if (!fourcc_known)
+         out->flags |= U_GRALLOC_BUFFER_INFO_FOURCC_UNVERIFIED;
 
       const int numFds = hnd->handle->numFds;
       if (have_planes) {

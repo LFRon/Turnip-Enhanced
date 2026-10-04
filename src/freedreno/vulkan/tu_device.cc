@@ -4327,15 +4327,24 @@ tu_AllocateMemory(VkDevice _device,
                 &drm) != VK_SUCCESS ||
              !drm.planes_unverified ||
              !tu_drm_fourcc_matches_format(mem->image->vk.format,
-                                           drm.drm_fourcc)) {
+                                           drm.drm_fourcc) ||
+             !tu_recovered_layout_is_provable(&drm)) {
             mesa_loge("tu: AHB recovery rejected (vk_format=%d fourcc=0x%x "
-                      "modifier=0x%llx unverified=%d)",
+                      "modifier=0x%llx unverified=%d fourcc_unverified=%d)",
                       (int)mem->image->vk.format, drm.drm_fourcc,
                       (unsigned long long)drm.modifier,
-                      (int)drm.planes_unverified);
+                      (int)drm.planes_unverified,
+                      (int)drm.fourcc_unverified);
             vk_device_memory_destroy(&device->vk, pAllocator, &mem->vk);
             return VK_ERROR_INVALID_EXTERNAL_HANDLE;
          }
+
+         if (drm.fourcc_unverified)
+            mesa_logw_once("tu: AHB import without a DRM fourcc; using the "
+                           "platform format (vk_format=%d) with modifier "
+                           "0x%llx",
+                           (int)mem->image->vk.format,
+                           (unsigned long long)drm.modifier);
 
          /* Adreno interpretation of a contradicted "linear" claim: the
           * leading region is UBWC metadata.

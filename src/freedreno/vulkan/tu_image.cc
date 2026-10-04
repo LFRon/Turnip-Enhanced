@@ -1011,6 +1011,18 @@ TU_GENX(tu_image_init);
 bool
 tu_drm_fourcc_matches_format(VkFormat vk_format, uint32_t fourcc)
 {
+   /* A missing fourcc (DRM_FORMAT_INVALID) is accepted only for shapes
+    * whose layout is unambiguous without it: single-plane concrete
+    * formats, whose identity is then given by the platform buffer format
+    * (the Vulkan/Android format equivalence is authoritative, and fdl
+    * validates that it can lay the format out).  Multi-planar formats
+    * need the fourcc for the plane order, and external formats need it
+    * to resolve at all, so both fail closed.
+    */
+   if (fourcc == 0)
+      return vk_format != VK_FORMAT_UNDEFINED &&
+             tu6_plane_count(vk_format) == 1;
+
    /* External-format images are created with VK_FORMAT_UNDEFINED and
     * resolve their real format from the AHB properties (which are
     * derived from this very fourcc), so accept it here; the concrete
@@ -1039,6 +1051,8 @@ tu_drm_fourcc_matches_format(VkFormat vk_format, uint32_t fourcc)
       return vk_format == VK_FORMAT_A2R10G10B10_UNORM_PACK32;
    case fourcc_code('A', 'B', '1', '6'): /* AB16 float */
    case fourcc_code('X', 'B', '1', '6'):
+   case DRM_FORMAT_ABGR16161616F: /* AB4H float */
+   case DRM_FORMAT_XBGR16161616F:
       return vk_format == VK_FORMAT_R16G16B16A16_SFLOAT;
    case DRM_FORMAT_RGB565:
       return vk_format == VK_FORMAT_R5G6B5_UNORM_PACK16;
@@ -1049,6 +1063,26 @@ tu_drm_fourcc_matches_format(VkFormat vk_format, uint32_t fourcc)
    default:
       return false;
    }
+}
+
+bool
+tu_recovered_layout_is_provable(const struct vk_android_drm_format_info *drm)
+{
+   /* A zero fourcc without the standard-metadata "unverified" signal comes
+    * from a transport that simply did not map the format; its layout must
+    * keep failing closed as before.
+    */
+   if (drm->drm_fourcc == 0 && !drm->fourcc_unverified)
+      return false;
+
+   if (!drm->fourcc_unverified)
+      return true;
+
+   const uint64_t modifier = drm->planes_contradictory
+                                ? DRM_FORMAT_MOD_QCOM_COMPRESSED
+                                : drm->modifier;
+   return modifier == DRM_FORMAT_MOD_LINEAR ||
+          modifier == DRM_FORMAT_MOD_QCOM_COMPRESSED;
 }
 
 /* Deferred ANB image support for ANB v8+ aliased images. */
@@ -1091,19 +1125,27 @@ tu_android_get_wsi_memory(struct tu_device *dev,
        * (fourcc, modifier, dimensions) exactly as it does for the
        * driver's own allocations.  Anything inconsistent fails closed.
        */
-      struct vk_android_drm_format_info drm;
+      struct vk_android_drm_format_info drm = {0};
       if (vk_android_get_anb_drm_format(
              img->vk.android_deferred_create_info, &drm) != VK_SUCCESS ||
           !drm.planes_unverified ||
           !tu_drm_fourcc_matches_format(
-             img->vk.android_deferred_create_info->format, drm.drm_fourcc)) {
+             img->vk.android_deferred_create_info->format, drm.drm_fourcc) ||
+          !tu_recovered_layout_is_provable(&drm)) {
          mesa_loge("tu: ANB recovery rejected (vk_format=%d fourcc=0x%x "
-                   "modifier=0x%llx unverified=%d)",
+                   "modifier=0x%llx unverified=%d fourcc_unverified=%d)",
                    (int)img->vk.android_deferred_create_info->format,
                    drm.drm_fourcc, (unsigned long long)drm.modifier,
-                   (int)drm.planes_unverified);
+                   (int)drm.planes_unverified,
+                   (int)drm.fourcc_unverified);
          return VK_ERROR_INVALID_EXTERNAL_HANDLE;
       }
+
+      if (drm.fourcc_unverified)
+         mesa_logw_once("tu: ANB import without a DRM fourcc; using the "
+                        "platform format (vk_format=%d) with modifier 0x%llx",
+                        (int)img->vk.android_deferred_create_info->format,
+                        (unsigned long long)drm.modifier);
 
       /* The transport marked the geometry unverified (compressed UBWC on
        * gralloc-4 era vendors): the driver's own layout library is the
@@ -1246,20 +1288,28 @@ tu_CreateImage(VkDevice _device,
           * did not supply geometry we consume (compressed layouts are
           * recomputed by fdl; see tu_android_get_wsi_memory).
           */
-         struct vk_android_drm_format_info drm;
+         struct vk_android_drm_format_info drm = {0};
          if (vk_android_get_anb_drm_format(pCreateInfo, &drm) != VK_SUCCESS ||
              !drm.planes_unverified ||
              !tu_drm_fourcc_matches_format(pCreateInfo->format,
-                                           drm.drm_fourcc)) {
+                                           drm.drm_fourcc) ||
+             !tu_recovered_layout_is_provable(&drm)) {
             mesa_loge("tu: ANB create recovery rejected (vk_format=%d "
-                      "fourcc=0x%x modifier=0x%llx)",
+                      "fourcc=0x%x modifier=0x%llx fourcc_unverified=%d)",
                       (int)pCreateInfo->format, drm.drm_fourcc,
-                      (unsigned long long)drm.modifier);
+                      (unsigned long long)drm.modifier,
+                      (int)drm.fourcc_unverified);
             result = VK_ERROR_INVALID_EXTERNAL_HANDLE;
             goto fail;
          }
          eci.drmFormatModifierPlaneCount =
             (uint32_t)tu6_plane_count(pCreateInfo->format);
+         if (drm.fourcc_unverified)
+            mesa_logw_once("tu: ANB import without a DRM fourcc; using the "
+                           "platform format (vk_format=%d) with modifier "
+                           "0x%llx",
+                           (int)pCreateInfo->format,
+                           (unsigned long long)drm.modifier);
          /* contradicted "linear" == Adreno UBWC metadata region (see the
           * bind-site recovery for the same policy).
           */
