@@ -452,6 +452,7 @@ stablec_get_buffer_basic_info(struct u_gralloc *gralloc,
    buffer_handle_t buffer = hnd->handle;
 
    int ret = -EINVAL;
+   bool valid = false;
    do {
       std::vector<uint8_t> blob;
       size_t offset = 0;
@@ -564,6 +565,11 @@ stablec_get_buffer_basic_info(struct u_gralloc *gralloc,
       if (!fourcc_known)
          out->flags |= U_GRALLOC_BUFFER_INFO_FOURCC_UNVERIFIED;
 
+      /* Every mandatory key has been read; only malformed plane geometry
+       * below can still invalidate the result.
+       */
+      valid = true;
+
       const int numFds = hnd->handle->numFds;
       if (have_planes) {
          out->num_planes = (int)planes.size();
@@ -571,7 +577,7 @@ stablec_get_buffer_basic_info(struct u_gralloc *gralloc,
             const PlaneLayout &plane = planes[i];
             if (plane.offsetInBytes < 0 || plane.offsetInBytes > INT32_MAX ||
                 plane.strideInBytes <= 0 || plane.strideInBytes > INT32_MAX) {
-               ret = -EINVAL;
+               valid = false;
                break;
             }
             out->offsets[i] = (int)plane.offsetInBytes;
@@ -606,9 +612,28 @@ stablec_get_buffer_basic_info(struct u_gralloc *gralloc,
       }
       if (contradictory)
          out->flags |= U_GRALLOC_BUFFER_INFO_PLANES_CONTRADICTORY;
-      if (ret != -EINVAL)
+
+      if (valid)
          ret = 0;
+
+      if (stablec_debug_enabled())
+         mesa_logi("u_gralloc: basic_info ok handle=%p hal_format=0x%x "
+                   "pixel_stride=%d fourcc=0x%x fourcc_known=%d modifier=0x%llx "
+                   "planes=%d have_planes=%d planes_unverified=%d "
+                   "contradictory=%d compressed=%d alloc=%llu",
+                   (void *)hnd->handle, hnd->hal_format, hnd->pixel_stride,
+                   fourcc, (int)fourcc_known, (unsigned long long)modifier,
+                   out->num_planes, (int)have_planes,
+                   !!(out->flags & U_GRALLOC_BUFFER_INFO_PLANES_UNVERIFIED),
+                   (int)contradictory, (int)compressed,
+                   (unsigned long long)allocation_size);
    } while (0);
+
+   if (ret != 0 && stablec_debug_enabled())
+      mesa_loge("u_gralloc: basic_info FAILED handle=%p hal_format=0x%x "
+                "pixel_stride=%d (see per-key lines above)",
+                hnd ? (void *)hnd->handle : NULL,
+                hnd ? hnd->hal_format : 0, hnd ? hnd->pixel_stride : 0);
 
    return ret;
 }
