@@ -279,6 +279,12 @@ get_standard_int32(const struct stablec_gralloc *gr, buffer_handle_t buffer,
    return true;
 }
 
+struct PlaneLayoutComponentInfo {
+   int64_t value;
+   int64_t offset_in_bits;
+   int64_t size_in_bits;
+};
+
 struct PlaneLayout {
    int64_t offsetInBytes;
    int64_t sampleIncrementInBits;
@@ -291,6 +297,9 @@ struct PlaneLayout {
     * component, else -1.
     */
    int64_t component_value = -1;
+
+   int num_components = 0;
+   PlaneLayoutComponentInfo components[4] = {};
 };
 
 bool
@@ -315,16 +324,28 @@ get_standard_plane_layouts(const struct stablec_gralloc *gr,
           num_components > 8)
          return false;
       int64_t component_value = -1;
+      PlaneLayoutComponentInfo components[4];
+      int num_standard_components = 0;
       for (int64_t j = 0; j < num_components; j++) {
          /* ExtendableType + offsetInBits + sizeInBits */
          std::string component_name;
          int64_t value = 0;
+         int64_t offset_in_bits = 0;
+         int64_t size_in_bits = 0;
          if (!reader.read_extendable_type(&component_name, &value) ||
-             !reader.skip_i64() || !reader.skip_i64())
+             !reader.read_i64(&offset_in_bits) ||
+             !reader.read_i64(&size_in_bits))
             return false;
-         if (num_components == 1 &&
-             component_name == STANDARD_PLANE_COMPONENT_TYPE)
+         bool standard_component =
+            component_name == STANDARD_PLANE_COMPONENT_TYPE;
+         if (num_components == 1 && standard_component)
             component_value = value;
+         if (standard_component) {
+            if (num_standard_components >= 4)
+               return false;
+            components[num_standard_components++] =
+               { value, offset_in_bits, size_in_bits };
+         }
       }
 
       PlaneLayout plane;
@@ -339,6 +360,9 @@ get_standard_plane_layouts(const struct stablec_gralloc *gr,
          return false;
 
       plane.component_value = component_value;
+      plane.num_components = num_standard_components;
+      for (int k = 0; k < num_standard_components; k++)
+         plane.components[k] = components[k];
       out->push_back(plane);
    }
 
@@ -377,6 +401,38 @@ stablec_normalize_yv12_plane_order(std::vector<PlaneLayout> *planes)
    return true;
 }
 
+static uint32_t
+stablec_derive_semiplanar_fourcc(const std::vector<PlaneLayout> &planes)
+{
+   if (planes.size() != 2)
+      return 0;
+   if (planes[0].component_value != PLANE_COMPONENT_Y)
+      return 0;
+
+   const PlaneLayout &uv = planes[1];
+   if (uv.num_components != 2)
+      return 0;
+
+   int64_t cb = -1, cr = -1;
+   for (int i = 0; i < uv.num_components; i++) {
+      const PlaneLayoutComponentInfo &c = uv.components[i];
+      if (c.size_in_bits != 8)
+         return 0;
+      if (c.value == PLANE_COMPONENT_CB)
+         cb = c.offset_in_bits;
+      else if (c.value == PLANE_COMPONENT_CR)
+         cr = c.offset_in_bits;
+      else
+         return 0;
+   }
+
+   if (cb == 0 && cr == 8)
+      return DRM_FORMAT_NV12;
+   if (cr == 0 && cb == 8)
+      return DRM_FORMAT_NV21;
+   return 0;
+}
+
 int
 stablec_get_buffer_basic_info(struct u_gralloc *gralloc,
                               struct u_gralloc_buffer_handle *hnd,
@@ -409,28 +465,28 @@ stablec_get_buffer_basic_info(struct u_gralloc *gralloc,
          else
             fourcc = 0;
       }
-      if (!fourcc_known) {
-         /* PIXEL_FORMAT_FOURCC is optional standard metadata: an
-          * implementation may leave it unsupported, or report
-          * DRM_FORMAT_INVALID, for a format it does not map.  Report the
-          * absence through the flags instead of refusing the buffer;
-          * consumers resolve the format from the platform-level buffer
-          * format and fail closed if they cannot.
-          */
-         mesa_logw_once("u_gralloc: no DRM fourcc in the standard metadata; "
-                        "buffer format must be resolved by the consumer");
-      }
+      if (!fourcc_known)
+         fourcc = 0;
 
       int64_t modifier = -1;
       if (!get_standard_int64(gr, buffer, MD_DRM_PIXEL_FORMAT_MODIFIER,
-                              &modifier))
+                              &modifier)) {
+         if (stablec_debug_enabled())
+            mesa_loge("u_gralloc: MANDATORY key MODIFIER(8) unavailable; "
+                      "giving up (handle %p)", (void *)buffer);
          break;
+      }
 
       int64_t allocation_size = 0;
       if (!get_standard_int64(gr, buffer, MD_ALLOCATION_SIZE,
                               &allocation_size) ||
-          allocation_size <= 0)
+          allocation_size <= 0) {
+         if (stablec_debug_enabled())
+            mesa_loge("u_gralloc: MANDATORY key ALLOCATION_SIZE(10) unavailable "
+                      "or non-positive (size=%lld); giving up (handle %p)",
+                      (long long)allocation_size, (void *)buffer);
          break;
+      }
 
       int64_t layer_count = 1;
       get_standard_int64(gr, buffer, MD_LAYER_COUNT, &layer_count);
@@ -484,6 +540,18 @@ stablec_get_buffer_basic_info(struct u_gralloc *gralloc,
       if (have_planes && !compressed && fourcc == DRM_FORMAT_YVU420 &&
           !stablec_normalize_yv12_plane_order(&planes))
          mesa_logw_once("u_gralloc: YV12 plane components missing; keeping reported order");
+
+      if (!fourcc_known && have_planes) {
+         uint32_t derived = stablec_derive_semiplanar_fourcc(planes);
+         if (derived != 0) {
+            fourcc = derived;
+            fourcc_known = true;
+         }
+      }
+
+      if (!fourcc_known)
+         mesa_logw_once("u_gralloc: no DRM fourcc in the standard metadata; "
+                        "buffer format must be resolved by the consumer");
 
       memset(out, 0, sizeof(*out));
       out->drm_fourcc = fourcc;
