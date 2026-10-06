@@ -144,7 +144,7 @@ vk_image_init(struct vk_device *device,
       vk_image_set_format(image, external_format);
    }
 
-   image->ahb_format = vk_image_format_to_ahb_format(image->format);
+   image->ahb_format = vk_android_vk_format_to_ahb_format(image->format);
 #endif
 
    const VkImageCompressionControlEXT *compr_info =
