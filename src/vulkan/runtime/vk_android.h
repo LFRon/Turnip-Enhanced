@@ -146,6 +146,8 @@ VkFormat vk_ahb_format_to_image_format(uint32_t ahb_format);
 
 uint32_t vk_image_format_to_ahb_format(VkFormat vk_format);
 
+uint32_t vk_android_vk_format_to_ahb_format(VkFormat vk_format);
+
 VkFormat vk_external_format_to_efr_format(VkFormat external_format);
 
 uint64_t vk_image_usage_to_ahb_usage(const VkImageCreateFlags2KHR vk_create,
@@ -248,6 +250,12 @@ vk_ahb_format_to_image_format(uint32_t ahb_format)
 
 static inline uint32_t
 vk_image_format_to_ahb_format(VkFormat vk_format)
+{
+   return 0;
+}
+
+static inline uint32_t
+vk_android_vk_format_to_ahb_format(VkFormat vk_format)
 {
    return 0;
 }
