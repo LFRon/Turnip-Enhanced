@@ -385,6 +385,12 @@ pt_get_extendable_value(const struct pt_gralloc *gr, void *buffer, int64_t key,
    return true;
 }
 
+struct PtPlaneComponent {
+   int64_t value;
+   int64_t offset_in_bits;
+   int64_t size_in_bits;
+};
+
 struct PtPlaneLayout {
    int64_t offsetInBytes;
    int64_t strideInBytes;
@@ -393,6 +399,9 @@ struct PtPlaneLayout {
     * component, else -1.
     */
    int64_t component_value = -1;
+
+   int num_components = 0;
+   PtPlaneComponent components[4] = {};
 };
 
 /* decodePlaneLayouts: int64 numPlanes, then per plane: int64
@@ -420,6 +429,8 @@ pt_get_plane_layouts(const struct pt_gralloc *gr, void *buffer,
           num_components > 8)
          return false;
       int64_t component_value = -1;
+      PtPlaneComponent components[4];
+      int num_standard_components = 0;
       for (int64_t j = 0; j < num_components; j++) {
          int64_t value;
          bool standard_component = false;
@@ -431,6 +442,12 @@ pt_get_plane_layouts(const struct pt_gralloc *gr, void *buffer,
          if (!reader.read_i64(&offset_in_bits) ||
              !reader.read_i64(&size_in_bits))
             return false;
+         if (standard_component) {
+            if (num_standard_components >= 4)
+               return false;
+            components[num_standard_components++] =
+               { value, offset_in_bits, size_in_bits };
+         }
       }
 
       PtPlaneLayout plane;
@@ -453,6 +470,9 @@ pt_get_plane_layouts(const struct pt_gralloc *gr, void *buffer,
          return false;
 
       plane.component_value = component_value;
+      plane.num_components = num_standard_components;
+      for (int k = 0; k < num_standard_components; k++)
+         plane.components[k] = components[k];
       out->push_back(plane);
    }
 
@@ -491,6 +511,38 @@ pt_normalize_yv12_plane_order(std::vector<PtPlaneLayout> *planes)
    return true;
 }
 
+static uint32_t
+pt_derive_semiplanar_fourcc(const std::vector<PtPlaneLayout> &planes)
+{
+   if (planes.size() != 2)
+      return 0;
+   if (planes[0].component_value != PLANE_COMPONENT_Y)
+      return 0;
+
+   const PtPlaneLayout &uv = planes[1];
+   if (uv.num_components != 2)
+      return 0;
+
+   int64_t cb = -1, cr = -1;
+   for (int i = 0; i < uv.num_components; i++) {
+      const PtPlaneComponent &c = uv.components[i];
+      if (c.size_in_bits != 8)
+         return 0;
+      if (c.value == PLANE_COMPONENT_CB)
+         cb = c.offset_in_bits;
+      else if (c.value == PLANE_COMPONENT_CR)
+         cr = c.offset_in_bits;
+      else
+         return 0;
+   }
+
+   if (cb == 0 && cr == 8)
+      return DRM_FORMAT_NV12;
+   if (cr == 0 && cb == 8)
+      return DRM_FORMAT_NV21;
+   return 0;
+}
+
 /*
  * u_gralloc backend interface
  */
@@ -521,19 +573,8 @@ pt_get_buffer_basic_info(struct u_gralloc *gralloc,
       bool fourcc_known =
          pt_get_uint32(gr, imported, MD_PIXEL_FORMAT_FOURCC, &fourcc) &&
          fourcc != 0;
-      if (!fourcc_known) {
-         /* PIXEL_FORMAT_FOURCC is optional standard metadata: an
-          * implementation may leave it unsupported, or report
-          * DRM_FORMAT_INVALID, for a format it does not map (observed with
-          * FP16 on gralloc-4 era vendors).  Report the absence through the
-          * flags instead of refusing the buffer; consumers resolve the
-          * format from the platform-level buffer format and fail closed
-          * if they cannot.
-          */
-         mesa_logw_once("u_gralloc: no DRM fourcc in the standard metadata; "
-                        "buffer format must be resolved by the consumer");
+      if (!fourcc_known)
          fourcc = 0;
-      }
 
       int64_t modifier = -1;
       if (!pt_get_int64(gr, imported, MD_DRM_PIXEL_FORMAT_MODIFIER, &modifier))
@@ -594,6 +635,18 @@ pt_get_buffer_basic_info(struct u_gralloc *gralloc,
       if (have_planes && !compressed && fourcc == DRM_FORMAT_YVU420 &&
           !pt_normalize_yv12_plane_order(&planes))
          mesa_logw_once("u_gralloc: YV12 plane components missing; keeping reported order");
+
+      if (!fourcc_known && have_planes) {
+         uint32_t derived = pt_derive_semiplanar_fourcc(planes);
+         if (derived != 0) {
+            fourcc = derived;
+            fourcc_known = true;
+         }
+      }
+
+      if (!fourcc_known)
+         mesa_logw_once("u_gralloc: no DRM fourcc in the standard metadata; "
+                        "buffer format must be resolved by the consumer");
 
       memset(out, 0, sizeof(*out));
       out->drm_fourcc = fourcc;
