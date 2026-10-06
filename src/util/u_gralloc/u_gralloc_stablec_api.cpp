@@ -29,6 +29,7 @@
 
 #include "drm-uapi/drm_fourcc.h"
 #include "util/log.h"
+#include "util/os_misc.h"
 
 #include "u_gralloc_internal.h"
 
@@ -182,6 +183,19 @@ class Reader {
    bool m_ok = true;
 };
 
+/* Diagnostics, off unless MESA_U_GRALLOC_DEBUG is set (sysprop
+ * debug.mesa.u.gralloc.debug / vendor.mesa.u.gralloc.debug).  Keyed to a
+ * process-static lazy lookup so release builds pay nothing.
+ */
+bool
+stablec_debug_enabled(void)
+{
+   static int enabled = -1;
+   if (enabled < 0)
+      enabled = os_get_option("MESA_U_GRALLOC_DEBUG") != NULL;
+   return enabled;
+}
+
 bool
 query_standard_metadata(const struct stablec_gralloc *gr,
                         buffer_handle_t buffer, int64_t key,
@@ -189,13 +203,20 @@ query_standard_metadata(const struct stablec_gralloc *gr,
 {
    int32_t required =
       gr->mapper->v5.getStandardMetadata(buffer, key, nullptr, 0);
-   if (required <= 0)
+   if (required <= 0) {
+      if (stablec_debug_enabled())
+         mesa_logi("u_gralloc: key %lld size-probe -> %d (handle %p)",
+                   (long long)key, required, (void *)buffer);
       return false;
+   }
 
    out->resize((size_t)required);
    int32_t written = gr->mapper->v5.getStandardMetadata(
       buffer, key, out->data(), out->size());
    if (written < 0 || (uint32_t)written > out->size()) {
+      if (stablec_debug_enabled())
+         mesa_logi("u_gralloc: key %lld read -> %d (wanted %d, handle %p)",
+                   (long long)key, written, required, (void *)buffer);
       out->clear();
       return false;
    }
@@ -203,9 +224,18 @@ query_standard_metadata(const struct stablec_gralloc *gr,
 
    Reader reader(out->data(), out->size());
    if (!reader.check_standard_header(key) || !reader.ok()) {
+      if (stablec_debug_enabled())
+         mesa_logi("u_gralloc: key %lld header mismatch (%zu bytes, handle %p)",
+                   (long long)key, out->size(), (void *)buffer);
       out->clear();
       return false;
    }
+
+   if (stablec_debug_enabled())
+      mesa_logi("u_gralloc: key %lld ok, payload %zu bytes (handle %p)",
+                (long long)key, out->size() -
+                (sizeof(int64_t) + sizeof(key) + strlen(STANDARD_METADATA_NAME)),
+                (void *)buffer);
 
    /* The payload begins right after the validated name + key header. */
    *payload_offset = sizeof(int64_t) + sizeof(key) + strlen(STANDARD_METADATA_NAME);
