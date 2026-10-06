@@ -38,6 +38,7 @@
 
 #include "c11/threads.h"
 #include "drm-uapi/drm_fourcc.h"
+#include "util/os_misc.h"
 #include "util/libsync.h"
 #include "util/log.h"
 #include "util/os_file.h"
@@ -89,6 +90,18 @@ vk_android_gralloc_supports_explicit_yuv_layout(void)
    }
 }
 
+/* Diagnostics, off unless MESA_VK_ANDROID_DEBUG is set (sysprop
+ * debug.mesa.vk.android.debug / vendor.mesa.vk.android.debug).
+ */
+static bool
+vk_android_debug_enabled(void)
+{
+   static int enabled = -1;
+   if (enabled < 0)
+      enabled = os_get_option("MESA_VK_ANDROID_DEBUG") != NULL;
+   return enabled;
+}
+
 static VkResult
 vk_android_drm_format_of(struct u_gralloc_buffer_handle *hnd,
                          struct vk_android_drm_format_info *out)
@@ -97,10 +110,24 @@ vk_android_drm_format_of(struct u_gralloc_buffer_handle *hnd,
    if (u_gralloc_get_buffer_basic_info(vk_android_get_ugralloc(), hnd,
                                         &info) != 0) {
       mesa_loge("vk_android: gralloc metadata query failed for handle "
-                "(hal_format=0x%x pixel_stride=%d) - refusing import",
-                hnd->hal_format, hnd->pixel_stride);
+                "(hal_format=0x%x pixel_stride=%d numFds=%d numInts=%d) - "
+                "refusing import; set debug.mesa.u.gralloc.debug=1 and "
+                "debug.mesa.vk.android.debug=1 for per-key detail",
+                hnd->hal_format, hnd->pixel_stride,
+                hnd->handle ? hnd->handle->numFds : -1,
+                hnd->handle ? hnd->handle->numInts : -1);
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
    }
+
+   if (vk_android_debug_enabled())
+      mesa_logi("vk_android: metadata ok hal_format=0x%x pixel_stride=%d "
+                "fourcc=0x%x modifier=0x%llx planes=%u unverified=%d "
+                "contradictory=%d fourcc_unverified=%d",
+                hnd->hal_format, hnd->pixel_stride, info.drm_fourcc,
+                (unsigned long long)info.modifier, info.num_planes,
+                !!(info.flags & U_GRALLOC_BUFFER_INFO_PLANES_UNVERIFIED),
+                !!(info.flags & U_GRALLOC_BUFFER_INFO_PLANES_CONTRADICTORY),
+                !!(info.flags & U_GRALLOC_BUFFER_INFO_FOURCC_UNVERIFIED));
 
    *out = (struct vk_android_drm_format_info){
       .drm_fourcc = info.drm_fourcc,
@@ -1284,6 +1311,18 @@ get_ahb_buffer_format_properties2(
       (color_info.vertical_siting == __DRI_YUV_CHROMA_SITING_0_5)
          ? VK_CHROMA_LOCATION_MIDPOINT
          : VK_CHROMA_LOCATION_COSITED_EVEN;
+
+   if (vk_android_debug_enabled())
+      mesa_logi("vk_android: AHB props hal_format=0x%x usage=0x%" PRIx64
+                " drm_fourcc=0x%x planes=%u flags=0x%x vkformat=0x%x"
+                " externalFormat=0x%llx components=(%u,%u,%u,%u)",
+                desc.format, desc.usage, info.drm_fourcc,
+                (unsigned)info.num_planes, info.flags, (unsigned)p->format,
+                (unsigned long long)external_format,
+                (unsigned)p->samplerYcbcrConversionComponents.r,
+                (unsigned)p->samplerYcbcrConversionComponents.g,
+                (unsigned)p->samplerYcbcrConversionComponents.b,
+                (unsigned)p->samplerYcbcrConversionComponents.a);
 
 finish:
 
