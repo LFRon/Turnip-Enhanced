@@ -31,6 +31,18 @@
 #include "vk_format.h"
 #include "vk_util.h"
 
+#include "util/log.h"
+#include "util/os_misc.h"
+
+static bool
+vk_ycbcr_debug_enabled(void)
+{
+   static int enabled = -1;
+   if (enabled < 0)
+      enabled = os_get_option("MESA_VK_ANDROID_DEBUG") != NULL;
+   return enabled;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 vk_common_CreateSamplerYcbcrConversion(VkDevice _device,
                                        const VkSamplerYcbcrConversionCreateInfo *pCreateInfo,
@@ -58,21 +70,33 @@ vk_common_CreateSamplerYcbcrConversion(VkDevice _device,
    if (external_format != VK_FORMAT_UNDEFINED) {
       assert(pCreateInfo->format == VK_FORMAT_UNDEFINED);
       state->format = external_format;
-   } else {
-      /* The Vulkan 1.1.95 spec says:
-       *
-       *    "When creating an external format conversion, the value of
-       *    components if ignored."
-       */
-      state->mapping[0] = pCreateInfo->components.r;
-      state->mapping[1] = pCreateInfo->components.g;
-      state->mapping[2] = pCreateInfo->components.b;
-      state->mapping[3] = pCreateInfo->components.a;
    }
+
+   /* The spec says components are ignored for an external format conversion,
+    * but Mesa identifies external formats by their Vulkan format, and the
+    * Android platform conveys a two-plane chroma swap (NV21) only through
+    * samplerYcbcrConversionComponents.  Honor them so external-format
+    * sampling matches the concrete multi-planar path.
+    */
+   state->mapping[0] = pCreateInfo->components.r;
+   state->mapping[1] = pCreateInfo->components.g;
+   state->mapping[2] = pCreateInfo->components.b;
+   state->mapping[3] = pCreateInfo->components.a;
 
    state->chroma_offsets[0] = pCreateInfo->xChromaOffset;
    state->chroma_offsets[1] = pCreateInfo->yChromaOffset;
    state->chroma_filter = pCreateInfo->chromaFilter;
+
+   if (vk_ycbcr_debug_enabled())
+      mesa_logi("vk_android: ycbcr conv external=%d format=0x%x ext=0x%llx "
+                "components=(%u,%u,%u,%u)",
+                external_format != VK_FORMAT_UNDEFINED,
+                (unsigned)pCreateInfo->format,
+                (unsigned long long)external_format,
+                (unsigned)pCreateInfo->components.r,
+                (unsigned)pCreateInfo->components.g,
+                (unsigned)pCreateInfo->components.b,
+                (unsigned)pCreateInfo->components.a);
 
    const struct vk_format_ycbcr_info *ycbcr_info =
       vk_format_get_ycbcr_info(state->format);
