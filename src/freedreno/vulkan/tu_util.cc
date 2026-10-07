@@ -57,6 +57,11 @@ static const struct debug_control tu_debug_options[] = {
    { "forcecb", TU_DEBUG_FORCE_CONCURRENT_BINNING },
    { "computeroundrobin", TU_DEBUG_COMPUTE_ROUND_ROBIN },
    { "gmem_warmup", TU_DEBUG_GMEM_WARMUP },
+   { "image_trace", TU_DEBUG_IMAGE_TRACE },
+   { "copyslow", TU_DEBUG_COPY_SLOW },
+   { "noexactahb", TU_DEBUG_NO_EXACT_AHB },
+   { "buf2img3d", TU_DEBUG_BUF2IMG_3D },
+   { "img_big", TU_DEBUG_IMG_BIG },
    { NULL, 0 }
 };
 
@@ -73,7 +78,7 @@ const uint64_t tu_runtime_debug_flags =
    TU_DEBUG_RAST_ORDER | TU_DEBUG_UNALIGNED_STORE |
    TU_DEBUG_LOG_SKIP_GMEM_OPS | TU_DEBUG_3D_LOAD | TU_DEBUG_FDM |
    TU_DEBUG_CONCURRENT_RESOLVES | TU_DEBUG_CONCURRENT_UNRESOLVES |
-   TU_DEBUG_NO_BIN_MERGING;
+   TU_DEBUG_NO_BIN_MERGING | TU_DEBUG_IMAGE_TRACE;
 
 os_file_notifier_t tu_debug_notifier;
 struct tu_env tu_env;
