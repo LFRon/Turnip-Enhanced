@@ -1723,6 +1723,14 @@ tu_ahb_external_format_resolve_supported(
       modifier_info.drmFormatModifier =
          drm.planes_contradictory ? DRM_FORMAT_MOD_QCOM_COMPRESSED
                                   : drm.modifier;
+      if (TU_DEBUG(IMAGE_TRACE))
+         mesa_logi("TU_IMAGE_TRACE: ahb-efr-probe vk_format=%d fourcc=0x%x "
+                   "modifier=0x%llx unverified=%d contradictory=%d "
+                   "fourcc_unverified=%d -> modifier=0x%llx",
+                   (int)format, drm.drm_fourcc, (unsigned long long)drm.modifier,
+                   (int)drm.planes_unverified, (int)drm.planes_contradictory,
+                   (int)drm.fourcc_unverified,
+                   (unsigned long long)modifier_info.drmFormatModifier);
    } else if (result != VK_SUCCESS ||
               modifier_info.drmFormatModifierPlaneCount !=
                  ycbcr_info->n_planes) {
@@ -2172,6 +2180,13 @@ tu_physical_device_init(struct tu_physical_device *device,
 
    const struct fd_dev_info info = fd_dev_info(&device->dev_id);
    assert(info.chip);
+
+   if (TU_DEBUG(IMAGE_TRACE) || TU_DEBUG(IMG_BIG))
+      mesa_logi("TU_IMAGE_TRACE: dev chip=%x tp_ubwc_flag_hint=%d "
+                "ubwc_linear_mipmap_fallback=%d hbb=%d swizzle=0x%x macrotile=%d",
+                info.chip, info.props.enable_tp_ubwc_flag_hint,
+                info.props.has_ubwc_linear_mipmap_fallback, info.highest_bank_bit,
+                info.ubwc_swizzle, info.macrotile_mode);
 
    /* Print a suffix if raytracing is disabled by the SW fuse, in an attempt
     * to avoid confusion when apps don't work.
@@ -4366,11 +4381,27 @@ tu_AllocateMemory(VkDevice _device,
          };
          modifier = recovered_modifier;
          plane_layouts = NULL;
+         if (TU_DEBUG(IMAGE_TRACE))
+            mesa_logi("TU_IMAGE_TRACE: ahb-bind recovery vk_format=%d "
+                      "fourcc=0x%x modifier=0x%llx unverified=%d "
+                      "contradictory=%d fourcc_unverified=%d -> modifier=0x%llx "
+                      "layout=fdl planes=%u",
+                      (int)mem->image->vk.format, drm.drm_fourcc,
+                      (unsigned long long)drm.modifier,
+                      (int)drm.planes_unverified, (int)drm.planes_contradictory,
+                      (int)drm.fourcc_unverified,
+                      (unsigned long long)recovered_modifier,
+                      (unsigned)eci.drmFormatModifierPlaneCount);
       } else if (result != VK_SUCCESS) {
          vk_device_memory_destroy(&device->vk, pAllocator, &mem->vk);
          return result;
       } else {
          modifier = eci.drmFormatModifier;
+         if (TU_DEBUG(IMAGE_TRACE))
+            mesa_logi("TU_IMAGE_TRACE: ahb-bind vendor-layout modifier=0x%llx "
+                      "planes=%u",
+                      (unsigned long long)modifier,
+                      (unsigned)eci.drmFormatModifierPlaneCount);
       }
 
       if (eci.drmFormatModifierPlaneCount !=

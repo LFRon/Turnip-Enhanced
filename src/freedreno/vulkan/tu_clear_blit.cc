@@ -29,6 +29,9 @@
 
 static const VkOffset2D blt_no_coord = { ~0, ~0 };
 
+#define TU_IMG_TRACE(w) \
+   (TU_DEBUG(IMAGE_TRACE) || (TU_DEBUG(IMG_BIG) && (w) >= 512))
+
 /* The helpers below quantize floats to match shader export behavior and avoid
  * rounding mismatches between hardware paths (R2D blit engine, 3D pipeline,
  * etc.).
@@ -2915,8 +2918,18 @@ tu_copy_buffer_to_image(struct tu_cmd_buffer *cmd,
 
    /* note: could use "R8_UNORM" when no UBWC */
    bool has_unaligned = CHIP >= A7XX; /* If unaligned buffer copies are supported. */
+   if (TU_DEBUG(COPY_SLOW))
+      has_unaligned = false;
    unsigned blit_param = 0;
    if (src_format == PIPE_FORMAT_Y8_UNORM) {
+      ops = &r3d_ops<CHIP>;
+      blit_param = R3D_COPY;
+      has_unaligned = false;
+   }
+   if (TU_DEBUG(BUF2IMG_3D) && dst_image->layout[0].ubwc &&
+       !util_format_is_depth_or_stencil(dst_format) &&
+       dst_image->layout[0].nr_samples == 1 &&
+       dst_image->vk.image_type == VK_IMAGE_TYPE_2D) {
       ops = &r3d_ops<CHIP>;
       blit_param = R3D_COPY;
       has_unaligned = false;
@@ -2932,6 +2945,108 @@ tu_copy_buffer_to_image(struct tu_cmd_buffer *cmd,
    uint32_t block_size = util_format_get_blocksize(src_format);
    uint32_t pitch = src_width * block_size;
    uint32_t layer_size = src_height * pitch;
+
+   if (TU_IMG_TRACE(extent.width))
+      mesa_logi("TU_IMAGE_TRACE:   buf2img-plan dst_id=%" PRIu64 " src_fmt=%s "
+                "src_pitch=%u rows=%u block=%u unaligned=%d has_unaligned=%d "
+                "dst_tile=%u dst_ubwc=%u dst_tile_all=%u dst_pitch0=%u",
+                dst_image->id, util_format_name(src_format), pitch, src_height,
+                block_size,
+                (int)((vk_buffer_address(&src_buffer->vk, info->bufferOffset) & 63) ||
+                      (pitch & 63)),
+                (int)has_unaligned, dst_image->layout[0].tile_mode,
+                dst_image->layout[0].ubwc, dst_image->layout[0].tile_all,
+                dst_image->layout[0].pitch0);
+
+   if (TU_IMG_TRACE(extent.width) && src_buffer->bo && extent.width >= 128) {
+      struct tu_bo *bo = src_buffer->bo;
+      const uint64_t va_off =
+         vk_buffer_address(&src_buffer->vk, info->bufferOffset) - bo->iova;
+
+      if (!bo->map)
+         tu_bo_map(cmd->device, bo, NULL);
+
+      if (bo->map && va_off + (uint64_t)pitch * 2 + 16 <= bo->size) {
+         const uint8_t *p = (const uint8_t *)bo->map + va_off;
+         uint32_t n = MIN2(extent.width, 512);
+         uint64_t d0 = 0, d1 = 0;
+
+         for (uint32_t i = 0; i + 1 < n; i++) {
+            int a = p[(uint64_t)i * block_size];
+            int b = p[(uint64_t)(i + 1) * block_size];
+            int c = p[pitch + (uint64_t)i * block_size];
+            int d = p[pitch + (uint64_t)(i + 1) * block_size];
+            d0 += a > b ? a - b : b - a;
+            d1 += c > d ? c - d : d - c;
+         }
+
+         char r0[3 * 64 + 1];
+         for (unsigned i = 0; i < 64; i++)
+            snprintf(r0 + 3 * i, 4, "%02x", p[i]);
+
+         mesa_logi("TU_IMAGE_TRACE:   src-check dst_id=%" PRIu64 " fmt=%s "
+                   "w=%u pitch=%u va=%" PRIu64 " va&63=%u map=%p d0=%u d1=%u "
+                   "b=%02x%02x%02x%02x%02x%02x%02x%02x r0=%s",
+                   dst_image->id, util_format_name(src_format), extent.width,
+                   pitch, va_off, (unsigned)(va_off & 63), bo->map,
+                   (unsigned)(d0 / MAX2(n - 1, 1u)),
+                   (unsigned)(d1 / MAX2(n - 1, 1u)),
+                   p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], r0);
+
+      } else {
+         mesa_logi("TU_IMAGE_TRACE:   src-check dst_id=%" PRIu64 " not-mapped "
+                   "va=%" PRIu64 " va&63=%u bo_size=%" PRIu64 " map=%p",
+                   dst_image->id, va_off, (unsigned)(va_off & 63),
+                   bo->size, bo->map);
+      }
+   }
+
+   {
+      static thread_local struct tu_bo *trace_bo;
+      static thread_local uint64_t trace_off, trace_size, trace_id, trace_data_off;
+
+      if (TU_IMG_TRACE(extent.width) && dst_image->total_size >= (1u << 20) &&
+          extent.width >= 512 && dst_image->mem && dst_image->mem->bo) {
+         if (trace_bo && trace_bo != dst_image->mem->bo) {
+            if (!trace_bo->map)
+               tu_bo_map(cmd->device, trace_bo, NULL);
+            if (trace_bo->map && trace_off + trace_size <= trace_bo->size &&
+                trace_data_off + 4100 <= trace_size) {
+               const uint8_t *q0 = (const uint8_t *)trace_bo->map + trace_off;
+               const uint8_t *qm = q0 + trace_size / 2;
+               const uint8_t *qe = q0 + trace_size - 64;
+               const uint8_t *qd = q0 + trace_data_off;
+               mesa_logi("TU_IMAGE_TRACE:   dst-check id=%" PRIu64
+                         " size=%" PRIu64 " off=%" PRIu64 " doff=%" PRIu64
+                         " meta=%02x%02x%02x%02x"
+                         " mid=%02x%02x%02x%02x end=%02x%02x%02x%02x "
+                         "s0=%02x%02x%02x%02x s4k=%02x%02x%02x%02x"
+                         " d0=%02x%02x%02x%02x d4k=%02x%02x%02x%02x",
+                         trace_id, trace_size, trace_off, trace_data_off,
+                         q0[0], q0[1], q0[2], q0[3],
+                         qm[0], qm[1], qm[2], qm[3],
+                         qe[0], qe[1], qe[2], qe[3],
+                         q0[16], q0[17], q0[18], q0[19],
+                         q0[4096], q0[4097], q0[4098], q0[4099],
+                         qd[0], qd[1], qd[2], qd[3],
+                         qd[4096], qd[4097], qd[4098], qd[4099]);
+            } else {
+               mesa_logi("TU_IMAGE_TRACE:   dst-check id=%" PRIu64
+                         " unavailable map=%p off=%" PRIu64 " size=%" PRIu64,
+                         trace_id, trace_bo->map, trace_off, trace_size);
+            }
+         }
+         if (trace_bo != dst_image->mem->bo) {
+            if (trace_bo)
+               tu_bo_finish(cmd->device, trace_bo);
+            trace_bo = tu_bo_get_ref(dst_image->mem->bo);
+         }
+         trace_off = dst_image->mem_offset;
+         trace_size = dst_image->total_size;
+         trace_id = dst_image->id;
+         trace_data_off = dst_image->layout[0].slices[0].offset;
+      }
+   }
 
    /* only the 2d path can rotate, a6xx still needs the per-row loop for unaligned buffers */
    const enum a6xx_rotation copy_rot = tu_copy_transform_rotation(info->pNext);
@@ -3025,6 +3140,27 @@ tu_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(tu_image, dst_image, pCopyBufferToImageInfo->dstImage);
    VK_FROM_HANDLE(tu_buffer, src_buffer, pCopyBufferToImageInfo->srcBuffer);
 
+   if (TU_IMG_TRACE(dst_image->vk.extent.width)) {
+      mesa_logi("TU_IMAGE_TRACE: copy_buf2img dst_id=%" PRIu64 " fmt=%s regions=%u "
+                "dst_tile=%u dst_ubwc=%u dst_tile_all=%u dst_pitch0=%u "
+                "dst_iova=%" PRIx64 " dst_size=%" PRIu64,
+                dst_image->id, util_format_name(dst_image->layout[0].format),
+                pCopyBufferToImageInfo->regionCount,
+                dst_image->layout[0].tile_mode, dst_image->layout[0].ubwc,
+                dst_image->layout[0].tile_all, dst_image->layout[0].pitch0,
+                dst_image->iova, dst_image->total_size);
+      for (unsigned i = 0; i < pCopyBufferToImageInfo->regionCount; ++i) {
+         const VkBufferImageCopy2 *r = pCopyBufferToImageInfo->pRegions + i;
+         mesa_logi("TU_IMAGE_TRACE:   region%u bufOff=%" PRIu64 " rowLen=%u imgHeight=%u "
+                   "extent=%ux%ux%u aspect=0x%x mip=%u layer=%u count=%u",
+                   i, (uint64_t)r->bufferOffset, r->bufferRowLength,
+                   r->bufferImageHeight, r->imageExtent.width, r->imageExtent.height,
+                   r->imageExtent.depth, r->imageSubresource.aspectMask,
+                   r->imageSubresource.mipLevel, r->imageSubresource.baseArrayLayer,
+                   r->imageSubresource.layerCount);
+      }
+   }
+
    trace_start_copy_buffer_to_image(&cmd->trace, &cmd->cs, cmd, dst_image->vk.format);
 
    for (unsigned i = 0; i < pCopyBufferToImageInfo->regionCount; ++i)
@@ -3078,6 +3214,20 @@ tu_copy_memory_to_image(struct tu_device *device,
       (src_width * src_height * layout->cpp);
    bool tiled =
       fdl_tile_mode(layout, info->imageSubresource.mipLevel) != 0;
+
+   if (TU_IMG_TRACE(extent.width)) {
+      mesa_logi("TU_IMAGE_TRACE: host2image id=%" PRIu64 " fmt=%s mip=%u baseLayer=%u "
+                "layers=%u off=%d,%d,%d extent=%ux%ux%u memcpy=%u tiled=%u "
+                "src_pitch=%u dst_layer_stride=%u dst_layer_size=%u img_offset=%u "
+                "ubwc=%u slice_pitch=%u slice_off=%" PRIu64,
+                dst_image->id, util_format_name(layout->format),
+                info->imageSubresource.mipLevel, info->imageSubresource.baseArrayLayer,
+                layers, offset.x, offset.y, offset.z, extent.width, extent.height,
+                extent.depth, copy_memcpy, tiled, src_pitch, dst_layer_stride,
+                dst_layer_size, image_offset, layout->ubwc,
+                fdl_pitch(layout, info->imageSubresource.mipLevel),
+                (uint64_t)layout->slices[info->imageSubresource.mipLevel].offset);
+   }
 
    const char *src = (const char *) info->pHostPointer;
    char *dst = (char *) dst_image->map + image_offset;

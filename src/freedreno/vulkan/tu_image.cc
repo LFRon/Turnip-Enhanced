@@ -35,6 +35,7 @@
 #include "tu_subsampled_image.h"
 #include "tu_wsi.h"
 
+
 uint32_t
 tu6_plane_count(VkFormat format)
 {
@@ -284,6 +285,23 @@ tu_image_view_init(struct tu_device *device,
    }
 
    TU_CALLX(device, fdl6_view_init)(&iview->view, layouts, &args, device->use_z24uint_s8uint);
+
+   if (TU_DEBUG(IMAGE_TRACE) || (TU_DEBUG(IMG_BIG) && image->vk.extent.width >= 512)) {
+      const struct fdl6_view *v = &iview->view;
+      mesa_logi("TU_IMAGE_TRACE:   view img_id=%" PRIu64 " fmt=%s ubwc=%u pitch=%u "
+                "base=%" PRIx64 " flag=%" PRIx64 " ls=%u ubls=%u fb_pitch=%08x",
+                image->id, util_format_name(image->layout[0].format), v->ubwc_enabled,
+                v->pitch, v->base_addr, v->ubwc_addr, v->layer_size,
+                v->ubwc_layer_size, v->FLAG_BUFFER_PITCH);
+      mesa_logi("TU_IMAGE_TRACE:   view-d0 img_id=%" PRIu64 " d0=%08x d1=%08x d2=%08x "
+                "d3=%08x d4=%08x d5=%08x d6=%08x",
+                image->id, v->descriptor[0], v->descriptor[1], v->descriptor[2],
+                v->descriptor[3], v->descriptor[4], v->descriptor[5], v->descriptor[6]);
+      mesa_logi("TU_IMAGE_TRACE:   view-d1 img_id=%" PRIu64 " d7=%08x d8=%08x d9=%08x "
+                "d10=%08x d11=%08x d12=%08x",
+                image->id, v->descriptor[7], v->descriptor[8], v->descriptor[9],
+                v->descriptor[10], v->descriptor[11], v->descriptor[12]);
+   }
 
    if (conversion &&
        tu_format_uses_software_ycbcr(conversion->state.format) &&
@@ -856,8 +874,17 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
           tile_mode == TILE6_3);
 
    const bool android_exact_linear_color_import =
-      tu_is_android_exact_linear_color_import(image, modifier, plane_layouts);
+      tu_is_android_exact_linear_color_import(image, modifier, plane_layouts) &&
+      !TU_DEBUG(NO_EXACT_AHB);
    image->android_external_no_gmem_padding = android_exact_linear_color_import;
+
+   const bool vendor_plane_no_padding =
+      plane_layouts != NULL && modifier == DRM_FORMAT_MOD_LINEAR &&
+      tu6_plane_count(image->vk.format) == 1 &&
+      image->vk.image_type == VK_IMAGE_TYPE_2D &&
+      image->vk.samples == VK_SAMPLE_COUNT_1_BIT &&
+      image->vk.mip_levels == 1 && image->vk.array_layers == 1 &&
+      image->vk.extent.depth == 1;
 
    /* Android YV12 guarantees only 16-byte row-pitch alignment.  Accept that
     * layout only for this exact single-level, sampled-only shared-buffer
@@ -890,7 +917,7 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
       struct fdl_explicit_layout plane_layout = {
          .pitch_alignment = android_yv12_import ? 16u : 0u,
          .skip_last_level_padding =
-            android_yv12_import || android_exact_linear_color_import,
+            android_yv12_import || vendor_plane_no_padding,
       };
 
       if (plane_layouts) {
@@ -995,6 +1022,33 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
       image->subsampled_metadata_offset = align64(image->total_size, 16);
       image->total_size = image->subsampled_metadata_offset +
          image->vk.array_layers * sizeof(struct tu_subsampled_metadata);
+   }
+
+   if (TU_DEBUG(IMAGE_TRACE) || (TU_DEBUG(IMG_BIG) && image->vk.extent.width >= 512)) {
+      mesa_logi("TU_IMAGE_TRACE: id=%" PRIu64 " fmt=%s extent=%ux%ux%u mips=%u "
+                "layers=%u samples=%u tiling=%u modifier=0x%" PRIx64
+                " ahb_format=0x%x usage=0x%" PRIx64 " flags=0x%x size=%" PRIu64,
+                image->id, util_format_name(image->layout[0].format),
+                image->vk.extent.width, image->vk.extent.height,
+                image->vk.extent.depth, image->vk.mip_levels,
+                image->vk.array_layers, image->vk.samples,
+                (unsigned)image->vk.tiling,
+                (uint64_t)image->vk.drm_format_mod, image->vk.ahb_format,
+                (uint64_t)image->vk.usage, (unsigned)image->vk.create_flags,
+                image->total_size);
+
+      for (uint32_t p = 0; p < tu6_plane_count(image->vk.format); p++) {
+         const struct fdl_layout *l = &image->layout[p];
+         mesa_logi("TU_IMAGE_TRACE: id=%" PRIu64 " plane%u pf=%s tile_mode=%u "
+                   "ubwc=%u tile_all=%u pitch0=%u slice0_off=%" PRIu64
+                   " slice0_pitch=%u ubwc0_off=%" PRIu64 " ubwc0_pitch=%u "
+                   "ubwc0_size=%u layer_size=%" PRIu64,
+                   image->id, p, util_format_name(l->format), l->tile_mode,
+                   l->ubwc, l->tile_all, l->pitch0,
+                   (uint64_t)l->slices[0].offset, fdl_pitch(l, 0),
+                   (uint64_t)l->ubwc_slices[0].offset, fdl_ubwc_pitch(l, 0),
+                   l->ubwc_slices[0].size0, l->layer_size);
+      }
    }
 
    return VK_SUCCESS;
@@ -1160,10 +1214,24 @@ tu_android_get_wsi_memory(struct tu_device *dev,
                                           : drm.modifier;
       eci.drmFormatModifier = modifier;
       plane_layouts = NULL;
+      if (TU_DEBUG(IMAGE_TRACE))
+         mesa_logi("TU_IMAGE_TRACE: anb-bind recovery vk_format=%d "
+                   "fourcc=0x%x modifier=0x%llx unverified=%d contradictory=%d "
+                   "fourcc_unverified=%d -> modifier=0x%llx layout=fdl planes=%u",
+                   (int)img->vk.android_deferred_create_info->format,
+                   drm.drm_fourcc, (unsigned long long)drm.modifier,
+                   (int)drm.planes_unverified, (int)drm.planes_contradictory,
+                   (int)drm.fourcc_unverified, (unsigned long long)modifier,
+                   (unsigned)eci.drmFormatModifierPlaneCount);
    } else if (result != VK_SUCCESS) {
       return result;
    } else {
       modifier = eci.drmFormatModifier;
+      if (TU_DEBUG(IMAGE_TRACE))
+         mesa_logi("TU_IMAGE_TRACE: anb-bind vendor-layout modifier=0x%llx "
+                   "planes=%u",
+                   (unsigned long long)modifier,
+                   (unsigned)eci.drmFormatModifierPlaneCount);
    }
 
    if (eci.drmFormatModifierPlaneCount !=
@@ -1317,6 +1385,16 @@ tu_CreateImage(VkDevice _device,
                                              : drm.modifier;
          eci.drmFormatModifier = modifier;
          plane_layouts = NULL;
+         if (TU_DEBUG(IMAGE_TRACE))
+            mesa_logi("TU_IMAGE_TRACE: anb-create recovery vk_format=%d "
+                      "fourcc=0x%x modifier=0x%llx unverified=%d "
+                      "contradictory=%d fourcc_unverified=%d -> modifier=0x%llx "
+                      "layout=fdl planes=%u",
+                      (int)pCreateInfo->format, drm.drm_fourcc,
+                      (unsigned long long)drm.modifier,
+                      (int)drm.planes_unverified, (int)drm.planes_contradictory,
+                      (int)drm.fourcc_unverified, (unsigned long long)modifier,
+                      (unsigned)eci.drmFormatModifierPlaneCount);
       } else if (result != VK_SUCCESS) {
          goto fail;
       } else {
@@ -1333,6 +1411,11 @@ tu_CreateImage(VkDevice _device,
          plane_layouts = a_plane_layouts;
          modifier = eci.drmFormatModifier;
       }
+      if (TU_DEBUG(IMAGE_TRACE))
+         mesa_logi("TU_IMAGE_TRACE: anb-create vendor-layout modifier=0x%llx "
+                   "planes=%u",
+                   (unsigned long long)modifier,
+                   (unsigned)eci.drmFormatModifierPlaneCount);
    }
 
    result = TU_CALLX(device, tu_image_init)(device, image, pCreateInfo,
