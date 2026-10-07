@@ -2428,6 +2428,8 @@ Turnip driver environment variables
       Disable concurrent binning.
    ``forcecb``
       Force enable concurrent binning.
+   ``image_trace``
+      Log image creation and buffer/image (including host-image-copy) upload layout details.
 
 Freedreno driver environment variables
 --------------------------------------
