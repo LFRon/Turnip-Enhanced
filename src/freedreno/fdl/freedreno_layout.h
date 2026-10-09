@@ -87,6 +87,16 @@ struct fdl_explicit_layout {
    bool skip_last_level_padding;
 };
 
+/* Vendor-packed ten-bit YUV modes (QTI TP10/P010 UBWC): the producer
+ * reports them as NV12 with a vendor modifier, so the layout and sampler
+ * format must follow the classified mode.  NONE for everything else.
+ */
+enum fdl_yuv10_mode {
+   FDL_YUV10_NONE = 0,
+   FDL_YUV10_TIGHT,
+   FDL_YUV10_P010,
+};
+
 /**
  * General layout params for images.
  */
@@ -125,6 +135,8 @@ struct fdl_image_params {
    bool force_disable_linear_fallback;
 
    uint32_t plane;
+
+   enum fdl_yuv10_mode yuv10_mode;
 };
 
 /**
@@ -155,6 +167,7 @@ struct fdl_layout {
    bool tile_all : 1;
    bool is_mutable : 1;
    bool has_explicit_pitch : 1;
+   enum fdl_yuv10_mode yuv10_mode;
 
    /* Note that for tiled textures, beyond a certain mipmap level (ie.
     * when width is less than block size) things switch to linear.  In
