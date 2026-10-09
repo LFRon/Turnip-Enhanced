@@ -43,6 +43,7 @@
 #include "util/log.h"
 #include "util/os_file.h"
 #include "util/u_gralloc/u_gralloc.h"
+#include "util/u_gralloc/u_gralloc_qti_semantics.h"
 
 #include <hardware/gralloc.h>
 #include <hardware/hardware.h>
@@ -54,6 +55,10 @@
 #endif
 
 #include <unistd.h>
+
+static_assert((int)U_GRALLOC_QTI_YUV10_NONE == (int)VK_ANDROID_YUV10_NONE, "");
+static_assert((int)U_GRALLOC_QTI_YUV10_TIGHT == (int)VK_ANDROID_YUV10_TIGHT, "");
+static_assert((int)U_GRALLOC_QTI_YUV10_P010 == (int)VK_ANDROID_YUV10_P010, "");
 
 static struct u_gralloc *_gralloc;
 
@@ -143,6 +148,17 @@ vk_android_drm_format_of(struct u_gralloc_buffer_handle *hnd,
       .fourcc_unverified =
          !!(info.flags & U_GRALLOC_BUFFER_INFO_FOURCC_UNVERIFIED),
    };
+
+   out->yuv10_mode = (enum vk_android_yuv10_mode)
+      u_gralloc_qti_get_yuv10_mode(hnd->hal_format, info.drm_fourcc,
+                                   info.modifier);
+   if (out->yuv10_mode != VK_ANDROID_YUV10_NONE)
+      mesa_logi_once("vk_android: QTI 10-bit buffer sampled as %s "
+                     "(hal_format=0x%x modifier=0x%llx)",
+                     out->yuv10_mode == VK_ANDROID_YUV10_TIGHT ? "TP10"
+                                                               : "P010",
+                     hnd->hal_format, (unsigned long long)info.modifier);
+
    return VK_SUCCESS;
 }
 

@@ -46,6 +46,15 @@ struct vk_image;
  * recompute plane layouts from (drm_fourcc, modifier, dimensions) with
  * their own layout library.
  */
+/* Ten-bit YUV packing of an imported buffer, classified from the vendor
+ * metadata (see u_gralloc_qti_semantics.h); drives the sampler format.
+ */
+enum vk_android_yuv10_mode {
+   VK_ANDROID_YUV10_NONE = 0,
+   VK_ANDROID_YUV10_TIGHT,
+   VK_ANDROID_YUV10_P010,
+};
+
 struct vk_android_drm_format_info {
    uint32_t drm_fourcc;
    uint64_t modifier;
@@ -62,6 +71,7 @@ struct vk_android_drm_format_info {
     * unambiguous without a fourcc.
     */
    bool fourcc_unverified;
+   enum vk_android_yuv10_mode yuv10_mode;
 };
 
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
