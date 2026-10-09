@@ -856,7 +856,8 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
     * UBWC, then override how the image was created.
     */
    bool force_ubwc = false;
-   if (modifier == DRM_FORMAT_MOD_QCOM_COMPRESSED) {
+   if (fourcc_mod_is_vendor(modifier, QCOM) &&
+       (modifier & DRM_FORMAT_MOD_QCOM_COMPRESSED)) {
       assert(!force_linear_tile);
       ubwc_enabled = true;
       force_ubwc = true;
