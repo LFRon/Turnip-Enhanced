@@ -928,7 +928,9 @@ a730_raw_magic_regs = [
 a740_raw_magic_regs = [
         [A6XXRegs.REG_A6XX_UCHE_CACHE_WAYS, 0x00040004],
         [A6XXRegs.REG_A6XX_TPL1_DBG_ECO_CNTL, 0x11100000],
-        [A6XXRegs.REG_A6XX_TPL1_DBG_ECO_CNTL1, 0x00040724],
+        # Value the platform firmware programs on a740; bit 18 is added
+        # conditionally through enable_tp_ubwc_flag_hint.
+        [A6XXRegs.REG_A6XX_TPL1_DBG_ECO_CNTL1, 0x00040700],
 
         [A6XXRegs.REG_A6XX_SP_CHICKEN_BITS, 0x10001400],
         [A6XXRegs.REG_A7XX_SP_CHICKEN_BITS_1, 0x00400400],
@@ -1235,7 +1237,7 @@ add_gpus([
         GPUId(chip_id=0xffff43050c01, name="Adreno X1-85"),
     ], A6xxGPUInfo(
         CHIP.A7XX,
-        [a7xx_base, a7xx_gen2],
+        [a7xx_base, a7xx_gen2, GPUProps(enable_tp_ubwc_flag_hint = True)],
         num_ccu = 6,
         tile_align_w = 96,
         tile_align_h = 32,
