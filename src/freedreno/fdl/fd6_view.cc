@@ -241,8 +241,16 @@ fdl6_view_init(struct fdl6_view *view, const struct fdl_layout **layouts,
    enum a6xx_tile_mode tile_mode = (enum a6xx_tile_mode)fdl_tile_mode(layout, args->base_miplevel);
 
    if (ubwc_enabled && util_format_is_yuv(args->format) &&
-       util_format_get_num_planes(args->format) == 2) {
+       util_format_get_num_planes(args->format) == 2)
       texture_format = FMT6_R8_G8B8_2PLANE_420_UNORM;
+
+   /* The combined two-plane YCbCr formats used for imported external
+    * images are described as PLANAR2 with an RGB colorspace, so
+    * util_format_is_yuv() does not match them.  Select the sampler format
+    * through the layout (which carries any vendor ten-bit packing, see
+    * fdl_yuv10_mode), not the format description.
+    */
+   if (ubwc_enabled && util_format_get_num_planes(args->format) == 2) {
       if (layout->yuv10_mode == FDL_YUV10_TIGHT)
          texture_format = FMT6_TP10;
       else if (layout->yuv10_mode == FDL_YUV10_P010)
