@@ -243,6 +243,10 @@ fdl6_view_init(struct fdl6_view *view, const struct fdl_layout **layouts,
    if (ubwc_enabled && util_format_is_yuv(args->format) &&
        util_format_get_num_planes(args->format) == 2) {
       texture_format = FMT6_R8_G8B8_2PLANE_420_UNORM;
+      if (layout->yuv10_mode == FDL_YUV10_TIGHT)
+         texture_format = FMT6_TP10;
+      else if (layout->yuv10_mode == FDL_YUV10_P010)
+         texture_format = FMT6_P010;
    }
 
    bool is_d24s8 = (args->format == PIPE_FORMAT_Z24_UNORM_S8_UINT ||
