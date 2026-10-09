@@ -70,6 +70,7 @@
 
 #include "drm-uapi/drm_fourcc.h"
 #include "util/log.h"
+#include "util/os_misc.h"
 
 #include "u_gralloc_internal.h"
 
@@ -244,6 +245,31 @@ make_metadata_type(int64_t key)
    return md;
 }
 
+static bool
+pt_debug_enabled(void)
+{
+   static int enabled = -1;
+   if (enabled < 0)
+      enabled = os_get_option("MESA_U_GRALLOC_DEBUG") != NULL;
+   return enabled;
+}
+
+static void
+pt_dump_hex(int64_t key, const uint8_t *data, size_t size)
+{
+   for (size_t off = 0; off < size; off += 48) {
+      size_t n = size - off;
+      if (n > 48)
+         n = 48;
+      char hex[48 * 2 + 1];
+      for (size_t i = 0; i < n; i++)
+         snprintf(hex + i * 2, 3, "%02x", data[off + i]);
+      hex[n * 2] = '\0';
+      mesa_logi("u_gralloc: [pt]  key=%lld[%zu..%zu]=%s", (long long)key, off,
+                off + n, hex);
+   }
+}
+
 /* One synchronous get() round-trip; returns the payload after the
  * validated [type-name][value] header, or false.
  */
@@ -294,6 +320,8 @@ pt_get_blob(const struct pt_gralloc *gr, void *buffer, int64_t key,
       return false;
 
    payload->assign(bytes.begin() + (long)pos, bytes.end());
+   if (pt_debug_enabled())
+      pt_dump_hex(key, payload->data(), payload->size());
    return true;
 }
 
@@ -401,6 +429,7 @@ struct PtPlaneLayout {
    int64_t component_value = -1;
 
    int num_components = 0;
+   int raw_components = 0;
    PtPlaneComponent components[4] = {};
 };
 
@@ -471,6 +500,7 @@ pt_get_plane_layouts(const struct pt_gralloc *gr, void *buffer,
 
       plane.component_value = component_value;
       plane.num_components = num_standard_components;
+      plane.raw_components = (int)num_components;
       for (int k = 0; k < num_standard_components; k++)
          plane.components[k] = components[k];
       out->push_back(plane);
@@ -598,12 +628,14 @@ pt_get_buffer_basic_info(struct u_gralloc *gralloc,
        * compressed, so the modifier claim must not be trusted and the
        * vendor plane geometry must not be consumed verbatim.
        */
+      int64_t compression = 0;
+      bool compression_read = false;
       bool metadata_compressed = false;
-      if (modifier_claims_linear) {
-         int64_t compression = 0;
-         if (pt_get_extendable_value(gr, imported, MD_COMPRESSION, &compression))
-            metadata_compressed = compression != 0;
-      }
+      if (modifier_claims_linear)
+         compression_read =
+            pt_get_extendable_value(gr, imported, MD_COMPRESSION, &compression);
+      if (modifier_claims_linear && compression_read)
+         metadata_compressed = compression != 0;
 
       /*
         * Vendor layout trust policy (platform-neutral):
@@ -624,6 +656,7 @@ pt_get_buffer_basic_info(struct u_gralloc *gralloc,
 
       std::vector<PtPlaneLayout> planes;
       bool have_planes = pt_get_plane_layouts(gr, imported, &planes);
+      const bool planes_decoded = have_planes;
       bool contradictory = metadata_compressed;
       if (have_planes && !compressed && planes[0].offsetInBytes != 0) {
          contradictory = true;
@@ -704,6 +737,39 @@ pt_get_buffer_basic_info(struct u_gralloc *gralloc,
 
       if (contradictory)
          out->flags |= U_GRALLOC_BUFFER_INFO_PLANES_CONTRADICTORY;
+
+      if (pt_debug_enabled()) {
+         mesa_logi("u_gralloc: [pt] hnd=%p numFds=%d numInts=%d hal_format=0x%x "
+                   "pixel_stride=%d",
+                   (void *)hnd->handle, hnd->handle->numFds,
+                   hnd->handle->numInts, hnd->hal_format, hnd->pixel_stride);
+         mesa_logi("u_gralloc: [pt] fourcc=0x%x known=%d modifier=0x%llx "
+                   "claims_linear=%d compression_read=%d compression=0x%llx "
+                   "metadata_compressed=%d compressed=%d",
+                   fourcc, fourcc_known, (unsigned long long)modifier,
+                   modifier_claims_linear, compression_read,
+                   (unsigned long long)compression, metadata_compressed,
+                   compressed);
+         mesa_logi("u_gralloc: [pt] planes_decoded=%d contradictory=%d "
+                   "have_planes=%d",
+                   planes_decoded, contradictory, have_planes);
+         for (size_t i = 0; i < planes.size(); i++)
+            mesa_logi("u_gralloc: [pt]  vendor plane%zu off=%lld stride=%lld "
+                      "ncomp=%d ncomp_raw=%d comp0=%lld",
+                      i, (long long)planes[i].offsetInBytes,
+                      (long long)planes[i].strideInBytes,
+                      planes[i].num_components, planes[i].raw_components,
+                      (long long)planes[i].component_value);
+         for (int i = 0; i < out->num_planes; i++)
+            mesa_logi("u_gralloc: [pt]  out plane%d off=%d stride=%d fd=%d", i,
+                      out->offsets[i], out->strides[i], out->fds[i]);
+         mesa_logi("u_gralloc: [pt] out fourcc=0x%x modifier=0x%llx "
+                   "num_planes=%d flags=0x%x alloc=%llu layers=%llu",
+                   out->drm_fourcc, (unsigned long long)out->modifier,
+                   out->num_planes, out->flags,
+                   (unsigned long long)out->alloc_size,
+                   (unsigned long long)out->layer_count);
+      }
 
       ret = 0;
 
