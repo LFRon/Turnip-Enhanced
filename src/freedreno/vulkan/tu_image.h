@@ -25,6 +25,8 @@ struct tu_image
 
    bool android_external_no_gmem_padding;
 
+   enum fdl_yuv10_mode yuv10_mode;
+
    /* Set when bound */
    uint64_t iova;
    union {
