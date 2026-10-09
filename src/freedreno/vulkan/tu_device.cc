@@ -4381,6 +4381,7 @@ tu_AllocateMemory(VkDevice _device,
          };
          modifier = recovered_modifier;
          plane_layouts = NULL;
+         mem->image->yuv10_mode = (enum fdl_yuv10_mode)drm.yuv10_mode;
          if (TU_DEBUG(IMAGE_TRACE))
             mesa_logi("TU_IMAGE_TRACE: ahb-bind recovery vk_format=%d "
                       "fourcc=0x%x modifier=0x%llx unverified=%d "

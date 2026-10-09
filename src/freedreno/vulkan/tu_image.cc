@@ -35,6 +35,9 @@
 #include "tu_subsampled_image.h"
 #include "tu_wsi.h"
 
+static_assert((int)VK_ANDROID_YUV10_NONE == (int)FDL_YUV10_NONE, "");
+static_assert((int)VK_ANDROID_YUV10_TIGHT == (int)FDL_YUV10_TIGHT, "");
+static_assert((int)VK_ANDROID_YUV10_P010 == (int)FDL_YUV10_P010, "");
 
 uint32_t
 tu6_plane_count(VkFormat format)
@@ -956,6 +959,7 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
             VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT,
          .force_disable_linear_fallback = force_disable_linear_fallback,
          .plane = i,
+         .yuv10_mode = plane_layouts ? FDL_YUV10_NONE : image->yuv10_mode,
       };
 
       if (!fdl6_layout_image(layout, &device->physical_device->dev_info,
@@ -1214,6 +1218,7 @@ tu_android_get_wsi_memory(struct tu_device *dev,
                                           : drm.modifier;
       eci.drmFormatModifier = modifier;
       plane_layouts = NULL;
+      img->yuv10_mode = (enum fdl_yuv10_mode)drm.yuv10_mode;
       if (TU_DEBUG(IMAGE_TRACE))
          mesa_logi("TU_IMAGE_TRACE: anb-bind recovery vk_format=%d "
                    "fourcc=0x%x modifier=0x%llx unverified=%d contradictory=%d "
