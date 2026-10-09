@@ -1391,6 +1391,7 @@ tu_CreateImage(VkDevice _device,
                                              : drm.modifier;
          eci.drmFormatModifier = modifier;
          plane_layouts = NULL;
+         image->yuv10_mode = (enum fdl_yuv10_mode)drm.yuv10_mode;
          if (TU_DEBUG(IMAGE_TRACE))
             mesa_logi("TU_IMAGE_TRACE: anb-create recovery vk_format=%d "
                       "fourcc=0x%x modifier=0x%llx unverified=%d "
