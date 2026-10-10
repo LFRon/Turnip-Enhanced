@@ -8,6 +8,7 @@
 #include "u_gralloc_internal.h"
 
 #include <hardware/gralloc.h>
+#include <hardware/gralloc1.h>
 
 #include "drm-uapi/drm_fourcc.h"
 #include "util/log.h"
@@ -148,19 +149,34 @@ fallback_gralloc_get_buffer_info(struct u_gralloc *gralloc,
    out->strides[0] = stride;
 
 #ifdef HAS_FREEDRENO
-#ifndef U_GRALLOC_STRICT_STANDARD
-   /* This inspects the vendor-private qcom native handle layout; standard
-    * metadata transports (IMapper stable-C, IMapper@4.0 passthrough)
-    * expose the same information through documented keys and are used
-    * before this path is ever selected.
+   /* Qualcomm gralloc1-generation handles (the mapper@2 era, e.g. SDM845 on
+    * Android 15) carry the vendor private layout with the 'gmsm' magic and
+    * the UBWC flag in their private flag word.  The gate requires the
+    * legacy gralloc module to actually be a gralloc1 module, so gralloc4/5
+    * devices - which never have one - cannot reach this; and this backend
+    * is itself only reached when no standard transport exists (they are
+    * registered above).  The QCOM backend normally reports the same flag
+    * through the official perform call; this is the fallback for when that
+    * backend cannot load.
     */
+   struct fallback_gralloc *gr = (struct fallback_gralloc *)gralloc;
+   gralloc_module_t *gr_mod = gr->gralloc_module;
    uint32_t gmsm = ('g' << 24) | ('m' << 16) | ('s' << 8) | 'm';
-   if (hnd->handle->numInts >= 2 && hnd->handle->data[hnd->handle->numFds] == gmsm) {
-      /* This UBWC flag was introduced in a5xx. */
+   if (gr_mod &&
+       gr_mod->common.module_api_version >= GRALLOC_MODULE_API_VERSION_1_0 &&
+       hnd->handle->numInts >= 2 &&
+       (uint32_t)hnd->handle->data[hnd->handle->numFds] == gmsm) {
+      /* PRIV_FLAGS_UBWC_ALIGNED (gr_priv_handle.h); introduced in a5xx. */
       bool ubwc = hnd->handle->data[hnd->handle->numFds + 1] & 0x08000000;
       out->modifier = ubwc ? DRM_FORMAT_MOD_QCOM_COMPRESSED : DRM_FORMAT_MOD_LINEAR;
+      if (ubwc) {
+         /* UBWC geometry cannot be expressed through the legacy handle
+          * metadata; plane geometry must be recovered from (fourcc,
+          * modifier, dimensions) by the consumer.
+          */
+         out->flags |= U_GRALLOC_BUFFER_INFO_PLANES_UNVERIFIED;
+      }
    }
-#endif /* !U_GRALLOC_STRICT_STANDARD */
 #endif
 
    return 0;

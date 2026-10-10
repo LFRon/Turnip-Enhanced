@@ -49,11 +49,16 @@ static const struct u_grallocs {
 #endif /* USE_IMAPPER4_METADATA_API */
 #ifndef U_GRALLOC_STRICT_STANDARD
    {.type = U_GRALLOC_TYPE_LIBDRM, .create = u_gralloc_libdrm_create},
-   /* The QCOM backend queries vendor-private gralloc1 perform codes;
-    * excluded from standard-only builds.
+#endif /* !U_GRALLOC_STRICT_STANDARD */
+   /* Legacy Qualcomm gralloc (the gralloc1 / mapper@2 generation, e.g.
+    * SDM845 devices on Android 15) has no standard metadata transport at
+    * all; this backend serves those devices through the vendor perform
+    * protocol and the format table in u_gralloc_qti_semantics.h.  It
+    * self-identifies by the legacy module identity and a working perform
+    * probe before any buffer is decoded, and the standard backends above
+    * are always tried first, so it stays inert on modern devices.
     */
    {.type = U_GRALLOC_TYPE_QCOM, .create = u_gralloc_qcom_create},
-#endif /* !U_GRALLOC_STRICT_STANDARD */
    {.type = U_GRALLOC_TYPE_FALLBACK, .create = u_gralloc_fallback_create},
 };
 
