@@ -242,13 +242,16 @@ fdl6_layout_image(struct fdl_layout *layout, const struct fd_dev_info *info,
 
    /* TP10 is 4/3 tightly packed, P010 stores 16-bit samples; both strides
     * follow the vendor layout formulas (kernel UAPI mmm_color_fmt.h, VIDC
-    * msm_media_info.h).
+    * msm_media_info.h).  MSM_MEDIA_ALIGN aligns to non-power-of-two values
+    * (192 for TP10), so the inner alignment must use the npot form: the
+    * plain align() mask is only defined for power-of-two alignments and
+    * diverges from the vendor stride for e.g. 1920-wide buffers.
     */
    if (layout->yuv10_mode != FDL_YUV10_NONE) {
       uint32_t luma_width = layout->width0 * (layout->plane ? 2 : 1);
 
       if (layout->yuv10_mode == FDL_YUV10_TIGHT)
-         layout->pitch0 = align(align(luma_width, 192) * 4 / 3, 256);
+         layout->pitch0 = align(util_align_npot(luma_width, 192) * 4 / 3, 256);
       else
          layout->pitch0 = align(luma_width * 2, 256);
    }
