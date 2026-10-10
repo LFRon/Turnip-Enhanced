@@ -34,12 +34,19 @@ struct droid_yuv_format {
 static const struct droid_yuv_format droid_yuv_formats[] = {
    /* Native format, YCrCb, Chroma step, DRI image FourCC */
    {HAL_PIXEL_FORMAT_YCbCr_420_888, YCbCr, 2, DRM_FORMAT_NV12},
+   /* V-first storage of the same semi-planar formats, expressed by the
+    * legacy ycbcr contract as cr < cb (see bufferinfo_from_ycbcr); camera
+    * streams on gralloc1-era devices (e.g. SDM845) fall into this shape.
+    * Only the legacy backends resolve formats through this table.
+    */
+   {HAL_PIXEL_FORMAT_YCbCr_420_888, YCrCb, 2, DRM_FORMAT_NV21},
    {HAL_PIXEL_FORMAT_YCbCr_420_888, YCbCr, 1, DRM_FORMAT_YUV420},
    {HAL_PIXEL_FORMAT_YCbCr_420_888, YCrCb, 1, DRM_FORMAT_YVU420},
    {HAL_PIXEL_FORMAT_YV12, YCrCb, 1, DRM_FORMAT_YVU420},
    /* HACK: See droid_create_image_from_prime_fds() and
     * https://issuetracker.google.com/32077885. */
    {HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, YCbCr, 2, DRM_FORMAT_NV12},
+   {HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, YCrCb, 2, DRM_FORMAT_NV21},
    {HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, YCbCr, 1, DRM_FORMAT_YUV420},
    {HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, YCrCb, 1, DRM_FORMAT_YVU420},
    {HAL_PIXEL_FORMAT_IMPLEMENTATION_DEFINED, YCrCb, 1, DRM_FORMAT_AYUV},
