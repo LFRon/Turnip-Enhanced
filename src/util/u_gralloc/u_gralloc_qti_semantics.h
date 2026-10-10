@@ -30,6 +30,27 @@ enum u_gralloc_qti_yuv10_mode
 u_gralloc_qti_get_yuv10_mode(uint32_t hal_format, uint32_t drm_fourcc,
                              uint64_t modifier);
 
+/* Legacy (gralloc1-era, pre-gralloc4) Qualcomm HAL format codes and the DRM
+ * identity of the buffers they describe.  That HAL generation has no
+ * DRM-format reporting at all, so the identity comes from the public vendor
+ * format definitions (QtiGrallocDefs.h) and the vendor plane-info rules
+ * (gr_utils.cpp GetYUVPlaneInfo).  Only the legacy backends consult this
+ * table; the standard transports never resolve formats through it.
+ */
+struct u_gralloc_qti_legacy_format {
+   uint32_t hal_format; /* QTI HAL_PIXEL_FORMAT_* code */
+   uint32_t drm_fourcc; /* DRM_FORMAT_* identity */
+   /* Packed ten-bit format carried under the NV12 identity: UBWC by
+    * construction, with the packing mode classified separately by
+    * u_gralloc_qti_get_yuv10_mode() from the format code.
+    */
+   bool ten_bit;
+};
+
+/* Returns NULL when the HAL format is not a legacy Qualcomm format. */
+const struct u_gralloc_qti_legacy_format *
+u_gralloc_qti_legacy_format_of(uint32_t hal_format);
+
 #ifdef __cplusplus
 }
 #endif
