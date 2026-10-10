@@ -18,6 +18,7 @@
 #include "util/u_memory.h"
 
 #include "u_gralloc_internal.h"
+#include "u_gralloc_qti_semantics.h"
 
 /* Using this gralloc is not recommended for new distributions. */
 
@@ -100,6 +101,66 @@ get_buffer_info(struct u_gralloc *gralloc,
       out->modifier = DRM_FORMAT_MOD_QCOM_COMPRESSED;
    else
       out->modifier = DRM_FORMAT_MOD_LINEAR;
+
+   if (out->modifier == DRM_FORMAT_MOD_QCOM_COMPRESSED) {
+      /* UBWC plane geometry cannot be expressed through this HAL
+       * generation's plane info, which describes only the CPU view; plane
+       * geometry must be recovered from (fourcc, modifier, dimensions) by
+       * the consumer.
+       */
+      out->flags |= U_GRALLOC_BUFFER_INFO_PLANES_UNVERIFIED;
+   }
+
+   /* Qualcomm gralloc1-generation YUV formats (e.g. SDM845 on Android 15):
+    * this HAL generation reports no DRM format at all (the mapper offers
+    * only the vendor perform calls), so the identity comes from the vendor
+    * format code through the QTI data table (see u_gralloc_qti_semantics.h).
+    * These codes exist only on this generation; standard HAL formats keep
+    * the paths below.
+    */
+   const struct u_gralloc_qti_legacy_format *qti_format =
+      u_gralloc_qti_legacy_format_of(hnd->hal_format);
+   if (qti_format) {
+      struct android_ycbcr ycbcr;
+
+      if (qti_format->ten_bit &&
+          out->modifier != DRM_FORMAT_MOD_QCOM_COMPRESSED) {
+         /* packed ten-bit formats have no linear layout */
+         mesa_logw("gralloc1: ten-bit format 0x%x without UBWC",
+                   hnd->hal_format);
+         return -EINVAL;
+      }
+
+      out->drm_fourcc = qti_format->drm_fourcc;
+      out->num_planes = 2;
+      out->fds[0] = out->fds[1] = hnd->handle->data[0];
+
+      if (out->modifier != DRM_FORMAT_MOD_QCOM_COMPRESSED) {
+         /* Linear: the perform plane info is authoritative.  The chroma
+          * order is fixed by the format code (the ycbcr pointers cannot
+          * express V-first for every code).
+          */
+         memset(&ycbcr, 0, sizeof(ycbcr));
+         err = gr->perform(gr->perform_handle,
+                           GRALLOC_MODULE_PERFORM_GET_YUV_PLANE_INFO,
+                           hnd->handle, &ycbcr);
+         if (err) {
+            mesa_logw("gralloc1: plane info failed for format 0x%x: %d",
+                      hnd->hal_format, err);
+            return -EINVAL;
+         }
+
+         out->offsets[0] = (size_t)ycbcr.y;
+         out->strides[0] = ycbcr.ystride;
+         /* Plane 1 starts at the lower of the two chroma pointers: the
+          * vendor builds the V-first variants by swapping them.
+          */
+         out->offsets[1] = MIN2((size_t)ycbcr.cb, (size_t)ycbcr.cr);
+         out->strides[1] = ycbcr.cstride;
+      }
+
+      return 0;
+   }
 
    if (is_hal_format_yuv(hnd->hal_format)) {
       int ret = fallback_gralloc_get_yuv_info(gralloc, hnd, out);
