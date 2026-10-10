@@ -43,9 +43,12 @@ if with_platform_android and get_option('platform-sdk-version') >= 35
   inc_u_gralloc_stablec += include_directories('stablec/include')
   # Gralloc 4 era devices expose the same standard metadata through the
   # HIDL IMapper@4.0 passthrough contract (extern-C HIDL_FETCH_IMapper
-  # in the vendor hw module).  Standard-only selection: no
-  # vendor-private gralloc1 perform calls, no framework-private libui
-  # linkage; the fallback NDK/hw-module path remains for gralloc <= 3.
+  # in the vendor hw module).  Framework-private libui linkage stays
+  # excluded; the fallback NDK/hw-module path remains for gralloc <= 3,
+  # and the legacy QCOM backend stays available for gralloc1-generation
+  # devices, which have no standard transport at all (it self-identifies
+  # before use and is only tried after the standard backends, see
+  # u_gralloc.c).
   files_u_gralloc += files('u_gralloc_imapper4_pt_api.cpp')
   c_args_for_u_gralloc += '-DUSE_IMAPPER4_PT_API'
   cpp_args_for_u_gralloc += '-DUSE_IMAPPER4_PT_API'
