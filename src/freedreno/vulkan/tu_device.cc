@@ -2183,10 +2183,12 @@ tu_physical_device_init(struct tu_physical_device *device,
 
    if (TU_DEBUG(IMAGE_TRACE) || TU_DEBUG(IMG_BIG))
       mesa_logi("TU_IMAGE_TRACE: dev chip=%x tp_ubwc_flag_hint=%d "
-                "ubwc_linear_mipmap_fallback=%d hbb=%d swizzle=0x%x macrotile=%d",
+                "ubwc_linear_mipmap_fallback=%d hbb=%d swizzle=0x%x macrotile=%d"
+                " drv=%s mod=c4c5c7p4 wfi=%d eco=%d",
                 info.chip, info.props.enable_tp_ubwc_flag_hint,
                 info.props.has_ubwc_linear_mipmap_fallback, info.highest_bank_bit,
-                info.ubwc_swizzle, info.macrotile_mode);
+                info.ubwc_swizzle, info.macrotile_mode, MESA_GIT_SHA1,
+                (int)!!TU_DEBUG(BLIT_WFI), (int)!!TU_DEBUG(BLIT_ECO));
 
    /* Print a suffix if raytracing is disabled by the SW fuse, in an attempt
     * to avoid confusion when apps don't work.

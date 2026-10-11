@@ -62,6 +62,8 @@ static const struct debug_control tu_debug_options[] = {
    { "noexactahb", TU_DEBUG_NO_EXACT_AHB },
    { "buf2img3d", TU_DEBUG_BUF2IMG_3D },
    { "img_big", TU_DEBUG_IMG_BIG },
+   { "blit_eco", TU_DEBUG_BLIT_ECO },
+   { "blit_wfi", TU_DEBUG_BLIT_WFI },
    { NULL, 0 }
 };
 
@@ -78,7 +80,8 @@ const uint64_t tu_runtime_debug_flags =
    TU_DEBUG_RAST_ORDER | TU_DEBUG_UNALIGNED_STORE |
    TU_DEBUG_LOG_SKIP_GMEM_OPS | TU_DEBUG_3D_LOAD | TU_DEBUG_FDM |
    TU_DEBUG_CONCURRENT_RESOLVES | TU_DEBUG_CONCURRENT_UNRESOLVES |
-   TU_DEBUG_NO_BIN_MERGING | TU_DEBUG_IMAGE_TRACE;
+   TU_DEBUG_NO_BIN_MERGING | TU_DEBUG_IMAGE_TRACE | TU_DEBUG_BLIT_ECO |
+   TU_DEBUG_BLIT_WFI;
 
 os_file_notifier_t tu_debug_notifier;
 struct tu_env tu_env;
