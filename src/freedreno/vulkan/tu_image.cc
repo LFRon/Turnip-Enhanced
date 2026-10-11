@@ -1173,10 +1173,19 @@ tu_android_get_wsi_memory(struct tu_device *dev,
    VkSubresourceLayout a_plane_layouts[TU_MAX_PLANE_COUNT];
    const VkSubresourceLayout *plane_layouts = a_plane_layouts;
    uint64_t modifier;
+   struct vk_android_drm_format_info drm = {0};
+   bool drm_from_layout = false;
 
-   result = vk_android_get_anb_layout(
+   /* Ask for the recovery description in the same metadata pass: for a
+    * compressed (UBWC) buffer the dedicated query below would repeat the
+    * identical vendor queries for the same handle.  The helper only
+    * serves it when its backend allows that (gralloc-4 passthrough);
+    * otherwise drm_from_layout stays false and the dedicated query runs
+    * exactly as before.
+    */
+   result = vk_android_get_anb_layout_with_format(
       img->vk.android_deferred_create_info, &eci, a_plane_layouts,
-      TU_MAX_PLANE_COUNT);
+      TU_MAX_PLANE_COUNT, &drm, &drm_from_layout);
    if (result == VK_ERROR_FEATURE_NOT_PRESENT) {
       /*
        * The gralloc metadata transport identified the buffer but could not
@@ -1186,9 +1195,9 @@ tu_android_get_wsi_memory(struct tu_device *dev,
        * (fourcc, modifier, dimensions) exactly as it does for the
        * driver's own allocations.  Anything inconsistent fails closed.
        */
-      struct vk_android_drm_format_info drm = {0};
-      if (vk_android_get_anb_drm_format(
-             img->vk.android_deferred_create_info, &drm) != VK_SUCCESS ||
+      if ((!drm_from_layout &&
+           vk_android_get_anb_drm_format(
+              img->vk.android_deferred_create_info, &drm) != VK_SUCCESS) ||
           !drm.planes_unverified ||
           !tu_drm_fourcc_matches_format(
              img->vk.android_deferred_create_info->format, drm.drm_fourcc) ||
@@ -1357,15 +1366,21 @@ tu_CreateImage(VkDevice _device,
    VkImageDrmFormatModifierExplicitCreateInfoEXT eci;
    VkSubresourceLayout a_plane_layouts[TU_MAX_PLANE_COUNT];
    if (vk_image_is_android_native_buffer(&image->vk)) {
-      result = vk_android_get_anb_layout(
-         pCreateInfo, &eci, a_plane_layouts, TU_MAX_PLANE_COUNT);
+      /* Same single-pass recovery description as the deferred bind path
+       * in tu_android_get_wsi_memory.
+       */
+      struct vk_android_drm_format_info drm = {0};
+      bool drm_from_layout = false;
+      result = vk_android_get_anb_layout_with_format(
+         pCreateInfo, &eci, a_plane_layouts, TU_MAX_PLANE_COUNT, &drm,
+         &drm_from_layout);
       if (result == VK_ERROR_FEATURE_NOT_PRESENT) {
          /* Vendor metadata resolved the buffer's DRM format/modifier but
           * did not supply geometry we consume (compressed layouts are
           * recomputed by fdl; see tu_android_get_wsi_memory).
           */
-         struct vk_android_drm_format_info drm = {0};
-         if (vk_android_get_anb_drm_format(pCreateInfo, &drm) != VK_SUCCESS ||
+         if ((!drm_from_layout &&
+              vk_android_get_anb_drm_format(pCreateInfo, &drm) != VK_SUCCESS) ||
              !drm.planes_unverified ||
              !tu_drm_fourcc_matches_format(pCreateInfo->format,
                                            drm.drm_fourcc) ||
