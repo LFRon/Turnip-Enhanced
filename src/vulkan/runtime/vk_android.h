@@ -104,6 +104,18 @@ VkResult vk_android_get_anb_layout(
    VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
    VkSubresourceLayout *out_layouts, int max_planes);
 
+/* Same layout query, additionally producing the recovery consumer's DRM
+ * format description from the same metadata pass when the metadata
+ * backend allows it (out_drm_from_layout set to true on success); callers
+ * fall back to vk_android_get_anb_drm_format() when it is false.
+ */
+VkResult vk_android_get_anb_layout_with_format(
+   const VkImageCreateInfo *pCreateInfo,
+   VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
+   VkSubresourceLayout *out_layouts, int max_planes,
+   struct vk_android_drm_format_info *out_drm,
+   bool *out_drm_from_layout);
+
 VkResult vk_android_init_deferred_image(struct vk_device *device,
                                         struct vk_image *image,
                                         const VkImageCreateInfo *pCreateInfo,
@@ -131,6 +143,17 @@ vk_android_get_anb_layout(
    const VkImageCreateInfo *pCreateInfo,
    VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
    VkSubresourceLayout *out_layouts, int max_planes)
+{
+   return VK_ERROR_FEATURE_NOT_PRESENT;
+}
+
+static inline VkResult
+vk_android_get_anb_layout_with_format(
+   const VkImageCreateInfo *pCreateInfo,
+   VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
+   VkSubresourceLayout *out_layouts, int max_planes,
+   struct vk_android_drm_format_info *out_drm,
+   bool *out_drm_from_layout)
 {
    return VK_ERROR_FEATURE_NOT_PRESENT;
 }
