@@ -270,38 +270,47 @@ pt_dump_hex(int64_t key, const uint8_t *data, size_t size)
    }
 }
 
-/* One synchronous get() round-trip; returns the payload after the
- * validated [type-name][value] header, or false.
+/* Every decodable standard value fits comfortably below this bound (the
+ * largest is a four-plane layout), so an oversized vendor blob cannot be
+ * valid metadata: refuse it without copying.
+ */
+constexpr uint32_t PT_MAX_METADATA_BLOB = 64 * 1024;
+
+/* One synchronous get() round-trip.  On success *blob holds the whole
+ * [int64 name length][name][int64 value][payload] stream -- the single
+ * necessary copy out of vendor memory, made inside the callback where
+ * the view is valid -- and *payload_offset points just past the
+ * validated header.  Callers parse their value from the blob directly.
  */
 bool
-pt_get_blob(const struct pt_gralloc *gr, void *buffer, int64_t key,
-            std::vector<uint8_t> *payload)
+pt_query_metadata(const struct pt_gralloc *gr, void *buffer, int64_t key,
+                  std::vector<uint8_t> *blob, size_t *payload_offset)
 {
    bool called = false;
    int32_t error = PT_ERROR_UNSUPPORTED;
-   std::vector<uint8_t> bytes;
+   blob->clear();
 
    GetCb cb = [&](int32_t err, const PtHidlVecU8 &metadata) {
       called = true;
       error = err;
-      if (err == PT_ERROR_NONE && metadata.mBuffer && metadata.mSize) {
-         bytes.assign(metadata.mBuffer,
-                      metadata.mBuffer + metadata.mSize);
+      if (err == PT_ERROR_NONE && metadata.mBuffer && metadata.mSize &&
+          metadata.mSize <= PT_MAX_METADATA_BLOB) {
+         blob->assign(metadata.mBuffer, metadata.mBuffer + metadata.mSize);
       }
    };
 
    PtMetadataType md = make_metadata_type(key);
    gr->get(gr->mapper, buffer, &md, cb);
 
-   if (!called || error != PT_ERROR_NONE || bytes.empty())
+   if (!called || error != PT_ERROR_NONE || blob->empty())
       return false;
 
    /* decodeMetadataType: int64 name length, name bytes, int64 value. */
    size_t pos = 0;
    auto read_i64 = [&](int64_t *out) -> bool {
-      if (pos + sizeof(int64_t) > bytes.size())
+      if (pos + sizeof(int64_t) > blob->size())
          return false;
-      memcpy(out, bytes.data() + pos, sizeof(int64_t));
+      memcpy(out, blob->data() + pos, sizeof(int64_t));
       pos += sizeof(int64_t);
       return true;
    };
@@ -309,9 +318,9 @@ pt_get_blob(const struct pt_gralloc *gr, void *buffer, int64_t key,
    int64_t name_len;
    if (!read_i64(&name_len) || name_len < 0 ||
        (size_t)name_len != strlen(STANDARD_METADATA_NAME) ||
-       pos + (size_t)name_len > bytes.size())
+       pos + (size_t)name_len > blob->size())
       return false;
-   if (memcmp(bytes.data() + pos, STANDARD_METADATA_NAME, (size_t)name_len) != 0)
+   if (memcmp(blob->data() + pos, STANDARD_METADATA_NAME, (size_t)name_len) != 0)
       return false;
    pos += (size_t)name_len;
 
@@ -319,9 +328,9 @@ pt_get_blob(const struct pt_gralloc *gr, void *buffer, int64_t key,
    if (!read_i64(&type_value) || type_value != key)
       return false;
 
-   payload->assign(bytes.begin() + (long)pos, bytes.end());
+   *payload_offset = pos;
    if (pt_debug_enabled())
-      pt_dump_hex(key, payload->data(), payload->size());
+      pt_dump_hex(key, blob->data() + pos, blob->size() - pos);
    return true;
 }
 
@@ -329,12 +338,13 @@ bool
 pt_get_int64(const struct pt_gralloc *gr, void *buffer, int64_t key,
              int64_t *out)
 {
-   std::vector<uint8_t> payload;
-   if (!pt_get_blob(gr, buffer, key, &payload))
+   std::vector<uint8_t> blob;
+   size_t offset = 0;
+   if (!pt_query_metadata(gr, buffer, key, &blob, &offset))
       return false;
-   if (payload.size() < sizeof(int64_t))
+   if (blob.size() - offset < sizeof(int64_t))
       return false;
-   memcpy(out, payload.data(), sizeof(int64_t));
+   memcpy(out, blob.data() + offset, sizeof(int64_t));
    return true;
 }
 
@@ -342,12 +352,13 @@ bool
 pt_get_uint32(const struct pt_gralloc *gr, void *buffer, int64_t key,
               uint32_t *out)
 {
-   std::vector<uint8_t> payload;
-   if (!pt_get_blob(gr, buffer, key, &payload))
+   std::vector<uint8_t> blob;
+   size_t offset = 0;
+   if (!pt_query_metadata(gr, buffer, key, &blob, &offset))
       return false;
-   if (payload.size() < sizeof(uint32_t))
+   if (blob.size() - offset < sizeof(uint32_t))
       return false;
-   memcpy(out, payload.data(), sizeof(uint32_t));
+   memcpy(out, blob.data() + offset, sizeof(uint32_t));
    return true;
 }
 
@@ -399,11 +410,12 @@ bool
 pt_get_extendable_value(const struct pt_gralloc *gr, void *buffer, int64_t key,
                         int64_t *out)
 {
-   std::vector<uint8_t> payload;
-   if (!pt_get_blob(gr, buffer, key, &payload))
+   std::vector<uint8_t> blob;
+   size_t offset = 0;
+   if (!pt_query_metadata(gr, buffer, key, &blob, &offset))
       return false;
 
-   PtReader reader{payload.data(), payload.data() + payload.size()};
+   PtReader reader{blob.data() + offset, blob.data() + blob.size()};
    int64_t value;
    bool standard_component_type;
    if (!reader.read_extendable(&value, &standard_component_type) || !reader.ok)
@@ -443,11 +455,12 @@ bool
 pt_get_plane_layouts(const struct pt_gralloc *gr, void *buffer,
                      std::vector<PtPlaneLayout> *out)
 {
-   std::vector<uint8_t> payload;
-   if (!pt_get_blob(gr, buffer, MD_PLANE_LAYOUTS, &payload))
+   std::vector<uint8_t> blob;
+   size_t offset = 0;
+   if (!pt_query_metadata(gr, buffer, MD_PLANE_LAYOUTS, &blob, &offset))
       return false;
 
-   PtReader reader{payload.data(), payload.data() + payload.size()};
+   PtReader reader{blob.data() + offset, blob.data() + blob.size()};
    int64_t num_planes;
    if (!reader.read_i64(&num_planes) || num_planes <= 0 || num_planes > 4)
       return false;
@@ -654,16 +667,26 @@ pt_get_buffer_basic_info(struct u_gralloc *gralloc,
         */
       const bool compressed = !modifier_claims_linear || metadata_compressed;
 
+      /* A compressed buffer's vendor plane layouts are always discarded
+       * below (the fallback branch reports PLANES_UNVERIFIED and leaves
+       * the geometry to the consumer's own layout rules), so the
+       * heavyweight PLANE_LAYOUTS query is skipped as soon as the
+       * modifier or the COMPRESSION cross-check already prove
+       * compression: the vendor answer could not reach any output.
+       * (planes_decoded then reports that no plane query was made.)
+       */
       std::vector<PtPlaneLayout> planes;
-      bool have_planes = pt_get_plane_layouts(gr, imported, &planes);
-      const bool planes_decoded = have_planes;
+      bool have_planes = false;
+      bool planes_decoded = false;
       bool contradictory = metadata_compressed;
-      if (have_planes && !compressed && planes[0].offsetInBytes != 0) {
-         contradictory = true;
-         have_planes = false;
+      if (!compressed) {
+         have_planes = pt_get_plane_layouts(gr, imported, &planes);
+         planes_decoded = have_planes;
+         if (have_planes && planes[0].offsetInBytes != 0) {
+            contradictory = true;
+            have_planes = false;
+         }
       }
-      if (compressed)
-         have_planes = false;
 
       if (have_planes && !compressed && fourcc == DRM_FORMAT_YVU420 &&
           !pt_normalize_yv12_plane_order(&planes))
@@ -809,9 +832,10 @@ pt_get_buffer_color_info(struct u_gralloc *gralloc,
          out->sample_range = __DRI_YUV_FULL_RANGE;
    }
 
-   std::vector<uint8_t> payload;
-   if (pt_get_blob(gr, imported, MD_CHROMA_SITING, &payload)) {
-      PtReader reader{payload.data(), payload.data() + payload.size()};
+   std::vector<uint8_t> blob;
+   size_t offset = 0;
+   if (pt_query_metadata(gr, imported, MD_CHROMA_SITING, &blob, &offset)) {
+      PtReader reader{blob.data() + offset, blob.data() + blob.size()};
       int64_t name_len;
       if (reader.read_i64(&name_len) && name_len >= 0 &&
           (size_t)name_len <= (size_t)(reader.end - reader.pos)) {
