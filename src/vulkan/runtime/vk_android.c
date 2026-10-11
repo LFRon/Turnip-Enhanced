@@ -105,6 +105,39 @@ vk_android_debug_enabled(void)
    return enabled;
 }
 
+/* Fill the caller's DRM format description from one basic-info answer.
+ * The handle is only read for diagnostics; every output is a function of
+ * the queried buffer alone.
+ */
+static void
+vk_android_drm_format_info_fill(struct u_gralloc_buffer_handle *hnd,
+                                const struct u_gralloc_buffer_basic_info *info,
+                                struct vk_android_drm_format_info *out)
+{
+   if (vk_android_debug_enabled())
+      mesa_logi("vk_android: metadata ok hal_format=0x%x pixel_stride=%d "
+                "fourcc=0x%x modifier=0x%llx planes=%u unverified=%d "
+                "contradictory=%d fourcc_unverified=%d",
+                hnd->hal_format, hnd->pixel_stride, info->drm_fourcc,
+                (unsigned long long)info->modifier, info->num_planes,
+                !!(info->flags & U_GRALLOC_BUFFER_INFO_PLANES_UNVERIFIED),
+                !!(info->flags & U_GRALLOC_BUFFER_INFO_PLANES_CONTRADICTORY),
+                !!(info->flags & U_GRALLOC_BUFFER_INFO_FOURCC_UNVERIFIED));
+
+   *out = (struct vk_android_drm_format_info){
+      .drm_fourcc = info->drm_fourcc,
+      .modifier = info->modifier,
+      .plane_count = (uint32_t)info->num_planes,
+      .planes_unverified =
+         !!(info->flags & U_GRALLOC_BUFFER_INFO_PLANES_UNVERIFIED),
+      .planes_contradictory =
+         !!(info->flags & U_GRALLOC_BUFFER_INFO_PLANES_CONTRADICTORY),
+      .fourcc_unverified =
+         !!(info->flags & U_GRALLOC_BUFFER_INFO_FOURCC_UNVERIFIED),
+   };
+
+}
+
 static VkResult
 vk_android_drm_format_of(struct u_gralloc_buffer_handle *hnd,
                          struct vk_android_drm_format_info *out)
@@ -122,27 +155,7 @@ vk_android_drm_format_of(struct u_gralloc_buffer_handle *hnd,
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
    }
 
-   if (vk_android_debug_enabled())
-      mesa_logi("vk_android: metadata ok hal_format=0x%x pixel_stride=%d "
-                "fourcc=0x%x modifier=0x%llx planes=%u unverified=%d "
-                "contradictory=%d fourcc_unverified=%d",
-                hnd->hal_format, hnd->pixel_stride, info.drm_fourcc,
-                (unsigned long long)info.modifier, info.num_planes,
-                !!(info.flags & U_GRALLOC_BUFFER_INFO_PLANES_UNVERIFIED),
-                !!(info.flags & U_GRALLOC_BUFFER_INFO_PLANES_CONTRADICTORY),
-                !!(info.flags & U_GRALLOC_BUFFER_INFO_FOURCC_UNVERIFIED));
-
-   *out = (struct vk_android_drm_format_info){
-      .drm_fourcc = info.drm_fourcc,
-      .modifier = info.modifier,
-      .plane_count = (uint32_t)info.num_planes,
-      .planes_unverified =
-         !!(info.flags & U_GRALLOC_BUFFER_INFO_PLANES_UNVERIFIED),
-      .planes_contradictory =
-         !!(info.flags & U_GRALLOC_BUFFER_INFO_PLANES_CONTRADICTORY),
-      .fourcc_unverified =
-         !!(info.flags & U_GRALLOC_BUFFER_INFO_FOURCC_UNVERIFIED),
-   };
+   vk_android_drm_format_info_fill(hnd, &info, out);
    return VK_SUCCESS;
 }
 
@@ -276,7 +289,8 @@ vk_gralloc_to_drm_explicit_layout(
    struct u_gralloc_buffer_handle *in_hnd,
    uint32_t platform_fourcc,
    VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
-   VkSubresourceLayout *out_layouts, int max_planes)
+   VkSubresourceLayout *out_layouts, int max_planes,
+   struct u_gralloc_buffer_basic_info *out_info)
 {
    struct u_gralloc_buffer_basic_info info;
    struct u_gralloc *u_gralloc = vk_android_get_ugralloc();
@@ -286,6 +300,12 @@ vk_gralloc_to_drm_explicit_layout(
       mesa_loge("u_gralloc_get_buffer_basic_info failed");
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
    }
+
+   /* Hand the single consumed answer back to callers that would
+    * otherwise repeat this exact query for the same handle.
+    */
+   if (out_info)
+      *out_info = info;
 
    if (info.flags & U_GRALLOC_BUFFER_INFO_PLANES_UNVERIFIED) {
       /* The metadata transport could not supply authoritative plane
@@ -478,6 +498,36 @@ vk_android_get_anb_layout(
    VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
    VkSubresourceLayout *out_layouts, int max_planes)
 {
+   return vk_android_get_anb_layout_with_format(pCreateInfo, out, out_layouts,
+                                                max_planes, NULL, NULL);
+}
+
+/* Layout query variant that also serves the recovery consumer's DRM
+ * format description from the same single metadata pass, so a compressed
+ * (UBWC) import does not repeat identical vendor queries.
+ *
+ * Only a backend whose basic-info answer is a pure function of the
+ * buffer handle qualifies: the gralloc-4 passthrough backend keys every
+ * queried metadata item by the handle alone, and the input-only
+ * hal_format/pixel_stride fields feed diagnostics and an unverified-
+ * geometry fallback that this consumer never reads.  For any other
+ * backend *out_drm_from_layout stays false and the caller keeps using
+ * its dedicated query, leaving that backend's behavior unchanged.
+ *
+ * When filled, the structure is identical to what
+ * vk_android_get_anb_drm_format(pCreateInfo, out) returns: the handle
+ * used for the QTI 10-bit classification is the same
+ * {(int) pCreateInfo->format, stride 0} pair, and the basic-info content
+ * derives from the same buffer handle.
+ */
+VkResult
+vk_android_get_anb_layout_with_format(
+   const VkImageCreateInfo *pCreateInfo,
+   VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
+   VkSubresourceLayout *out_layouts, int max_planes,
+   struct vk_android_drm_format_info *out_drm,
+   bool *out_drm_from_layout)
+{
    const VkNativeBufferANDROID *native_buffer =
       vk_find_struct_const(pCreateInfo->pNext, NATIVE_BUFFER_ANDROID);
 
@@ -487,8 +537,28 @@ vk_android_get_anb_layout(
       .pixel_stride = native_buffer->stride,
    };
 
-   return vk_gralloc_to_drm_explicit_layout(&gr_handle, 0, out,
-                                            out_layouts, max_planes);
+   if (out_drm_from_layout)
+      *out_drm_from_layout = false;
+
+   struct u_gralloc_buffer_basic_info info = {0};
+   VkResult result = vk_gralloc_to_drm_explicit_layout(
+      &gr_handle, 0, out, out_layouts, max_planes, &info);
+
+   if (out_drm != NULL && result == VK_ERROR_FEATURE_NOT_PRESENT &&
+       u_gralloc_get_type(vk_android_get_ugralloc()) ==
+          U_GRALLOC_TYPE_IMAPPER4_PT) {
+      struct u_gralloc_buffer_handle recovery_hnd = {
+         .handle = native_buffer->handle,
+         .hal_format = (int) pCreateInfo->format,
+         .pixel_stride = 0,
+      };
+
+      vk_android_drm_format_info_fill(&recovery_hnd, &info, out_drm);
+      if (out_drm_from_layout)
+         *out_drm_from_layout = true;
+   }
+
+   return result;
 }
 
 VkResult
@@ -857,7 +927,7 @@ vk_android_get_ahb_layout(
    return vk_gralloc_to_drm_explicit_layout(
       &gr_handle,
       vk_android_ahb_platform_fourcc(description.format, description.usage),
-      out, out_layouts, max_planes);
+      out, out_layouts, max_planes, NULL);
 }
 
 /* From the Android hardware_buffer.h header:
