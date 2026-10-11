@@ -590,6 +590,17 @@ r2d_src_buffer(struct tu_cmd_buffer *cmd,
                    TPL1_A2D_SRC_TEXTURE_SIZE(CHIP, .width = width, .height = height),
                    TPL1_A2D_SRC_TEXTURE_BASE(CHIP, .qword = va),
                    TPL1_A2D_SRC_TEXTURE_PITCH(CHIP, .pitch = pitch));
+
+   /* Vendor behavior (reverse-engineered from vendor vulkan.adreno.so, see
+    * plan.md R60/R62): every A7XX 2D copy rewrites the whole source plane
+    * register group, and a single-plane buffer source gets zeros in the
+    * second-plane and flag-surface slots.
+    */
+   if (CHIP >= A7XX) {
+      tu_cs_emit_pkt4(cs, __TPL1_A2D_SRC_TEXTURE_BASE_1<CHIP>({}).reg, 8);
+      for (unsigned i = 0; i < 8; i++)
+         tu_cs_emit(cs, 0);
+   }
 }
 
 template <chip CHIP>
@@ -633,6 +644,14 @@ r2d_src_buffer_unaligned(struct tu_cmd_buffer *cmd,
                    TPL1_A2D_SRC_TEXTURE_SIZE(CHIP, .width = width, .height = height),
                    TPL1_A2D_SRC_TEXTURE_BASE(CHIP, .qword = va),
                    TPL1_A2D_SRC_TEXTURE_PITCH(CHIP, .pitch = pitch));
+
+   /* Same as r2d_src_buffer(): zero the unused second-plane/flag slots, as
+    * the vendor A7XX 2D copy sequence does (reverse-engineered from vendor
+    * vulkan.adreno.so, see plan.md R60/R62).
+    */
+   tu_cs_emit_pkt4(cs, __TPL1_A2D_SRC_TEXTURE_BASE_1<CHIP>({}).reg, 8);
+   for (unsigned i = 0; i < 8; i++)
+      tu_cs_emit(cs, 0);
 }
 
 template <chip CHIP>
@@ -653,6 +672,21 @@ r2d_dst(struct tu_cs *cs, const struct fdl6_view *iview, uint32_t layer,
 
    tu_cs_emit_pkt4(cs, REG_A6XX_RB_A2D_DEST_FLAG_BUFFER_BASE, 3);
    tu_cs_image_flag_ref(cs, iview, layer);
+
+   /* Vendor behavior (reverse-engineered from vendor vulkan.adreno.so, see
+    * plan.md R60/R62): every A7XX 2D copy rewrites the full destination plane
+    * and flag register groups; a single-plane destination gets zeros for its
+    * second plane (BASE_1/PITCH_1/BASE_2) and second flag surface
+    * (FLAG_BASE_1/FLAG_PITCH_1) instead of stale values from a previous copy.
+    */
+   if (CHIP >= A7XX) {
+      tu_cs_emit_pkt4(cs, REG_A6XX_RB_A2D_DEST_BUFFER_BASE_1, 5);
+      for (unsigned i = 0; i < 5; i++)
+         tu_cs_emit(cs, 0);
+      tu_cs_emit_pkt4(cs, REG_A6XX_RB_A2D_DEST_FLAG_BUFFER_BASE_1, 3);
+      for (unsigned i = 0; i < 3; i++)
+         tu_cs_emit(cs, 0);
+   }
 }
 
 static void
@@ -813,8 +847,58 @@ r2d_run(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
    if (cmd->device->physical_device->info->props.blit_wfi_quirk)
       tu_cs_emit_wfi(cs);
 
+   /* Experimental arm (TU_DEBUG=blit_wfi): the vendor blit stream waits
+    * for CP idle before the CP_BLIT when bit 20 of its per-device caps
+    * word is clear (the value of that bit for this chip is not known
+    * yet).  Without the wait an A2D blit can read a buffer before a
+    * preceding operation has finished writing it.  Note the bit24 ECO
+    * wrap arm below already contains its own leading and trailing WFI,
+    * so this arm only matters if the vendor path emits the standalone
+    * WFI as well.  Kept off by default so the default build stays a
+    * single-variable baseline; enable via TU_DEBUG=blit_wfi.
+    * Vendor behavior reverse-engineered from the vendor vulkan.adreno.so
+    * blit emitters (see plan.md R60/R63/R67).
+    */
+   if (cmd->device->physical_device->info->chip == A7XX &&
+       TU_DEBUG(BLIT_WFI))
+      tu_cs_emit_wfi(cs);
+
+   /* Experimental arm (TU_DEBUG=blit_eco): the vendor blit emitter wraps
+    * CP_BLIT in RB_DBG_ECO_CNTL bit 24 (the same bit the QCTDD04536579
+    * quirk sets on A630) for this chip.  The hardware flag guarding this
+    * on the vendor side is bit 3 of a per-device word that its init code
+    * sets only for the A740 rev this driver targets (chip id 0x2760014,
+    * i.e. an A740 with the 0x14 revision; all other chips get a bare
+    * CP_BLIT).  The full vendor sequence is, per the blob's constant
+    * {CP_WAIT_FOR_IDLE, RB_DBG_ECO_CNTL write} pair at file offset
+    * 0x11418 / 0x13a40 / 0x13a48:
+    *   WFI; RB_DBG_ECO_CNTL |= bit24; CP_BLIT(SCALE); WFI; RB_DBG_ECO_CNTL &= ~bit24
+    * The value written with bit 24 set is 0x05100000 (= the a6xx base
+    * value 0x04100000 with bit24 added), the same "blit" value the
+    * magic regs use for A630.  Kept behind a debug flag until a device
+    * run confirms it; reverse-engineered from the vendor vulkan.adreno.so
+    * blit emitters (see plan.md R63/R64/R67).
+    */
+   if (cmd->device->physical_device->info->chip == A7XX &&
+       TU_DEBUG(BLIT_ECO)) {
+      tu_cs_emit_wfi(cs);
+      cs->rmw(A6XX_RB_DBG_ECO_CNTL(), {
+         .src0 = ~BITFIELD_BIT(24),
+         .src1 =  BITFIELD_BIT(24),
+      });
+   }
+
    tu_cs_emit_pkt7(cs, CP_BLIT, 1);
    tu_cs_emit(cs, CP_BLIT_0_OP(BLIT_OP_SCALE));
+
+   if (cmd->device->physical_device->info->chip == A7XX &&
+       TU_DEBUG(BLIT_ECO)) {
+      tu_cs_emit_wfi(cs);
+      cs->rmw(A6XX_RB_DBG_ECO_CNTL(), {
+         .src0 = ~BITFIELD_BIT(24),
+         .src1 =  0,
+      });
+   }
 
    if (FD_QUIRK(cmd->device->physical_device->info, QCTDD04536579)) {
       tu_cs_emit_wfi(cs);
