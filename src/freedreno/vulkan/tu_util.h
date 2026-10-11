@@ -80,6 +80,8 @@ enum tu_debug_flags : uint64_t
    TU_DEBUG_NO_EXACT_AHB             = BITFIELD64_BIT(41),
    TU_DEBUG_BUF2IMG_3D               = BITFIELD64_BIT(42),
    TU_DEBUG_IMG_BIG                  = BITFIELD64_BIT(43),
+   TU_DEBUG_BLIT_ECO                 = BITFIELD64_BIT(44),
+   TU_DEBUG_BLIT_WFI                 = BITFIELD64_BIT(45),
 };
 
 struct tu_env {
