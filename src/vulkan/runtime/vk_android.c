@@ -1527,6 +1527,50 @@ finish:
     */
    p->formatFeatures |= VK_FORMAT_FEATURE_2_MIDPOINT_CHROMA_SAMPLES_BIT_KHR;
 
+   /* VK_ANDROID_external_format_resolve: an external format that has a
+    * resolve (color-attachment) format is renderable through the resolve
+    * path, which the driver advertises as
+    * VK_ANDROID_external_format_resolve.  Report COLOR_ATTACHMENT on the
+    * public vkGetAndroidHardwareBufferPropertiesANDROID path whenever the
+    * buffer itself declares AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER, and not
+    * only when the caller chains the resolve properties (upstream Mesa does
+    * the latter since commit b64cd520f78 "vulkan/android: Set
+    * COLOR_ATTACHMENT_BIT for external format resolve").
+    *
+    * Compatibility for ANGLE's AHardwareBuffer import (GLES-over-Vulkan):
+    * HardwareBufferImageSiblingVkAndroid::CheckFormatSupport requires
+    * COLOR_ATTACHMENT in formatFeatures as soon as the AHB usage contains
+    * GPU_FRAMEBUFFER, but deployed builds do not chain the resolve
+    * properties during that validation.  Buffers such as WeChat's decoder
+    * output (usage GPU_SAMPLED_IMAGE|GPU_FRAMEBUFFER, QTI NV12/UBWC) were
+    * therefore rejected with EGL_BAD_PARAMETER, making eglCreateImageKHR
+    * fail for every frame (black video).  This is a pure Vulkan-side
+    * capability report; no private gralloc API is involved.  The resolve
+    * contract remains enforced at image creation (callers must chain the
+    * resolve properties and enable the extension feature), and a caller
+    * that does chain them still gets the same bit.  The external-format
+    * path only (format == VK_FORMAT_UNDEFINED): buffers whose format is in
+    * the format-equivalence table take their features straight from that
+    * format's own properties instead.  The resolve mapping is limited to
+    * the eight-bit recipe (R8G8B8A8 color attachment) that this tree
+    * verifies for its direct external-format path; ten-bit resolve stays
+    * governed by the chained path and its per-buffer fail-safe.  See
+    * plan.md R74/R75.
+    */
+   if (p->format == VK_FORMAT_UNDEFINED &&
+       (desc.usage & AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER) != 0 &&
+       device->physical->supported_extensions.ANDROID_external_format_resolve &&
+       vk_external_format_to_efr_format(external_format) ==
+          VK_FORMAT_R8G8B8A8_UNORM)
+      p->formatFeatures |= VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT;
+
+   if (vk_android_debug_enabled())
+      mesa_logi("vk_android: [ahb] final features=0x%x cb=%d externalFormat=0x%llx"
+                " usage=0x%" PRIx64,
+                (unsigned)p->formatFeatures,
+                !!(p->formatFeatures & VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT),
+                (unsigned long long)p->externalFormat, desc.usage);
+
    return VK_SUCCESS;
 }
 
