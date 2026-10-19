@@ -512,7 +512,17 @@ vk_physical_device_entrypoint_is_enabled(int index, uint32_t core_version,
 % for e in physical_device_entrypoints:
    case ${e.entry_table_index}:
       /* ${e.name} */
-   % if e.core_version:
+   % if e.name == 'GetPhysicalDeviceImageFormatProperties2':
+      /* The Android loader reads this entrypoint's core name through
+       * GetInstanceProcAddr for instances of every apiVersion while it
+       * initializes its driver dispatch table, and then calls the stored
+       * pointer without a NULL check (SupportsSurfaceFormat, used to decide
+       * whether R8G8B8 has to be reported as a surface format).  Keep it
+       * queryable regardless of the version the instance requested;
+       * filtering what applications can see is the loader's responsibility.
+       */
+      return true;
+   % elif e.core_version:
       return ${e.core_version.c_vk_version()} <= core_version;
    % elif e.extensions:
      % for ext in e.extensions:
