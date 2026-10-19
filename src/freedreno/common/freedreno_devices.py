@@ -1331,6 +1331,8 @@ add_gpus([
     ))
 
 add_gpus([
+        GPUId(chip_id=0x43051400, name="FD750"), # KGSL, pineapple v1 DTS chipid
+        GPUId(chip_id=0xffff43051400, name="FD750"), # Default no-speedbin fallback
         GPUId(chip_id=0x43051401, name="FD750"), # KGSL, no speedbin data
         GPUId(chip_id=0xffff43051401, name="FD750"), # Default no-speedbin fallback
         GPUId(chip_id=0xffff43051701, name="Adreno (TM) 753"),
