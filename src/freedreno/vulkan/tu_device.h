@@ -30,6 +30,11 @@
 #include "tu_suballoc.h"
 #include "tu_util.h"
 
+/* Bumped whenever a device frees its BO array.  Debug caches that hold raw
+ * tu_bo pointers compare this to detect a destroyed or recreated device.
+ */
+extern uint64_t tu_device_generation;
+
 /* queue types */
 #define TU_QUEUE_GENERAL 0
 
