@@ -3051,9 +3051,15 @@ tu_copy_buffer_to_image(struct tu_cmd_buffer *cmd,
          vk_buffer_address(&src_buffer->vk, info->bufferOffset) - bo->iova;
 
       if (!bo->map)
-         tu_bo_map(cmd->device, bo, NULL);
+         (void) tu_bo_map(cmd->device, bo, NULL);
 
-      if (bo->map && va_off + (uint64_t)pitch * 2 + 16 <= bo->size) {
+      const uint64_t src_pitch = (uint64_t)src_width * block_size;
+      const uint64_t src_span = src_pitch * 2 + 16;
+
+      if (bo->map && (uintptr_t)bo->map != (uintptr_t)-1 &&
+          bo->gem_handle != 0 &&
+          src_pitch <= UINT32_MAX && src_pitch >= 64 &&
+          va_off <= bo->size && src_span <= bo->size - va_off) {
          const uint8_t *p = (const uint8_t *)bo->map + va_off;
          uint32_t n = MIN2(extent.width, 512);
          uint64_t d0 = 0, d1 = 0;
@@ -3061,8 +3067,8 @@ tu_copy_buffer_to_image(struct tu_cmd_buffer *cmd,
          for (uint32_t i = 0; i + 1 < n; i++) {
             int a = p[(uint64_t)i * block_size];
             int b = p[(uint64_t)(i + 1) * block_size];
-            int c = p[pitch + (uint64_t)i * block_size];
-            int d = p[pitch + (uint64_t)(i + 1) * block_size];
+            int c = p[src_pitch + (uint64_t)i * block_size];
+            int d = p[src_pitch + (uint64_t)(i + 1) * block_size];
             d0 += a > b ? a - b : b - a;
             d1 += c > d ? c - d : d - c;
          }
@@ -3089,9 +3095,52 @@ tu_copy_buffer_to_image(struct tu_cmd_buffer *cmd,
    }
 
    {
-      static thread_local struct tu_bo *trace_bo;
-      static thread_local uint64_t trace_off, trace_size, trace_id, trace_data_off;
-      static thread_local struct tu_cmd_buffer *trace_cmd;
+      /* tu_bo storage lives in the device's util_sparse_array, which
+       * tu_device_finish() frees regardless of the BO refcount.  Tag the
+       * cache with its device and a global generation, and never touch a
+       * cached BO after that device has been destroyed.
+       */
+      struct tu_trace_cache {
+         struct tu_bo *bo;
+         struct tu_device *device;
+         uint64_t generation;
+         uint64_t unique_id;
+         uint64_t off;
+         uint64_t size;
+         uint64_t id;
+         uint64_t data_off;
+         struct tu_cmd_buffer *cmd;
+      };
+      static thread_local struct tu_trace_cache trace;
+
+      const uint64_t generation = p_atomic_read(&tu_device_generation);
+
+      if (trace.bo &&
+          (trace.device != cmd->device || trace.generation != generation)) {
+         /* The BO may belong to a destroyed device: do not dereference it
+          * and do not release it, because the device's BO array is gone as
+          * a whole.  Dropping the reference is a bounded leak in this
+          * diagnostic-only path.
+          */
+         trace.bo = NULL;
+         trace.device = NULL;
+         trace.generation = 0;
+         trace.unique_id = 0;
+         trace.off = trace.size = trace.id = trace.data_off = 0;
+         trace.cmd = NULL;
+      } else if (trace.bo && trace.unique_id &&
+                 trace.bo->unique_id != trace.unique_id) {
+         /* The BO slot was reused for a different buffer.  Do not release
+          * the cached reference here: it no longer identifies the original
+          * BO, and the slot now belongs to the new owner.
+          */
+         trace.bo = NULL;
+         trace.device = NULL;
+         trace.generation = 0;
+         trace.unique_id = 0;
+         trace.off = trace.size = trace.id = trace.data_off = 0;
+         trace.cmd = NULL;
+      }
 
       /* 512 KiB instead of 1 MiB so that the 1080x144/171 upload strips of
        * the corrupted Chrome pages (size 634880/774144) are read back too
@@ -3100,15 +3149,23 @@ tu_copy_buffer_to_image(struct tu_cmd_buffer *cmd,
        */
       if (TU_IMG_TRACE(extent.width) && dst_image->total_size >= (1u << 19) &&
           extent.width >= 512 && dst_image->mem && dst_image->mem->bo) {
-         if (trace_bo && trace_bo != dst_image->mem->bo) {
-            if (!trace_bo->map)
-               tu_bo_map(cmd->device, trace_bo, NULL);
-            if (trace_bo->map && trace_off + trace_size <= trace_bo->size &&
-                trace_data_off + 4100 <= trace_size) {
-               const uint8_t *q0 = (const uint8_t *)trace_bo->map + trace_off;
-               const uint8_t *qm = q0 + trace_size / 2;
-               const uint8_t *qe = q0 + trace_size - 64;
-               const uint8_t *qd = q0 + trace_data_off;
+         if (trace.bo && trace.bo != dst_image->mem->bo) {
+            if (!trace.bo->map)
+               (void) tu_bo_map(cmd->device, trace.bo, NULL);
+
+            const bool readable =
+               trace.bo->gem_handle != 0 && trace.bo->map &&
+               (uintptr_t)trace.bo->map != (uintptr_t)-1 &&
+               trace.off <= trace.bo->size &&
+               trace.size <= trace.bo->size - trace.off &&
+               trace.size >= 4100 &&
+               trace.data_off <= trace.size - 4100;
+
+            if (readable) {
+               const uint8_t *q0 = (const uint8_t *)trace.bo->map + trace.off;
+               const uint8_t *qm = q0 + trace.size / 2;
+               const uint8_t *qe = q0 + trace.size - 64;
+               const uint8_t *qd = q0 + trace.data_off;
                mesa_logi("TU_IMAGE_TRACE:   dst-check id=%" PRIu64
                          " size=%" PRIu64 " off=%" PRIu64 " doff=%" PRIu64
                          " samecb=%d"
@@ -3116,8 +3173,8 @@ tu_copy_buffer_to_image(struct tu_cmd_buffer *cmd,
                          " mid=%02x%02x%02x%02x end=%02x%02x%02x%02x "
                          "s0=%02x%02x%02x%02x s4k=%02x%02x%02x%02x"
                          " d0=%02x%02x%02x%02x d4k=%02x%02x%02x%02x",
-                         trace_id, trace_size, trace_off, trace_data_off,
-                         (int)(trace_cmd == cmd),
+                         trace.id, trace.size, trace.off, trace.data_off,
+                         (int)(trace.cmd == cmd),
                          q0[0], q0[1], q0[2], q0[3],
                          qm[0], qm[1], qm[2], qm[3],
                          qe[0], qe[1], qe[2], qe[3],
@@ -3128,19 +3185,22 @@ tu_copy_buffer_to_image(struct tu_cmd_buffer *cmd,
             } else {
                mesa_logi("TU_IMAGE_TRACE:   dst-check id=%" PRIu64
                          " unavailable map=%p off=%" PRIu64 " size=%" PRIu64,
-                         trace_id, trace_bo->map, trace_off, trace_size);
+                         trace.id, trace.bo->map, trace.off, trace.size);
             }
          }
-         if (trace_bo != dst_image->mem->bo) {
-            if (trace_bo)
-               tu_bo_finish(cmd->device, trace_bo);
-            trace_bo = tu_bo_get_ref(dst_image->mem->bo);
+         if (trace.bo != dst_image->mem->bo) {
+            if (trace.bo)
+               tu_bo_finish(cmd->device, trace.bo);
+            trace.bo = tu_bo_get_ref(dst_image->mem->bo);
+            trace.device = cmd->device;
+            trace.generation = generation;
+            trace.unique_id = trace.bo->unique_id;
          }
-         trace_off = dst_image->mem_offset;
-         trace_size = dst_image->total_size;
-         trace_id = dst_image->id;
-         trace_data_off = dst_image->layout[0].slices[0].offset;
-         trace_cmd = cmd;
+         trace.off = dst_image->mem_offset;
+         trace.size = dst_image->total_size;
+         trace.id = dst_image->id;
+         trace.data_off = dst_image->layout[0].slices[0].offset;
+         trace.cmd = cmd;
       }
    }
 

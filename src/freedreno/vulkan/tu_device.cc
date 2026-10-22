@@ -58,6 +58,7 @@
 #endif
 
 uint64_t os_page_size = 4096;
+uint64_t tu_device_generation;
 
 static bool
 tu_device_get_build_id(blake3_hasher *ctx)
@@ -3802,6 +3803,7 @@ fail_global_bo:
    if (physical_device->has_set_iova)
       util_vma_heap_finish(&device->vma);
 fail_free_zombie_vma:
+   p_atomic_inc(&tu_device_generation);
    util_sparse_array_finish(&device->bo_map);
    u_vector_finish(&device->zombie_vmas);
    ir3_compiler_destroy(device->compiler);
@@ -3935,6 +3937,7 @@ tu_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
    if (device->physical_device->has_set_iova)
       util_vma_heap_finish(&device->vma);
 
+   p_atomic_inc(&tu_device_generation);
    util_sparse_array_finish(&device->bo_map);
    tu_device_destroy_mutexes(device);
 
