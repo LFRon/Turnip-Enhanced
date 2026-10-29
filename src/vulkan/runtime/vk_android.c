@@ -1059,6 +1059,14 @@ vk_android_ahb_platform_fourcc(uint32_t ahb_format, uint64_t ahb_usage)
    switch (ahb_format) {
    case AHARDWAREBUFFER_FORMAT_Y8Cb8Cr8_420:
       return DRM_FORMAT_NV12;
+   case AHARDWAREBUFFER_FORMAT_YCbCr_P010:
+      /* Ten-bit formats normally hide behind IMPLEMENTATION_DEFINED, where
+       * only the vendor modifier tells the packing apart.  P010 is the
+       * exception: 0x36 is both the NDK AHardwareBuffer format and the HAL
+       * PixelFormat, so the platform format alone pins the identity.  The
+       * modifier is still reported next to it and still drives the tiling.
+       */
+      return DRM_FORMAT_P010;
    case AHARDWAREBUFFER_FORMAT_IMPLEMENTATION_DEFINED:
       if (ahb_usage & AHARDWAREBUFFER_USAGE_CAMERA_MASK)
          return DRM_FORMAT_NV12;
