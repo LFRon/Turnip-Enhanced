@@ -1105,6 +1105,12 @@ tu_drm_fourcc_matches_format(VkFormat vk_format, uint32_t fourcc)
       return vk_format == VK_FORMAT_G8_B8R8_2PLANE_420_UNORM;
    case DRM_FORMAT_YVU420:
       return vk_format == VK_FORMAT_G8_B8_R8_3PLANE_420_UNORM;
+   case DRM_FORMAT_P010:
+      /* Qualcomm hands P010 out as DRM_FORMAT_NV12 plus the DX modifier;
+       * vk_android resolves that to DRM_FORMAT_P010 before this check.
+       */
+      return vk_format ==
+             VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16;
    case fourcc_code('A', 'B', '2', '4'): /* AB24 = RGBA byte order */
    case fourcc_code('X', 'B', '2', '4'): /* XB24 = RGBX byte order */
       return vk_format == VK_FORMAT_R8G8B8A8_UNORM;
