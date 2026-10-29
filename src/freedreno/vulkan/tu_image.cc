@@ -13,6 +13,8 @@
 
 #include "drm-uapi/drm_fourcc.h"
 
+#include "util/u_gralloc/u_gralloc_qti_semantics.h"
+
 #include "util/format/u_format.h"
 #include "util/u_atomic.h"
 #include "util/u_debug.h"
@@ -834,6 +836,21 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
       force_linear_tile = true;
    }
 
+   /* Qualcomm reports the memory layout of its buffers through vendor flags in
+    * the modifier (display/drm/sde_drm.h) instead of the generic DRM tokens,
+    * so a QTI modifier never compares equal to one of them and the layout only
+    * follows from the flags: COMPRESSED/TILE describe an UBWC-shaped
+    * allocation, every other combination a linear one -- notably DX on its
+    * own, which is how gralloc reports a linear P010 buffer.
+    */
+   const uint64_t qti_modifier_flags = u_gralloc_qti_modifier_flags(modifier);
+   const uint64_t qti_ubwc_flags =
+      qti_modifier_flags &
+      (U_GRALLOC_QTI_MOD_COMPRESSED | U_GRALLOC_QTI_MOD_TILE);
+
+   if (qti_modifier_flags && !qti_ubwc_flags)
+      force_linear_tile = true;
+
    if (force_linear_tile) {
       tile_mode = TILE6_LINEAR;
       ubwc_enabled = false;
@@ -847,8 +864,7 @@ tu_image_init(struct tu_device *device, struct tu_image *image,
     * UBWC, then override how the image was created.
     */
    bool force_ubwc = false;
-   if (fourcc_mod_is_vendor(modifier, QCOM) &&
-       (modifier & DRM_FORMAT_MOD_QCOM_COMPRESSED)) {
+   if (qti_ubwc_flags) {
       assert(!force_linear_tile);
       ubwc_enabled = true;
       force_ubwc = true;
@@ -1130,8 +1146,16 @@ tu_recovered_layout_is_provable(const struct vk_android_drm_format_info *drm)
    const uint64_t modifier = drm->planes_contradictory
                                 ? DRM_FORMAT_MOD_QCOM_COMPRESSED
                                 : drm->modifier;
-   return modifier == DRM_FORMAT_MOD_LINEAR ||
-          modifier == DRM_FORMAT_MOD_QCOM_COMPRESSED;
+   if (modifier == DRM_FORMAT_MOD_LINEAR)
+      return true;
+
+   /* The QTI UBWC family adds vendor flags (DX for ten-bit, TIGHT for the
+    * 4/3 packed variant) on top of COMPRESSED/TILE, so compare flags rather
+    * than the whole token.
+    */
+   const uint64_t qti_flags = u_gralloc_qti_modifier_flags(modifier);
+   return (qti_flags &
+           (U_GRALLOC_QTI_MOD_COMPRESSED | U_GRALLOC_QTI_MOD_TILE)) != 0;
 }
 
 /* Deferred ANB image support for ANB v8+ aliased images. */

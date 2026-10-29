@@ -43,6 +43,7 @@
 #include "util/log.h"
 #include "util/os_file.h"
 #include "util/u_gralloc/u_gralloc.h"
+#include "util/u_gralloc/u_gralloc_qti_semantics.h"
 
 #include <hardware/gralloc.h>
 #include <hardware/hardware.h>
@@ -105,6 +106,42 @@ vk_android_debug_enabled(void)
    return enabled;
 }
 
+/* Qualcomm reports its packed ten-bit buffers under the DRM_FORMAT_NV12
+ * identity; the real packing only lives in the QCOM vendor modifier flags
+ * (display/drm/sde_drm.h).  P010 has a native Vulkan format, so report the
+ * fourcc that describes what the buffer really holds and let the driver lay
+ * it out from (fourcc, modifier, dimensions).
+ *
+ * TP10 (4/3 packed) has no Vulkan format, so keep the NV12 identity: both
+ * the external format and the recovered layout are eight-bit then.  Failing
+ * the import instead would make SurfaceFlinger abort, as it treats a failed
+ * texture import as fatal, the moment an HDR surface appears, and the
+ * eight-bit layout is strictly smaller than the 4/3 packed one, so sampling
+ * stays inside the allocation.
+ */
+static uint32_t
+vk_android_resolve_qti_ten_bit(uint32_t drm_fourcc, uint64_t modifier)
+{
+   if (drm_fourcc != DRM_FORMAT_NV12)
+      return drm_fourcc;
+
+   const uint64_t qti_flags = u_gralloc_qti_modifier_flags(modifier);
+   if (qti_flags & U_GRALLOC_QTI_MOD_TIGHT) {
+      mesa_logw_once("vk_android: QTI TP10 (4/3 packed) buffer imported as "
+                     "8-bit NV12 (modifier=0x%llx)",
+                     (unsigned long long)modifier);
+      return DRM_FORMAT_NV12;
+   }
+
+   if (!(qti_flags & U_GRALLOC_QTI_MOD_DX))
+      return DRM_FORMAT_NV12;
+
+   if (vk_android_debug_enabled())
+      mesa_logi("vk_android: QTI P010 packing resolved from the QCOM DX "
+                "modifier (modifier=0x%llx)", (unsigned long long)modifier);
+   return DRM_FORMAT_P010;
+}
+
 /* Fill the caller's DRM format description from one basic-info answer.
  * The handle is only read for diagnostics; every output is a function of
  * the queried buffer alone.
@@ -125,7 +162,8 @@ vk_android_drm_format_info_fill(struct u_gralloc_buffer_handle *hnd,
                 !!(info->flags & U_GRALLOC_BUFFER_INFO_FOURCC_UNVERIFIED));
 
    *out = (struct vk_android_drm_format_info){
-      .drm_fourcc = info->drm_fourcc,
+      .drm_fourcc = vk_android_resolve_qti_ten_bit(info->drm_fourcc,
+                                                   info->modifier),
       .modifier = info->modifier,
       .plane_count = (uint32_t)info->num_planes,
       .planes_unverified =
@@ -135,7 +173,6 @@ vk_android_drm_format_info_fill(struct u_gralloc_buffer_handle *hnd,
       .fourcc_unverified =
          !!(info->flags & U_GRALLOC_BUFFER_INFO_FOURCC_UNVERIFIED),
    };
-
 }
 
 static VkResult
@@ -210,7 +247,8 @@ vk_android_get_ahb_drm_format(struct AHardwareBuffer *buffer,
       uint32_t platform_fourcc =
          vk_android_ahb_platform_fourcc(desc.format, desc.usage);
       if (platform_fourcc != 0)
-         out->drm_fourcc = platform_fourcc;
+         out->drm_fourcc = vk_android_resolve_qti_ten_bit(platform_fourcc,
+                                                          out->modifier);
    }
 
    return VK_SUCCESS;
@@ -515,10 +553,9 @@ vk_android_get_anb_layout(
  * its dedicated query, leaving that backend's behavior unchanged.
  *
  * When filled, the structure is identical to what
- * vk_android_get_anb_drm_format(pCreateInfo, out) returns: the handle
- * used for the QTI 10-bit classification is the same
- * {(int) pCreateInfo->format, stride 0} pair, and the basic-info content
- * derives from the same buffer handle.
+ * vk_android_get_anb_drm_format(pCreateInfo, out) returns: the buffer
+ * handle is queried the same way and the basic-info content derives from
+ * it.
  */
 VkResult
 vk_android_get_anb_layout_with_format(
@@ -1419,6 +1456,13 @@ get_ahb_buffer_format_properties2(
          return VK_ERROR_INVALID_EXTERNAL_HANDLE;
       }
    }
+
+   /* Resolve the packing that the QTI vendor modifier flags add to the DRM
+    * identity gralloc reports, so that an image created from this external
+    * format and the layout recovered for it agree.
+    */
+   info.drm_fourcc = vk_android_resolve_qti_ten_bit(info.drm_fourcc,
+                                                    info.modifier);
 
    switch (info.drm_fourcc) {
    case DRM_FORMAT_YVU420:
