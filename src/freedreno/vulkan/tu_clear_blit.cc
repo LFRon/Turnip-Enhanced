@@ -190,7 +190,7 @@ format_to_ifmt(enum pipe_format format)
       return R2D_FLOAT32;
    if (format == PIPE_FORMAT_S8_UINT)
       return R2D_INT8;
-   if (format == PIPE_FORMAT_A8_UNORM)
+   if (format == PIPE_FORMAT_A8_UNORM || format == PIPE_FORMAT_Y8_UNORM)
       return R2D_UNORM8;
    if (format == PIPE_FORMAT_R9G9B9E5_FLOAT)
       return R2D_FLOAT16;
@@ -433,6 +433,9 @@ r2d_clear_value(struct tu_cmd_buffer *cmd,
                 const VkClearValue *val)
 {
    uint32_t clear_value[4] = {};
+
+   if (format == PIPE_FORMAT_Y8_UNORM)
+      format = PIPE_FORMAT_R8_UNORM;
 
    switch (format) {
    case PIPE_FORMAT_Z24_UNORM_S8_UINT:
@@ -707,6 +710,19 @@ r2d_dst_buffer(struct tu_cs *cs, enum pipe_format format, uint64_t va, uint32_t 
                    A6XX_RB_A2D_DEST_BUFFER_PITCH(pitch));
 }
 
+static bool
+r2d_format_is_yuv(enum a6xx_format fmt)
+{
+   switch (fmt) {
+   case FMT6_NV12_Y:
+   case FMT6_P010_Y:
+   case FMT6_P010_UV:
+      return true;
+   default:
+      return false;
+   }
+}
+
 template <chip CHIP>
 static void
 r2d_setup_common(struct tu_cmd_buffer *cmd,
@@ -726,6 +742,13 @@ r2d_setup_common(struct tu_cmd_buffer *cmd,
    enum a6xx_format fmt = blit_base_format<CHIP>(dst_format, ubwc, false);
    fixup_dst_format(src_format, &dst_format, &fmt);
    enum adreno_2d_ifmt ifmt = format_to_ifmt(dst_format);
+
+   /* Like the destination, RB and GRAS have to use FMT6_NV12_Y for the Y
+    * plane of NV12 when it's compressed.
+    */
+   enum a6xx_format blt_fmt =
+      dst_format == PIPE_FORMAT_Y8_UNORM && ubwc ? FMT6_NV12_Y : fmt;
+   bool is_yuv = r2d_format_is_yuv(blt_fmt);
 
    enum a6xx_a2d_pixel_op pixel_op = PIXEL_OP_DISABLED;
    enum adreno_rb_blend_factor color_src_factor = FACTOR_ZERO;
@@ -760,21 +783,25 @@ r2d_setup_common(struct tu_cmd_buffer *cmd,
    tu_cs_emit_regs(cs, A6XX_RB_A2D_BLT_CNTL(
       .rotate = static_cast<enum a6xx_rotation>(blit_param),
       .solid_color = clear,
-      .color_format = fmt,
+      .color_format = blt_fmt,
       .scissor = scissor,
-      .is_src_yuv = fmt == FMT6_Z24_UNORM_S8_UINT_AS_R8G8B8A8 && !clear,
+      .is_src_yuv = (fmt == FMT6_Z24_UNORM_S8_UINT_AS_R8G8B8A8 && !clear) ||
+                    is_yuv,
       .mask = 0xf,
       .ifmt = util_format_is_srgb(dst_format) ? R2D_UNORM8_SRGB : ifmt,
+      .linear_yuv = is_yuv,
    ));
 
    tu_cs_emit_regs(cs, GRAS_A2D_BLT_CNTL(CHIP,
       .rotate = static_cast<enum a6xx_rotation>(blit_param),
       .solid_color = clear,
-      .color_format = fmt,
+      .color_format = blt_fmt,
       .scissor = scissor,
-      .is_src_yuv = fmt == FMT6_Z24_UNORM_S8_UINT_AS_R8G8B8A8 && !clear,
+      .is_src_yuv = (fmt == FMT6_Z24_UNORM_S8_UINT_AS_R8G8B8A8 && !clear) ||
+                    is_yuv,
       .mask = 0xf,
       .ifmt = util_format_is_srgb(dst_format) ? R2D_UNORM8_SRGB : ifmt,
+      .linear_yuv = is_yuv,
    ));
 
    if (CHIP > A6XX) {
@@ -3045,16 +3072,10 @@ tu_copy_buffer_to_image(struct tu_cmd_buffer *cmd,
       src_format = PIPE_FORMAT_S8_UINT;
    }
 
-   /* note: could use "R8_UNORM" when no UBWC */
    bool has_unaligned = CHIP >= A7XX; /* If unaligned buffer copies are supported. */
    if (TU_DEBUG(COPY_SLOW))
       has_unaligned = false;
    unsigned blit_param = 0;
-   if (src_format == PIPE_FORMAT_Y8_UNORM) {
-      ops = &r3d_ops<CHIP>;
-      blit_param = R3D_COPY;
-      has_unaligned = false;
-   }
    if (TU_DEBUG(BUF2IMG_3D) && dst_image->layout[0].ubwc &&
        !util_format_is_depth_or_stencil(dst_format) &&
        dst_image->layout[0].nr_samples == 1 &&
@@ -3498,12 +3519,7 @@ tu_copy_image_to_buffer(struct tu_cmd_buffer *cmd,
       dst_format = PIPE_FORMAT_S8_UINT;
    }
 
-   /* note: could use "R8_UNORM" when no UBWC */
    unsigned blit_param = 0;
-   if (dst_format == PIPE_FORMAT_Y8_UNORM) {
-      ops = &r3d_ops<CHIP>;
-      blit_param = R3D_COPY;
-   }
 
    VkOffset3D offset = info->imageOffset;
    VkExtent3D extent = info->imageExtent;
@@ -3767,12 +3783,9 @@ tu_copy_image_to_image(struct tu_cmd_buffer *cmd,
    enum pipe_format dst_format = copy_format(dst_image->vk.format, info->dstSubresource.aspectMask);
    enum pipe_format src_format = copy_format(src_image->vk.format, info->srcSubresource.aspectMask);
 
-   /* note: could use "R8_UNORM" when no UBWC */
    unsigned blit_param = 0;
-   if (dst_format == PIPE_FORMAT_Y8_UNORM ||
-       src_format == PIPE_FORMAT_Y8_UNORM ||
-       (is_msaa && (util_format_is_float16(src_format) ||
-                    util_format_is_float16(dst_format)))) {
+   if (is_msaa && (util_format_is_float16(src_format) ||
+                   util_format_is_float16(dst_format))) {
       ops = &r3d_ops<CHIP>;
       blit_param = R3D_COPY;
    }
