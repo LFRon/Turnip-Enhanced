@@ -610,10 +610,20 @@ tu_get_features(struct tu_physical_device *pdevice,
    /* Vulkan 1.4 */
    features->pushDescriptor = true;
 
+   /* The RT feature structs must agree with the extension table.  On A6XX
+    * has_ray_intersection is false; on fused A7XX/A8XX parts the KNL fuse can
+    * also disable RT.  Do not advertise RT feature bits in either case.
+    */
+   const bool has_raytracing =
+      pdevice->info->props.has_ray_intersection &&
+      (!pdevice->info->props.has_sw_fuse || pdevice->has_raytracing);
+
    /* VK_KHR_acceleration_structure */
-   features->accelerationStructure = true;
-   features->accelerationStructureCaptureReplay = pdevice->has_set_iova;
-   features->descriptorBindingAccelerationStructureUpdateAfterBind = true;
+   features->accelerationStructure = has_raytracing;
+   features->accelerationStructureCaptureReplay =
+      has_raytracing && pdevice->has_set_iova;
+   features->descriptorBindingAccelerationStructureUpdateAfterBind =
+      has_raytracing;
 
    /* VK_KHR_compute_shader_derivatives */
    features->computeDerivativeGroupQuads = pdevice->info->chip >= 7;
@@ -875,23 +885,25 @@ tu_get_features(struct tu_physical_device *pdevice,
    features->rasterizationOrderStencilAttachmentAccess = true;
 
    /* VK_KHR_ray_query */
-   features->rayQuery = true;
+   features->rayQuery = has_raytracing;
 
    /* VK_KHR_ray_tracing_pipeline */
-   features->rayTracingPipeline = true;
-   features->rayTracingPipelineTraceRaysIndirect = true;
-   features->rayTracingPipelineShaderGroupHandleCaptureReplay = true;
-   features->rayTracingPipelineShaderGroupHandleCaptureReplayMixed = true;
-   features->rayTraversalPrimitiveCulling = true;
+   features->rayTracingPipeline = has_raytracing;
+   features->rayTracingPipelineTraceRaysIndirect = has_raytracing;
+   features->rayTracingPipelineShaderGroupHandleCaptureReplay = has_raytracing;
+   features->rayTracingPipelineShaderGroupHandleCaptureReplayMixed =
+      has_raytracing;
+   features->rayTraversalPrimitiveCulling = has_raytracing;
    features->pipelineLibraryGroupHandles =
+      has_raytracing &&
       pdevice->vk.supported_extensions.EXT_pipeline_library_group_handles;
 
    /* VK_KHR_ray_tracing_maintenance1 */
-   features->rayTracingMaintenance1 = true;
-   features->rayTracingPipelineTraceRaysIndirect2 = true;
+   features->rayTracingMaintenance1 = has_raytracing;
+   features->rayTracingPipelineTraceRaysIndirect2 = has_raytracing;
 
    /* VK_KHR_ray_tracing_position_fetch */
-   features->rayTracingPositionFetch = true;
+   features->rayTracingPositionFetch = has_raytracing;
 
    /* VK_KHR_robustness2 */
    features->robustBufferAccess2 = true;
