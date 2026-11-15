@@ -800,8 +800,11 @@ callable shaders have no ray context and may invoke other callable shaders.
 Each active callable frame has its own callable-data and shader-record state.
 After stage linking, the monolithic RT shader runs NIR SSA construction, so
 the per-level traversal and hit scalars live in registers rather than local
-memory; the dynamically indexed BVH stack and the payload/hit-attribute
-scratch remain in local memory.
+memory.  Each invocation owns a bounded 16-entry, 32-bit BVH stack per ray
+level in shared memory; stack overflow is handled by walking parent pointers
+encoded in the BVH instead of dropping nodes.  Ray generation runs as a
+persistent 32-thread workgroup so indirect dispatches can read their launch
+dimensions in the shader without a host-side divide.
 Shader group handle capture replay is supported with stable 8-byte handles; the
 maintenance1 stack-size entry points are implemented as advisory calls.
 
@@ -814,11 +817,10 @@ The main limitations are:
   four nested ``executeCallableEXT`` calls).  Vulkan bounds callable recursion
   only by the implementation stack size; this driver uses statically cloned
   callable frames, so deeper chains must not be used.
-* Every ray recursion level owns a 64-entry BVH traversal stack and a separate
-  hit state.  The stack is dynamically indexed and therefore remains in local
-  memory; the other traversal scalars are promoted to SSA.  A pathologically
-  deep BVH that overflows the 64-entry stack can miss geometry, although
-  Turnip's BVH builder keeps normal trees well below this limit.
+* Every ray recursion level owns a 16-entry, 32-bit BVH traversal stack and a
+  separate hit state.  The stack lives in shared memory and is indexed per
+  invocation.  A deep BVH can overflow the bounded stack, but traversal then
+  continues through parent pointers instead of dropping geometry.
 * AABB intersection shaders are expected to report one intersection per
   invocation.  The return value of ``reportIntersectionEXT`` and the any-hit
   feedback for multiple reports in one intersection-shader invocation are not

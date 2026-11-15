@@ -10539,9 +10539,17 @@ tu_dispatch_rt_trace(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(tu_cmd_buffer, cmd_buffer, commandBuffer);
    struct tu_dispatch_info info = {};
 
-   info.blocks[0] = x;
-   info.blocks[1] = y;
-   info.blocks[2] = z;
+   /* The shader runs one invocation per ray and a persistent strided loop,
+    * so the host only has to provide enough workgroups to cover the launch.
+    * Cap the grid at the hardware's per-dimension limit; the shader loops if
+    * the cap is hit.
+    */
+   uint64_t total_rays = (uint64_t)x * y * z;
+   uint64_t groups =
+      (total_rays + TU_RT_WORKGROUP_SIZE - 1) / TU_RT_WORKGROUP_SIZE;
+   info.blocks[0] = (uint32_t)MIN2(groups, 65535u);
+   info.blocks[1] = 1;
+   info.blocks[2] = 1;
    TU_CALLX(cmd_buffer->device, tu_dispatch)(cmd_buffer, &info);
 }
 
@@ -10552,7 +10560,15 @@ tu_dispatch_rt_trace_indirect(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(tu_cmd_buffer, cmd_buffer, commandBuffer);
    struct tu_dispatch_info info = {};
 
-   info.indirect = indirect_addr;
+   /* Use a fixed persistent grid and let the shader read the real launch
+    * dimensions from the indirect command.  This avoids a GPU-side divide
+    * of the 3D launch size and works for both VkTraceRaysIndirectCommandKHR
+    * and VkTraceRaysIndirectCommand2KHR.
+    */
+   (void)indirect_addr;
+   info.blocks[0] = TU_RT_INDIRECT_GROUPS;
+   info.blocks[1] = 1;
+   info.blocks[2] = 1;
    TU_CALLX(cmd_buffer->device, tu_dispatch)(cmd_buffer, &info);
 }
 
@@ -10562,35 +10578,16 @@ tu_dispatch_rt_trace_indirect2(VkCommandBuffer commandBuffer,
                                VkDeviceAddress indirect_addr)
 {
    VK_FROM_HANDLE(tu_cmd_buffer, cmd_buffer, commandBuffer);
-   struct tu_cs *cs = &cmd_buffer->cs;
-   /* CP_EXEC_CS_INDIRECT has to read width/height/depth back from GPU memory,
-    * but the VkTraceRaysIndirectCommand2KHR is only guaranteed to be 8 byte
-    * aligned. Copy the three dimensions into a 16 byte aligned scratch BO.
-    * The BO has to be allocated as GPU-writeable, otherwise KGSL maps it
-    * read-only for the GPU and the CP_MEM_TO_MEM writes are dropped.
-    */
-   struct tu_cs_memory dims;
-   tu_cs_set_writeable(&cmd_buffer->sub_cs, true);
-   VkResult result = tu_cs_alloc(&cmd_buffer->sub_cs, 1, 4, &dims);
-   tu_cs_set_writeable(&cmd_buffer->sub_cs, false);
-   if (result != VK_SUCCESS) {
-      vk_command_buffer_set_error(&cmd_buffer->vk, result);
-      return;
-   }
-
-   for (uint32_t i = 0; i < 3; i++) {
-      tu_cs_emit_pkt7(cs, CP_MEM_TO_MEM, 5);
-      tu_cs_emit(cs, 0);
-      tu_cs_emit_qw(cs, dims.iova + i * sizeof(uint32_t));
-      tu_cs_emit_qw(cs, indirect_addr +
-                        offsetof(VkTraceRaysIndirectCommand2KHR, width) +
-                        i * sizeof(uint32_t));
-   }
-   tu_cs_emit_pkt7(cs, CP_WAIT_MEM_WRITES, 0);
-   tu_cs_emit_wfi(cs);
-
    struct tu_dispatch_info info = {};
-   info.indirect = dims.iova;
+
+   /* The shader reads width/height/depth directly from the 8-byte-aligned
+    * indirect2 command, so the old CP_MEM_TO_MEM staging copy and its
+    * pipeline stall are no longer needed.
+    */
+   (void)indirect_addr;
+   info.blocks[0] = TU_RT_INDIRECT_GROUPS;
+   info.blocks[1] = 1;
+   info.blocks[2] = 1;
    TU_CALLX(cmd_buffer->device, tu_dispatch)(cmd_buffer, &info);
 }
 

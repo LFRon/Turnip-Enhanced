@@ -20,9 +20,17 @@
 #include "ir3/ir3_nir.h"
 
 #include "bvh/tu_bvh_defines.h"
+#include "tu_ray_traversal.h"
 #include "tu_ray_tracing_pipeline.h"
 
-#define TU_RT_MAX_STACK 64
+/* Bounded per-level stack.  Overflow is handled by walking parent pointers
+ * encoded in the BVH instead of silently dropping nodes, so this only affects
+ * performance, not correctness.  16 entries matches RADV's MAX_STACK_ENTRY_COUNT
+ * and keeps the shared-memory footprint small.
+ */
+#define TU_RT_MAX_STACK 16
+#define TU_RT_INVALID_NODE TU_RAY_BVH_INVALID_NODE
+#define TU_RT_NO_INSTANCE_ROOT TU_RAY_BVH_NO_INSTANCE_ROOT
 
 enum tu_rt_call_data_kind {
    TU_RT_CALL_DATA_PAYLOAD,
@@ -39,8 +47,12 @@ struct tu_rt_state {
    nir_variable *root_bvh_base;
    nir_variable *bvh_base;
    nir_variable *current_node;
+   nir_variable *previous_node;
    nir_variable *stack_ptr;
-   nir_variable *stack_base;
+   nir_variable *top_stack;
+   nir_variable *stack_low_watermark;
+   nir_variable *instance_top_node;
+   nir_variable *instance_bottom_node;
    nir_variable *stack;
    nir_variable *hit;
 
@@ -94,6 +106,13 @@ struct tu_rt_lower_ctx {
    struct hash_table *var_slots;
    uint32_t rt_data_size;
 
+   /* If the pipeline has exactly one outgoing payload/callable slot, every
+    * incoming view ultimately aliases that slot.  Use a compile-time dword
+    * offset instead of the dynamic payload_ptr/callable_ptr indirection.
+    */
+   int32_t fixed_payload_slot;
+   int32_t fixed_callable_slot;
+
    bool has_any_hit;
    bool has_closest_hit;
    bool has_intersection;
@@ -105,6 +124,13 @@ static nir_variable *
 rt_var(nir_shader *shader, const struct glsl_type *type, const char *name)
 {
    return nir_variable_create(shader, nir_var_shader_temp, type, name);
+}
+
+static nir_variable *
+rt_shared_var(nir_shader *shader, const struct glsl_type *type,
+              const char *name)
+{
+   return nir_variable_create(shader, nir_var_mem_shared, type, name);
 }
 
 static void
@@ -128,10 +154,21 @@ rt_state_init_one(nir_shader *shader, struct tu_rt_state *s,
       s->root_bvh_base = rt_var(shader, uvec2, "root_bvh_base");
       s->bvh_base = rt_var(shader, uvec2, "bvh_base");
       s->current_node = rt_var(shader, u32, "current_node");
+      s->previous_node = rt_var(shader, u32, "previous_node");
       s->stack_ptr = rt_var(shader, u32, "stack_ptr");
-      s->stack_base = rt_var(shader, u32, "stack_base");
-      s->stack = rt_var(shader,
-         glsl_array_type(glsl_uvec4_type(), TU_RT_MAX_STACK, 0),
+      s->top_stack = rt_var(shader, u32, "top_stack");
+      s->stack_low_watermark = rt_var(shader, u32, "stack_low_watermark");
+      s->instance_top_node = rt_var(shader, u32, "instance_top_node");
+      s->instance_bottom_node = rt_var(shader, u32, "instance_bottom_node");
+      /* The traversal stack is per invocation.  It lives in shared memory so
+       * that the persistent 32-thread raygen workgroup does not multiply
+       * local-memory usage.  The array is slot-major: all invocations' entries
+       * for a given stack depth are adjacent, matching RADV's LDS layout and
+       * avoiding bank conflicts when the warp pushes/pops the same depth.
+       */
+      s->stack = rt_shared_var(shader,
+         glsl_array_type(glsl_uint_type(),
+                         TU_RT_MAX_STACK * TU_RT_WORKGROUP_SIZE, 0),
          "traversal_stack");
       s->hit = rt_var(shader, glsl_bool_type(), "hit");
    }
@@ -449,6 +486,43 @@ load_sbt_stride(nir_builder *b, const struct tu_rt_lowering_info *info,
    return nir_load_var(b, result);
 }
 
+/* Load the ray launch dimensions from the direct push constant or from the
+ * indirect command.  The persistent raygen loop uses this to derive the total
+ * number of rays and to turn a linear invocation index back into a 3D
+ * gl_LaunchIDEXT.
+ */
+static nir_def *
+load_launch_size(nir_builder *b, const struct tu_rt_lowering_info *info)
+{
+   nir_def *indirect = load_trace_u32(b, info,
+                                      offsetof(struct tu_rt_trace_params, flags));
+   nir_variable *launch_size =
+      nir_local_variable_create(b->impl,
+                                glsl_vector_type(GLSL_TYPE_UINT, 3),
+                                "rt_launch_size");
+   nir_push_if(b, nir_test_mask(b, indirect, 3));
+   {
+      nir_def *addr = load_trace_u64(b, info,
+                                     offsetof(struct tu_rt_trace_params,
+                                              indirect_addr));
+      nir_def *off = nir_bcsel(b, nir_test_mask(b, indirect, 2),
+                               nir_imm_int(b, offsetof(VkTraceRaysIndirectCommand2KHR,
+                                                       width)),
+                               nir_imm_int(b, 0));
+      nir_store_var(b, launch_size,
+                    nir_load_global(b, 3, 32, nir_iadd(b, addr, nir_u2u64(b, off)),
+                                    .align_mul = 4), 7);
+   }
+   nir_push_else(b, NULL);
+   {
+      nir_store_var(b, launch_size,
+                    load_push(b, info,
+                              offsetof(struct tu_rt_trace_params, launch_size), 3), 7);
+   }
+   nir_pop_if(b, NULL);
+   return nir_load_var(b, launch_size);
+}
+
 /* Follow a deref chain back to the root variable.  The SPIR-V payload
  * operands of traceRay/executeCallable are always pointers to variables, so
  * this is stable even after the shader has been through some NIR passes.
@@ -557,6 +631,23 @@ collect_call_data_slots(nir_shader *shader, struct tu_rt_lower_ctx *ctx)
    ctx->rt_data_size = ctx->hit_attr_base +
                        ctx->levels * TU_RT_HIT_ATTR_SIZE;
 
+   if (payload_vars.size == 1) {
+      nir_variable *var =
+         *util_dynarray_element(&payload_vars, nir_variable *, 0);
+      struct hash_entry *entry = _mesa_hash_table_search(ctx->var_slots, var);
+      if (entry)
+         ctx->fixed_payload_slot =
+            (int32_t)(((uint32_t)(uintptr_t)entry->data - 1) / 4);
+   }
+   if (callable_vars.size == 1) {
+      nir_variable *var =
+         *util_dynarray_element(&callable_vars, nir_variable *, 0);
+      struct hash_entry *entry = _mesa_hash_table_search(ctx->var_slots, var);
+      if (entry)
+         ctx->fixed_callable_slot =
+            (int32_t)(((uint32_t)(uintptr_t)entry->data - 1) / 4);
+   }
+
    util_dynarray_fini(&payload_vars);
    util_dynarray_fini(&callable_vars);
    _mesa_hash_table_destroy(seen, NULL);
@@ -579,6 +670,11 @@ call_data_ptr(nir_builder *b, struct tu_rt_lower_ctx *ctx, nir_def *src,
          return nir_imm_int(b, slot / 4);
       }
    }
+
+   if (kind == TU_RT_CALL_DATA_PAYLOAD && ctx->fixed_payload_slot >= 0)
+      return nir_imm_int(b, ctx->fixed_payload_slot);
+   if (kind == TU_RT_CALL_DATA_CALLABLE && ctx->fixed_callable_slot >= 0)
+      return nir_imm_int(b, ctx->fixed_callable_slot);
 
    return load_u32(b, kind == TU_RT_CALL_DATA_PAYLOAD ?
                       ctx->state->payload_ptr : ctx->state->callable_ptr);
@@ -658,6 +754,141 @@ pipeline_has_general_stage(const struct tu_rt_lowering_info *info,
    return false;
 }
 
+enum tu_rt_dispatch_kind {
+   TU_RT_DISPATCH_RAYGEN,
+   TU_RT_DISPATCH_MISS,
+   TU_RT_DISPATCH_CALLABLE,
+   TU_RT_DISPATCH_ANY_HIT,
+   TU_RT_DISPATCH_CLOSEST_HIT,
+   TU_RT_DISPATCH_INTERSECTION,
+};
+
+struct tu_rt_candidate {
+   const struct tu_rt_group *group;
+   nir_function *func;
+};
+
+static int
+candidate_compare(const void *va, const void *vb)
+{
+   const struct tu_rt_candidate *a =
+      static_cast<const struct tu_rt_candidate *>(va);
+   const struct tu_rt_candidate *b =
+      static_cast<const struct tu_rt_candidate *>(vb);
+   return (a->group->handle > b->group->handle) -
+          (a->group->handle < b->group->handle);
+}
+
+static nir_function *
+dispatch_group_stage(struct tu_rt_lower_ctx *ctx,
+                     const struct tu_rt_group *group,
+                     enum tu_rt_dispatch_kind kind,
+                     uint32_t level, uint32_t call_depth)
+{
+   const struct tu_rt_lowering_info *info = ctx->info;
+   uint32_t stage_idx;
+
+   switch (kind) {
+   case TU_RT_DISPATCH_RAYGEN:
+      stage_idx = group->general;
+      if (stage_idx < info->stage_count &&
+          info->stages[stage_idx].stage != VK_SHADER_STAGE_RAYGEN_BIT_KHR)
+         return NULL;
+      level = 0;
+      call_depth = 0;
+      break;
+   case TU_RT_DISPATCH_MISS:
+      stage_idx = group->general;
+      if (stage_idx < info->stage_count &&
+          info->stages[stage_idx].stage != VK_SHADER_STAGE_MISS_BIT_KHR)
+         return NULL;
+      break;
+   case TU_RT_DISPATCH_CALLABLE:
+      stage_idx = group->general;
+      if (stage_idx < info->stage_count &&
+          info->stages[stage_idx].stage != VK_SHADER_STAGE_CALLABLE_BIT_KHR)
+         return NULL;
+      level = 0;
+      break;
+   case TU_RT_DISPATCH_ANY_HIT:
+      stage_idx = group->any_hit;
+      break;
+   case TU_RT_DISPATCH_CLOSEST_HIT:
+      stage_idx = group->closest_hit;
+      break;
+   case TU_RT_DISPATCH_INTERSECTION:
+      stage_idx = group->intersection;
+      break;
+   default:
+      return NULL;
+   }
+
+   if (stage_idx >= info->stage_count || level >= info->levels ||
+       call_depth >= info->callable_levels)
+      return NULL;
+   return info->funcs[(stage_idx * info->levels + level) *
+                         info->callable_levels +
+                      call_depth];
+}
+
+static void
+collect_candidates(struct tu_rt_lower_ctx *ctx, enum tu_rt_dispatch_kind kind,
+                   uint32_t level, uint32_t call_depth,
+                   struct util_dynarray *candidates)
+{
+   const struct tu_ray_tracing_pipeline *pipeline = ctx->info->pipeline;
+
+   util_dynarray_clear(candidates);
+   for (uint32_t i = 0; i < pipeline->group_count; i++) {
+      const struct tu_rt_group *group = &pipeline->groups[i];
+      nir_function *func =
+         dispatch_group_stage(ctx, group, kind, level, call_depth);
+      if (!func || !func->impl)
+         continue;
+      struct tu_rt_candidate candidate = { group, func };
+      util_dynarray_append(candidates, candidate);
+   }
+   uint32_t count =
+      util_dynarray_num_elements(candidates, struct tu_rt_candidate);
+   if (count > 1) {
+      qsort(candidates->data, count, sizeof(struct tu_rt_candidate),
+            candidate_compare);
+   }
+}
+
+/* Emit a balanced handle search over the stage candidates.  This replaces the
+ * old linear "if (handle == group->handle)" chain, which grew with every
+ * shader group in the pipeline.
+ */
+static void
+emit_dispatch_tree(nir_builder *b, const struct tu_rt_state *callee,
+                   nir_def *handle, nir_def *record,
+                   struct util_dynarray *candidates,
+                   uint32_t lo, uint32_t hi)
+{
+   if (lo >= hi)
+      return;
+
+   uint32_t mid = lo + (hi - lo) / 2;
+   struct tu_rt_candidate *candidate =
+      util_dynarray_element(candidates, struct tu_rt_candidate, mid);
+
+   nir_push_if(b, nir_ult(b, handle,
+                          nir_imm_int(b, candidate->group->handle)));
+   emit_dispatch_tree(b, callee, handle, record, candidates, lo, mid);
+   nir_push_else(b, NULL);
+   nir_push_if(b, nir_ieq(b, handle,
+                          nir_imm_int(b, candidate->group->handle)));
+   {
+      nir_store_var(b, callee->shader_record_ptr, record, 1);
+      nir_build_call(b, candidate->func, 0, NULL);
+   }
+   nir_push_else(b, NULL);
+   emit_dispatch_tree(b, callee, handle, record, candidates, mid + 1, hi);
+   nir_pop_if(b, NULL);
+   nir_pop_if(b, NULL);
+}
+
 static void
 copy_hit_context(nir_builder *b, const struct tu_rt_state *dst,
                  const struct tu_rt_state *src);
@@ -672,56 +903,43 @@ call_group_stage(nir_builder *b, struct tu_rt_lower_ctx *ctx,
                  uint32_t level, nir_def *index)
 {
    const struct tu_rt_lowering_info *info = ctx->info;
-   const struct tu_ray_tracing_pipeline *pipeline = info->pipeline;
    struct tu_rt_state *callee = &ctx->hit_states[level];
 
    if (caller != callee)
       copy_hit_context(b, callee, caller);
 
-   uint32_t base_offset, stride_offset;
+   ASSERTED enum tu_rt_dispatch_kind dispatch_kind;
    switch (kind) {
-   case TU_RT_GENERAL:
-      base_offset = offsetof(struct tu_rt_trace_params, hit_sbt);
-      stride_offset = offsetof(struct tu_rt_trace_params, hit_stride);
+   case TU_RT_INTERSECTION:
+      dispatch_kind = TU_RT_DISPATCH_INTERSECTION;
       break;
    case TU_RT_ANY_HIT:
-      base_offset = offsetof(struct tu_rt_trace_params, hit_sbt);
-      stride_offset = offsetof(struct tu_rt_trace_params, hit_stride);
+      dispatch_kind = TU_RT_DISPATCH_ANY_HIT;
       break;
    case TU_RT_CLOSEST_HIT:
-      base_offset = offsetof(struct tu_rt_trace_params, hit_sbt);
-      stride_offset = offsetof(struct tu_rt_trace_params, hit_stride);
-      break;
-   case TU_RT_INTERSECTION:
-      base_offset = offsetof(struct tu_rt_trace_params, hit_sbt);
-      stride_offset = offsetof(struct tu_rt_trace_params, hit_stride);
+      dispatch_kind = TU_RT_DISPATCH_CLOSEST_HIT;
       break;
    default:
-      UNREACHABLE("bad stage kind");
+      UNREACHABLE("bad hit-group stage kind");
    }
 
    nir_def *base = load_sbt_base(
-      b, info, base_offset,
+      b, info, offsetof(struct tu_rt_trace_params, hit_sbt),
       offsetof(VkTraceRaysIndirectCommand2KHR, hitShaderBindingTableAddress));
    nir_def *stride = load_sbt_stride(
-      b, info, stride_offset,
+      b, info, offsetof(struct tu_rt_trace_params, hit_stride),
       offsetof(VkTraceRaysIndirectCommand2KHR, hitShaderBindingTableStride));
    nir_def *byte_offset = nir_u2u64(b, nir_imul(b, index, stride));
    nir_def *entry = nir_iadd(b, base, byte_offset);
    nir_def *handle = nir_load_global(b, 1, 32, entry, .align_mul = 4);
    nir_def *record = nir_iadd_imm(b, entry, TU_RT_HANDLE_SIZE);
 
-   for (uint32_t i = 0; i < pipeline->group_count; i++) {
-      const struct tu_rt_group *group = &pipeline->groups[i];
-      nir_function *func =
-         group_stage(pipeline, info, group, kind, level, 0);
-      if (!func)
-         continue;
-
-      nir_push_if(b, nir_ieq(b, handle, nir_imm_int(b, group->handle)));
-      call_stage(b, callee, func, record);
-      nir_pop_if(b, NULL);
-   }
+   struct util_dynarray candidates = UTIL_DYNARRAY_INIT;
+   collect_candidates(ctx, dispatch_kind, level, 0, &candidates);
+   emit_dispatch_tree(b, callee, handle, record, &candidates,
+                      0, util_dynarray_num_elements(&candidates,
+                                                    struct tu_rt_candidate));
+   util_dynarray_fini(&candidates);
 
    if (caller != callee && kind == TU_RT_INTERSECTION)
       copy_call_result(b, caller, callee, true);
@@ -732,7 +950,6 @@ call_miss(nir_builder *b, struct tu_rt_lower_ctx *ctx,
           struct tu_rt_state *caller, uint32_t level, nir_def *index)
 {
    const struct tu_rt_lowering_info *info = ctx->info;
-   const struct tu_ray_tracing_pipeline *pipeline = info->pipeline;
    struct tu_rt_state *callee = &ctx->hit_states[level];
 
    copy_hit_context(b, callee, caller);
@@ -745,22 +962,12 @@ call_miss(nir_builder *b, struct tu_rt_lower_ctx *ctx,
    nir_def *handle = nir_load_global(b, 1, 32, entry, .align_mul = 4);
    nir_def *record = nir_iadd_imm(b, entry, TU_RT_HANDLE_SIZE);
 
-   for (uint32_t i = 0; i < pipeline->group_count; i++) {
-      const struct tu_rt_group *group = &pipeline->groups[i];
-      nir_function *func =
-         group_stage(pipeline, info, group, TU_RT_GENERAL, level, 0);
-      if (!func || group->general >= info->stage_count)
-         continue;
-      if (info->stages[group->general].stage != VK_SHADER_STAGE_MISS_BIT_KHR)
-         continue;
-      if (func->impl == NULL)
-         continue;
-
-      nir_push_if(b, nir_ieq(b, handle, nir_imm_int(b, group->handle)));
-      nir_store_var(b, callee->shader_record_ptr, record, 1);
-      nir_build_call(b, func, 0, NULL);
-      nir_pop_if(b, NULL);
-   }
+   struct util_dynarray candidates = UTIL_DYNARRAY_INIT;
+   collect_candidates(ctx, TU_RT_DISPATCH_MISS, level, 0, &candidates);
+   emit_dispatch_tree(b, callee, handle, record, &candidates,
+                      0, util_dynarray_num_elements(&candidates,
+                                                    struct tu_rt_candidate));
+   util_dynarray_fini(&candidates);
 }
 
 static void
@@ -769,7 +976,6 @@ call_callable(nir_builder *b, struct tu_rt_lower_ctx *ctx,
               nir_def *index)
 {
    const struct tu_rt_lowering_info *info = ctx->info;
-   const struct tu_ray_tracing_pipeline *pipeline = info->pipeline;
 
    nir_def *base = load_sbt_base(b, info, offsetof(struct tu_rt_trace_params, callable_sbt),
                     offsetof(VkTraceRaysIndirectCommand2KHR, callableShaderBindingTableAddress));
@@ -779,20 +985,13 @@ call_callable(nir_builder *b, struct tu_rt_lower_ctx *ctx,
    nir_def *handle = nir_load_global(b, 1, 32, entry, .align_mul = 4);
    nir_def *record = nir_iadd_imm(b, entry, TU_RT_HANDLE_SIZE);
 
-   for (uint32_t i = 0; i < pipeline->group_count; i++) {
-      const struct tu_rt_group *group = &pipeline->groups[i];
-      nir_function *func =
-         group_stage(pipeline, info, group, TU_RT_GENERAL, level, call_depth);
-      if (!func || group->general >= info->stage_count)
-         continue;
-      if (info->stages[group->general].stage != VK_SHADER_STAGE_CALLABLE_BIT_KHR)
-         continue;
-
-      nir_push_if(b, nir_ieq(b, handle, nir_imm_int(b, group->handle)));
-      nir_store_var(b, callee->shader_record_ptr, record, 1);
-      nir_build_call(b, func, 0, NULL);
-      nir_pop_if(b, NULL);
-   }
+   struct util_dynarray candidates = UTIL_DYNARRAY_INIT;
+   collect_candidates(ctx, TU_RT_DISPATCH_CALLABLE, level, call_depth,
+                      &candidates);
+   emit_dispatch_tree(b, callee, handle, record, &candidates,
+                      0, util_dynarray_num_elements(&candidates,
+                                                    struct tu_rt_candidate));
+   util_dynarray_fini(&candidates);
 }
 
 static void
@@ -800,7 +999,6 @@ call_closest_hit(nir_builder *b, struct tu_rt_lower_ctx *ctx,
                  struct tu_rt_state *caller, uint32_t level, nir_def *index)
 {
    const struct tu_rt_lowering_info *info = ctx->info;
-   const struct tu_ray_tracing_pipeline *pipeline = info->pipeline;
    struct tu_rt_state *callee = &ctx->hit_states[level];
 
    if (caller != callee)
@@ -814,18 +1012,12 @@ call_closest_hit(nir_builder *b, struct tu_rt_lower_ctx *ctx,
    nir_def *handle = nir_load_global(b, 1, 32, entry, .align_mul = 4);
    nir_def *record = nir_iadd_imm(b, entry, TU_RT_HANDLE_SIZE);
 
-   for (uint32_t i = 0; i < pipeline->group_count; i++) {
-      const struct tu_rt_group *group = &pipeline->groups[i];
-      nir_function *func =
-         group_stage(pipeline, info, group, TU_RT_CLOSEST_HIT, level, 0);
-      if (!func)
-         continue;
-
-      nir_push_if(b, nir_ieq(b, handle, nir_imm_int(b, group->handle)));
-      nir_store_var(b, callee->shader_record_ptr, record, 1);
-      nir_build_call(b, func, 0, NULL);
-      nir_pop_if(b, NULL);
-   }
+   struct util_dynarray candidates = UTIL_DYNARRAY_INIT;
+   collect_candidates(ctx, TU_RT_DISPATCH_CLOSEST_HIT, level, 0, &candidates);
+   emit_dispatch_tree(b, callee, handle, record, &candidates,
+                      0, util_dynarray_num_elements(&candidates,
+                                                    struct tu_rt_candidate));
+   util_dynarray_fini(&candidates);
 
    if (caller != callee)
       copy_call_result(b, caller, callee, false);
@@ -836,7 +1028,6 @@ call_any_hit(nir_builder *b, struct tu_rt_lower_ctx *ctx,
              struct tu_rt_state *caller, uint32_t level, nir_def *index)
 {
    const struct tu_rt_lowering_info *info = ctx->info;
-   const struct tu_ray_tracing_pipeline *pipeline = info->pipeline;
    struct tu_rt_state *callee = &ctx->hit_states[level];
 
    if (caller != callee)
@@ -858,18 +1049,12 @@ call_any_hit(nir_builder *b, struct tu_rt_lower_ctx *ctx,
    nir_def *handle = nir_load_global(b, 1, 32, entry, .align_mul = 4);
    nir_def *record = nir_iadd_imm(b, entry, TU_RT_HANDLE_SIZE);
 
-   for (uint32_t i = 0; i < pipeline->group_count; i++) {
-      const struct tu_rt_group *group = &pipeline->groups[i];
-      nir_function *func =
-         group_stage(pipeline, info, group, TU_RT_ANY_HIT, level, 0);
-      if (!func)
-         continue;
-
-      nir_push_if(b, nir_ieq(b, handle, nir_imm_int(b, group->handle)));
-      nir_store_var(b, callee->shader_record_ptr, record, 1);
-      nir_build_call(b, func, 0, NULL);
-      nir_pop_if(b, NULL);
-   }
+   struct util_dynarray candidates = UTIL_DYNARRAY_INIT;
+   collect_candidates(ctx, TU_RT_DISPATCH_ANY_HIT, level, 0, &candidates);
+   emit_dispatch_tree(b, callee, handle, record, &candidates,
+                      0, util_dynarray_num_elements(&candidates,
+                                                    struct tu_rt_candidate));
+   util_dynarray_fini(&candidates);
 
    if (caller == callee)
       nir_store_var(b, callee->shader_record_ptr,
@@ -941,22 +1126,44 @@ ray_flags_with_instance(nir_builder *b, const struct tu_rt_state *s)
    return nir_ior(b, flags, instance_flags);
 }
 
+static nir_def *
+stack_index(nir_builder *b, nir_def *ptr)
+{
+   nir_def *local_id =
+      nir_channel(b, nir_load_local_invocation_id(b), 0);
+   /* Slot-major: adjacent invocations write adjacent words for the same
+    * depth.  The previous invocation-major layout used a 16-word stride,
+    * which maps every lane's same-depth entry to very few LDS banks.
+    */
+   return nir_iadd(b,
+      nir_imul_imm(b, nir_umod_imm(b, ptr, TU_RT_MAX_STACK),
+                   TU_RT_WORKGROUP_SIZE),
+      local_id);
+}
+
+static nir_deref_instr *
+stack_entry(nir_builder *b, const struct tu_rt_state *s, nir_def *ptr)
+{
+   return nir_build_deref_array(b, nir_build_deref_var(b, s->stack),
+                                stack_index(b, ptr));
+}
+
 static void
-push_stack(nir_builder *b, const struct tu_rt_state *s,
-           nir_def *base, nir_def *node, nir_def *mask)
+push_stack(nir_builder *b, const struct tu_rt_state *s, nir_def *node)
 {
    nir_def *ptr = load_u32(b, s->stack_ptr);
-   nir_push_if(b, nir_ult(b, ptr, nir_imm_int(b, TU_RT_MAX_STACK)));
-   {
-      nir_def *idx = nir_umod_imm(b, ptr, TU_RT_MAX_STACK);
-      nir_deref_instr *entry =
-         nir_build_deref_array(b, nir_build_deref_var(b, s->stack), idx);
-      nir_store_deref(b, entry,
-                      nir_vec4(b, nir_channel(b, base, 0),
-                               nir_channel(b, base, 1), node, mask), 0xf);
-      nir_store_var(b, s->stack_ptr, nir_iadd_imm(b, ptr, 1), 1);
-   }
-   nir_pop_if(b, NULL);
+   nir_store_deref(b, stack_entry(b, s, ptr), node, 0x1);
+   ptr = nir_iadd_imm(b, ptr, 1);
+   store_u32(b, s->stack_ptr, ptr);
+
+   /* Remember how far the stack wrapped.  When the pointer later falls to or
+    * below this watermark, the wrapped entries are no longer valid and the
+    * traversal must continue by walking parent pointers instead.
+    */
+   nir_def *watermark =
+      nir_iadd_imm(b, ptr, -(int)TU_RT_MAX_STACK);
+   store_u32(b, s->stack_low_watermark,
+             nir_imax(b, load_u32(b, s->stack_low_watermark), watermark));
 }
 
 static void
@@ -1136,9 +1343,14 @@ build_ray_traversal(nir_builder *b, struct tu_rt_lower_ctx *ctx,
 {
 
    store_u32(b, s->current_node, nir_imm_int(b, 0));
+   store_u32(b, s->previous_node, nir_imm_int(b, TU_RT_INVALID_NODE));
    store_u32(b, s->stack_ptr, nir_imm_int(b, 0));
+   store_u32(b, s->top_stack, nir_imm_int(b, UINT32_MAX));
+   store_u32(b, s->stack_low_watermark, nir_imm_int(b, 0));
+   store_u32(b, s->instance_top_node, nir_imm_int(b, TU_RT_INVALID_NODE));
+   store_u32(b, s->instance_bottom_node,
+             nir_imm_int(b, TU_RT_NO_INSTANCE_ROOT));
    store_u32(b, s->node_mask, nir_imm_int(b, 0xf));
-   nir_store_var(b, s->stack_base, nir_imm_int(b, UINT32_MAX), 1);
    nir_store_var(b, s->hit, nir_imm_false(b), 1);
    nir_store_var(b, s->accept, nir_imm_false(b), 1);
    nir_store_var(b, s->terminate, nir_imm_false(b), 1);
@@ -1163,47 +1375,94 @@ build_ray_traversal(nir_builder *b, struct tu_rt_lower_ctx *ctx,
 
    nir_loop *loop = nir_push_loop(b);
    {
-      nir_push_if(b, nir_ieq_imm(b, load_u32(b, s->current_node), UINT32_MAX));
+      nir_push_if(b, nir_ieq_imm(b, load_u32(b, s->current_node),
+                                 TU_RT_INVALID_NODE));
       {
-         nir_push_if(b, nir_ieq_imm(b, load_u32(b, s->stack_ptr), 0));
-         nir_jump(b, nir_jump_break);
-         nir_pop_if(b, NULL);
-
-         nir_push_if(b, nir_ine_imm(b, load_u32(b, s->stack_base), UINT32_MAX));
+         /* Early-exit when both the node queue and the stack are empty.
+          * This is the only successful termination path.
+          */
+         nir_push_if(b, nir_ilt_imm(b, load_u32(b, s->stack_ptr), 1));
          {
-            nir_def *leave_instance =
-               nir_ige(b, load_u32(b, s->stack_base), load_u32(b, s->stack_ptr));
-            nir_push_if(b, leave_instance);
-            {
-               store_uvec2(b, s->bvh_base, load_vec(b, s->root_bvh_base));
-               nir_store_var(b, s->origin, load_vec(b, s->world_origin), 7);
-               nir_store_var(b, s->dir, load_vec(b, s->world_dir), 7);
-               store_u32(b, s->stack_base, nir_imm_int(b, UINT32_MAX));
-               store_u32(b, s->instance_flags, nir_imm_int(b, 0));
-               nir_push_if(b, nir_ieq_imm(b, load_u32(b, s->stack_ptr), 0));
-               nir_jump(b, nir_jump_break);
-               nir_pop_if(b, NULL);
-            }
-            nir_pop_if(b, NULL);
+            nir_jump(b, nir_jump_break);
          }
          nir_pop_if(b, NULL);
 
-         nir_def *ptr = nir_iadd_imm(b, load_u32(b, s->stack_ptr), -1);
-         store_u32(b, s->stack_ptr, ptr);
-         nir_def *idx = nir_umod_imm(b, ptr, TU_RT_MAX_STACK);
-         nir_deref_instr *entry =
-            nir_build_deref_array(b, nir_build_deref_var(b, s->stack), idx);
-         nir_def *e = nir_load_deref(b, entry);
-         store_uvec2(b, s->bvh_base,
-                     nir_vec2(b, nir_channel(b, e, 0), nir_channel(b, e, 1)));
-         store_u32(b, s->current_node, nir_channel(b, e, 2));
-         store_u32(b, s->node_mask, nir_channel(b, e, 3));
+         /* An instance's BLAS has been fully traversed when the stack has
+          * unwound back to the level it had when the instance was entered,
+          * or when the previous node was the BLAS root.  Restore the world
+          * ray and the TLAS before looking for the next TLAS sibling.
+          */
+         nir_def *stack_instance_exit =
+            nir_iand(b,
+               nir_ine_imm(b, load_u32(b, s->top_stack), UINT32_MAX),
+               nir_ige(b, load_u32(b, s->top_stack),
+                          load_u32(b, s->stack_ptr)));
+         nir_def *root_instance_exit =
+            nir_ieq(b, load_u32(b, s->previous_node),
+                       load_u32(b, s->instance_bottom_node));
+         nir_push_if(b, nir_ior(b, stack_instance_exit, root_instance_exit));
+         {
+            store_u32(b, s->top_stack, nir_imm_int(b, UINT32_MAX));
+            store_u32(b, s->previous_node,
+                      load_u32(b, s->instance_top_node));
+            store_u32(b, s->instance_bottom_node,
+                      nir_imm_int(b, TU_RT_NO_INSTANCE_ROOT));
+            store_uvec2(b, s->bvh_base, load_vec(b, s->root_bvh_base));
+            nir_store_var(b, s->origin, load_vec(b, s->world_origin), 7);
+            nir_store_var(b, s->dir, load_vec(b, s->world_dir), 7);
+            store_u32(b, s->instance_flags, nir_imm_int(b, 0));
+            store_u32(b, s->node_mask, nir_imm_int(b, 0xf));
+         }
+         nir_pop_if(b, NULL);
+
+         /* If the bounded stack wrapped, the entries at the top are gone.
+          * Re-intersect the parent of the last processed node and let the
+          * hardware tell us which sibling to visit next.  This is the
+          * RADV-style stackless overflow path; it trades a little bandwidth
+          * for never silently dropping geometry.
+          */
+         nir_push_if(b, nir_ige(b, load_u32(b, s->stack_low_watermark),
+                                   load_u32(b, s->stack_ptr)));
+         {
+            nir_def *prev = load_u32(b, s->previous_node);
+            nir_def *parent = tu_ray_fetch_parent_node(
+               b, load_vec(b, s->bvh_base), prev);
+            nir_push_if(b, nir_ieq_imm(b, parent, TU_RT_INVALID_NODE));
+            {
+               nir_jump(b, nir_jump_break);
+            }
+            nir_pop_if(b, NULL);
+            store_u32(b, s->current_node, parent);
+            store_u32(b, s->node_mask, nir_imm_int(b, 0xf));
+         }
+         nir_push_else(b, NULL);
+         {
+            nir_def *ptr =
+               nir_iadd_imm(b, load_u32(b, s->stack_ptr), -1);
+            store_u32(b, s->stack_ptr, ptr);
+            store_u32(b, s->current_node,
+                      nir_load_deref(b, stack_entry(b, s, ptr)));
+            store_u32(b, s->previous_node, nir_imm_int(b, TU_RT_INVALID_NODE));
+            store_u32(b, s->node_mask, nir_imm_int(b, 0xf));
+         }
+         nir_pop_if(b, NULL);
+      }
+      nir_push_else(b, NULL);
+      {
+         /* A node is about to be visited.  It has no parent-backtracking
+          * predecessor yet.
+          */
+         store_u32(b, s->previous_node, nir_imm_int(b, TU_RT_INVALID_NODE));
       }
       nir_pop_if(b, NULL);
 
       nir_def *node = load_u32(b, s->current_node);
       nir_def *bvh_base = load_vec(b, s->bvh_base);
-      store_u32(b, s->current_node, nir_imm_int(b, UINT32_MAX));
+      store_u32(b, s->current_node, nir_imm_int(b, TU_RT_INVALID_NODE));
+      /* Remember which node we are leaving from when the next iteration has
+       * to backtrack through parent pointers.
+       */
+      store_u32(b, s->previous_node, node);
 
       nir_def *ray = nir_vec8(b,
          nir_channel(b, load_vec(b, s->origin), 0),
@@ -1244,7 +1503,9 @@ build_ray_traversal(nir_builder *b, struct tu_rt_lower_ctx *ctx,
                                           offsetof(struct tu_instance_descriptor,
                                                    bvh_ptr), 2);
 
-            store_u32(b, s->stack_base, load_u32(b, s->stack_ptr));
+            store_u32(b, s->top_stack, load_u32(b, s->stack_ptr));
+            store_u32(b, s->instance_top_node, node);
+            store_u32(b, s->instance_bottom_node, nir_imm_int(b, 0));
             store_uvec2(b, s->bvh_base, blas);
 
             nir_def *wto[3];
@@ -1260,27 +1521,37 @@ build_ray_traversal(nir_builder *b, struct tu_rt_lower_ctx *ctx,
          }
          nir_push_else(b, NULL);
          {
-            nir_def *ray_skip_aabbs = skip_aabbs ?
-               nir_imm_true(b) :
-               nir_test_mask(b, load_u32(b, s->ray_flags),
-                             SpvRayFlagsSkipAABBsKHRMask << 4);
-            nir_def *ray_skip_triangles = skip_triangles ?
-               nir_imm_true(b) :
-               nir_test_mask(b, load_u32(b, s->ray_flags),
-                             SpvRayFlagsSkipTrianglesKHRMask << 4);
+            /* Procedural AABB leaves are only meaningful if the pipeline has
+             * an intersection shader; without one, no reportIntersectionEXT
+             * can ever accept the candidate.  Skip the entire AABB path for
+             * triangle-only pipelines.  The triangle path is likewise
+             * removed when the pipeline was created with SKIP_TRIANGLES.
+             */
+            const bool handle_aabbs = ctx->has_intersection && !skip_aabbs;
+            const bool handle_triangles = !skip_triangles;
 
             nir_push_if(b, nir_test_mask(b, type,
                                          TU_INTERSECTION_TYPE_AABB >> 8));
             {
-               nir_push_if(b, nir_inot(b, ray_skip_aabbs));
-               handle_aabb(b, ctx, s, bvh_base, node, result);
-               nir_pop_if(b, NULL);
+               if (handle_aabbs) {
+                  nir_def *ray_skip_aabbs =
+                     nir_test_mask(b, load_u32(b, s->ray_flags),
+                                   SpvRayFlagsSkipAABBsKHRMask << 4);
+                  nir_push_if(b, nir_inot(b, ray_skip_aabbs));
+                  handle_aabb(b, ctx, s, bvh_base, node, result);
+                  nir_pop_if(b, NULL);
+               }
             }
             nir_push_else(b, NULL);
             {
-               nir_push_if(b, nir_inot(b, ray_skip_triangles));
-               handle_triangle(b, ctx, s, bvh_base, node, result);
-               nir_pop_if(b, NULL);
+               if (handle_triangles) {
+                  nir_def *ray_skip_triangles =
+                     nir_test_mask(b, load_u32(b, s->ray_flags),
+                                   SpvRayFlagsSkipTrianglesKHRMask << 4);
+                  nir_push_if(b, nir_inot(b, ray_skip_triangles));
+                  handle_triangle(b, ctx, s, bvh_base, node, result);
+                  nir_pop_if(b, NULL);
+               }
             }
             nir_pop_if(b, NULL);
          }
@@ -1299,15 +1570,16 @@ build_ray_traversal(nir_builder *b, struct tu_rt_lower_ctx *ctx,
             store_u32(b, s->current_node, nir_iadd(b, id, closest));
             store_u32(b, s->node_mask, nir_imm_int(b, 0xf));
 
-            /* Push the remaining children, farthest first. */
+            /* Push the remaining children, farthest first, so the next
+             * closest sibling is on top of the stack.
+             */
             for (unsigned i = 0; i < 7; i++) {
                nir_push_if(b, nir_ult(b, nir_imm_int(b, i + 1), count));
                {
                   nir_def *pos = nir_imm_int(b, 8 + i * 3);
                   nir_def *child =
                      nir_iand_imm(b, nir_ishr(b, children, pos), 7);
-                  push_stack(b, s, bvh_base, nir_iadd(b, id, child),
-                             nir_imm_int(b, 0xf));
+                  push_stack(b, s, nir_iadd(b, id, child));
                }
                nir_pop_if(b, NULL);
             }
@@ -1590,38 +1862,11 @@ lower_instr(nir_builder *b, nir_instr *instr, void *data)
       nir_instr_remove(instr);
       return true;
    case nir_intrinsic_load_ray_launch_id:
-      def = nir_load_global_invocation_id(b, 32);
+      def = load_vec(b, ctx->info->launch_id);
       break;
-   case nir_intrinsic_load_ray_launch_size: {
-      nir_def *indirect = load_trace_u32(b, ctx->info,
-                                         offsetof(struct tu_rt_trace_params, flags));
-      nir_variable *launch_size =
-         nir_local_variable_create(b->impl,
-                                   glsl_vector_type(GLSL_TYPE_UINT, 3),
-                                   "rt_launch_size");
-      nir_push_if(b, nir_test_mask(b, indirect, 3));
-      {
-         nir_def *addr = load_trace_u64(b, ctx->info,
-                                        offsetof(struct tu_rt_trace_params,
-                                                 indirect_addr));
-         nir_def *off = nir_bcsel(b, nir_test_mask(b, indirect, 2),
-                                  nir_imm_int(b, offsetof(VkTraceRaysIndirectCommand2KHR,
-                                                          width)),
-                                  nir_imm_int(b, 0));
-         nir_store_var(b, launch_size,
-                       nir_load_global(b, 3, 32, nir_iadd(b, addr, nir_u2u64(b, off)),
-                                       .align_mul = 4), 7);
-      }
-      nir_push_else(b, NULL);
-      {
-         nir_store_var(b, launch_size,
-                       load_push(b, ctx->info,
-                                 offsetof(struct tu_rt_trace_params, launch_size), 3), 7);
-      }
-      nir_pop_if(b, NULL);
-      def = nir_load_var(b, launch_size);
+   case nir_intrinsic_load_ray_launch_size:
+      def = load_launch_size(b, ctx->info);
       break;
-   }
    case nir_intrinsic_load_shader_record_ptr:
       def = load_u64(b, s->shader_record_ptr);
       break;
@@ -1808,8 +2053,12 @@ lower_derefs(nir_shader *shader, struct tu_rt_lower_ctx *ctx)
                offset = nir_imm_int(
                   &b, ctx->traversal_states[ray_level].hit_attr_offset / 4);
             } else if (mode & nir_var_shader_call_data_in) {
-               offset = load_u32(&b, callable_stage ?
-                                 s->callable_ptr : s->payload_ptr);
+               int32_t fixed_slot = callable_stage ?
+                  ctx->fixed_callable_slot : ctx->fixed_payload_slot;
+               offset = fixed_slot >= 0 ?
+                  nir_imm_int(&b, fixed_slot) :
+                  load_u32(&b, callable_stage ?
+                              s->callable_ptr : s->payload_ptr);
             } else {
                struct hash_entry *entry =
                   _mesa_hash_table_search(ctx->var_slots, deref->var);
@@ -1840,6 +2089,8 @@ tu_nir_lower_ray_tracing(nir_shader *shader, struct tu_rt_lowering_info *info)
       .info = info,
       .func_to_stage = _mesa_pointer_hash_table_create(NULL),
       .var_slots = _mesa_pointer_hash_table_create(NULL),
+      .fixed_payload_slot = -1,
+      .fixed_callable_slot = -1,
    };
 
    ctx.levels = info->levels;
@@ -1870,6 +2121,8 @@ tu_nir_lower_ray_tracing(nir_shader *shader, struct tu_rt_lowering_info *info)
       pipeline_has_general_stage(info, VK_SHADER_STAGE_CALLABLE_BIT_KHR);
 
    collect_call_data_slots(shader, &ctx);
+   info->launch_id = rt_var(
+      shader, glsl_vector_type(GLSL_TYPE_UINT, 3), "rt_launch_id");
    rt_state_init(shader, ctx.traversal_states, ctx.hit_states,
                  ctx.callable_states, ctx.levels, ctx.rt_data_size,
                  ctx.hit_attr_base);
@@ -1926,10 +2179,15 @@ tu_nir_build_raygen_dispatch(nir_shader *shader,
    nir_function_impl *impl = nir_shader_get_entrypoint(shader);
    nir_builder b = nir_builder_at(nir_before_impl(impl));
 
-   for (uint32_t level = 0; level < info->levels; level++) {
-      nir_store_var(&b, info->payload_ptr[level], nir_imm_int(&b, 0), 1);
-      nir_store_var(&b, info->callable_ptr[level], nir_imm_int(&b, 0), 1);
-   }
+   nir_def *launch_size = load_launch_size(&b, info);
+   nir_def *size_x = nir_channel(&b, launch_size, 0);
+   nir_def *size_y = nir_channel(&b, launch_size, 1);
+   nir_def *size_z = nir_channel(&b, launch_size, 2);
+   nir_def *total_rays =
+      nir_imul(&b, nir_imul(&b, size_x, size_y), size_z);
+
+   nir_store_var(&b, info->launch_id,
+                 nir_imm_vec3(&b, 0, 0, 0), 7);
 
    nir_def *base = load_sbt_base(&b, info,
                                  offsetof(struct tu_rt_trace_params, raygen_sbt),
@@ -1943,23 +2201,84 @@ tu_nir_build_raygen_dispatch(nir_shader *shader,
    nir_def *handle = nir_load_global(&b, 1, 32, entry, .align_mul = 4);
    nir_def *record = nir_iadd_imm(&b, entry, TU_RT_HANDLE_SIZE);
 
-   for (uint32_t i = 0; i < pipeline->group_count; i++) {
-      const struct tu_rt_group *group = &pipeline->groups[i];
-      if (group->general >= info->stage_count)
-         continue;
-      if (info->stages[group->general].stage != VK_SHADER_STAGE_RAYGEN_BIT_KHR)
-         continue;
-      nir_function *func =
-         info->funcs[(group->general * info->levels + 0) *
-                        info->callable_levels +
-                     0];
-      if (!func || func->impl == NULL)
-         continue;
+   /* Persistent traversal: every invocation walks a strided sequence of rays.
+    * This keeps indirect dispatches correct without a host-side divide of the
+    * 3D launch size, and gives each invocation a chance to reuse its caches
+    * across several rays.
+    */
+   nir_def *num_groups = nir_load_num_workgroups(&b);
+   nir_def *groups_x = nir_channel(&b, num_groups, 0);
+   nir_def *groups_y = nir_channel(&b, num_groups, 1);
+   nir_def *groups_z = nir_channel(&b, num_groups, 2);
+   nir_def *invocations_x = nir_imul_imm(&b, groups_x, TU_RT_WORKGROUP_SIZE);
+   nir_def *invocations_xy = nir_imul(&b, invocations_x, groups_y);
+   nir_def *total_invocations = nir_imul(&b, invocations_xy, groups_z);
 
-      nir_push_if(&b, nir_ieq(&b, handle, nir_imm_int(&b, group->handle)));
-      nir_store_var(&b, info->shader_record_ptr[0], record, 1);
-      nir_build_call(&b, func,
-                     0, NULL);
+   nir_def *global_id = nir_load_global_invocation_id(&b, 32);
+   nir_def *linear_id = nir_channel(&b, global_id, 0);
+   linear_id = nir_iadd(&b, linear_id,
+      nir_imul(&b, nir_channel(&b, global_id, 1), invocations_x));
+   linear_id = nir_iadd(&b, linear_id,
+      nir_imul(&b, nir_channel(&b, global_id, 2), invocations_xy));
+
+   /* The loop-carried index must live in a variable so nir_lower_vars_to_ssa
+    * can turn it into a phi.  Assigning a new SSA def to the C variable would
+    * leave the loop back-edge reading the initial value forever.
+    */
+   nir_variable *linear_id_var =
+      nir_local_variable_create(b.impl, glsl_uint_type(), "rt_linear_id");
+   nir_store_var(&b, linear_id_var, linear_id, 1);
+
+   nir_loop *loop = nir_push_loop(&b);
+   {
+      nir_def *linear_id = nir_load_var(&b, linear_id_var);
+      nir_push_if(&b, nir_ieq_imm(&b, total_rays, 0));
+      {
+         nir_jump(&b, nir_jump_break);
+      }
       nir_pop_if(&b, NULL);
+
+      nir_push_if(&b, nir_uge(&b, linear_id, total_rays));
+      {
+         nir_jump(&b, nir_jump_break);
+      }
+      nir_pop_if(&b, NULL);
+
+      /* Turn the linear ray index back into gl_LaunchIDEXT. */
+      nir_def *launch_x = nir_umod(&b, linear_id, size_x);
+      nir_def *launch_y = nir_umod(&b,
+         nir_udiv(&b, linear_id, size_x), size_y);
+      nir_def *launch_z = nir_udiv(&b, linear_id,
+         nir_imul(&b, size_x, size_y));
+      nir_store_var(&b, info->launch_id,
+                    nir_vec3(&b, launch_x, launch_y, launch_z), 7);
+
+      for (uint32_t level = 0; level < info->levels; level++) {
+         nir_store_var(&b, info->payload_ptr[level], nir_imm_int(&b, 0), 1);
+         nir_store_var(&b, info->callable_ptr[level], nir_imm_int(&b, 0), 1);
+      }
+
+      for (uint32_t i = 0; i < pipeline->group_count; i++) {
+         const struct tu_rt_group *group = &pipeline->groups[i];
+         if (group->general >= info->stage_count)
+            continue;
+         if (info->stages[group->general].stage != VK_SHADER_STAGE_RAYGEN_BIT_KHR)
+            continue;
+         nir_function *func =
+            info->funcs[(group->general * info->levels + 0) *
+                           info->callable_levels +
+                        0];
+         if (!func || func->impl == NULL)
+            continue;
+
+         nir_push_if(&b, nir_ieq(&b, handle, nir_imm_int(&b, group->handle)));
+         nir_store_var(&b, info->shader_record_ptr[0], record, 1);
+         nir_build_call(&b, func, 0, NULL);
+         nir_pop_if(&b, NULL);
+      }
+
+      nir_store_var(&b, linear_id_var,
+                    nir_iadd(&b, linear_id, total_invocations), 1);
    }
+   nir_pop_loop(&b, loop);
 }

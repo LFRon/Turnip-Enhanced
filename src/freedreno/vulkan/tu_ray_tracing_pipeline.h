@@ -13,6 +13,12 @@ struct tu_device;
 struct nir_shader;
 
 #define TU_RT_HANDLE_SIZE 8
+#define TU_RT_WORKGROUP_SIZE 32
+/* Fixed persistent grid for indirect trace dispatches.  The shader reads the
+ * real launch dimensions from the indirect command and walks a strided ray
+ * sequence, so the host never has to divide a GPU-side 3D launch size.
+ */
+#define TU_RT_INDIRECT_GROUPS 1024
 
 /* Maximum ray tracing recursion depth supported by the monolithic pipeline.
  * The actual per-pipeline depth is min(maxPipelineRayRecursionDepth, this).

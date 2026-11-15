@@ -38,7 +38,10 @@ struct tu_rt_lowering_info {
    uint32_t levels;
    uint32_t callable_levels;
 
-   /* Filled in by tu_nir_lower_ray_tracing(). */
+   /* Filled in by tu_nir_lower_ray_tracing().  launch_id is shared by every
+    * stage clone and is updated by the persistent raygen loop.
+    */
+   nir_variable *launch_id;
    nir_variable *shader_record_ptr[TU_RT_MAX_RECURSION_DEPTH + 1];
 
    /* Dword offsets of the payload/callable data slot used by the stage at

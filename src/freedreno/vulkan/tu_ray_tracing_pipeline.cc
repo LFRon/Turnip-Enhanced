@@ -321,7 +321,7 @@ tu_create_ray_tracing_pipeline(
          MESA_SHADER_COMPUTE, ir3_get_compiler_options(dev->compiler),
          "tu ray tracing pipeline");
       nir_builder *b = &builder;
-      b->shader->info.workgroup_size[0] = 1;
+      b->shader->info.workgroup_size[0] = TU_RT_WORKGROUP_SIZE;
 
       struct tu_rt_lowering_info info = {
          .pipeline = rt,
