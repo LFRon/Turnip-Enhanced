@@ -744,3 +744,94 @@ environment variables:
   ``TU_AUTOTUNE_FLAGS=big_gmem,tune_small``.
 
   If no flags are specified, the default behavior is used.
+
+Ray tracing
+^^^^^^^^^^^
+
+On A740 and newer, Turnip exposes ``VK_KHR_acceleration_structure``,
+``VK_KHR_ray_query``, ``VK_KHR_ray_tracing_pipeline``,
+``VK_KHR_ray_tracing_maintenance1`` and
+``VK_KHR_ray_tracing_position_fetch`` when the device reports
+``has_ray_intersection`` and, on parts with a software fuse, the KGSL
+ray-tracing fuse is enabled.  The traversal is implemented in the shader and
+uses the hardware ``ray_intersection`` instruction for BVH node and primitive
+tests; the BVH format is the native 64-byte Adreno format described in the
+freedreno wiki.
+
+The traversal treats the hardware intersection count as authoritative: a node
+result with no intersecting child is not a hit, and compressed leaf nodes are
+re-tested with the narrowed four-bit node mask until every primitive has been
+considered.  This is required for correct miss-shader execution and for
+closest-hit selection when a BVH node contains more than one primitive.
+Procedural AABB hits run the intersection shader first and then the any-hit
+shader; ``ignoreIntersectionEXT`` restores the previous ``t_max`` so the ray
+continues to other nodes, while an accepted hit proceeds to the closest-hit
+shader.
+World-to-object instance transforms are read from the TLAS instance
+descriptors and used for object-space ray builtins and BLAS tests.
+
+``VK_KHR_ray_tracing_position_fetch`` reads the triangle vertices directly
+from the uncompressed leaf nodes produced by Turnip's BVH builder.  It does not
+require a second copy of the geometry.
+
+Turnip also exposes ``VK_EXT_pipeline_library_group_handles``.  Shader group
+handles are stable for the lifetime of the process and are preserved
+bit-for-bit when a pipeline library is linked into another pipeline; handles
+may therefore be queried from libraries and reused in the linked pipeline's
+shader binding table.
+
+``VK_KHR_ray_tracing_pipeline`` links raygen, miss, any-hit, closest-hit,
+intersection and callable stages into one compute shader, reads shader records
+from the application's shader binding table, and uses the hardware
+``ray_intersection`` instruction for node and primitive tests.  The
+implementation supports direct ``vkCmdTraceRaysKHR``,
+``vkCmdTraceRaysIndirectKHR`` and ``vkCmdTraceRaysIndirect2KHR`` (including
+exercise of the indirect command's SBT and launch dimensions), pipeline
+libraries, shader-record buffers, instance transforms and SBT record offsets,
+ray flags, any-hit terminate/ignore, intersection shaders, callables, and ray
+queries inside any stage.  Ray payload and callable data are stored per
+invocation in slots sized to the largest variable of the same kind in the
+pipeline, so separate live payload/callable variables do not alias.  Nested
+``traceRayEXT`` calls are supported up to the reported
+``maxRayRecursionDepth`` of 4; each ray recursion level has its own traversal and
+hit state so a nested trace does not clobber the caller's ray builtins or hit
+attributes.  ``executeCallableEXT`` does not consume a ray recursion level:
+callable shaders have no ray context and may invoke other callable shaders.
+Each active callable frame has its own callable-data and shader-record state.
+After stage linking, the monolithic RT shader runs NIR SSA construction, so
+the per-level traversal and hit scalars live in registers rather than local
+memory; the dynamically indexed BVH stack and the payload/hit-attribute
+scratch remain in local memory.
+Shader group handle capture replay is supported with stable 8-byte handles; the
+maintenance1 stack-size entry points are implemented as advisory calls.
+
+The main limitations are:
+
+* ``maxRayRecursionDepth`` is 4.  A pipeline requesting a deeper recursion
+  limit is rejected; calls that exceed the pipeline's own
+  ``maxPipelineRayRecursionDepth`` are dropped as invalid execution.
+* Callable nesting is limited to five active frames (the initial callable plus
+  four nested ``executeCallableEXT`` calls).  Vulkan bounds callable recursion
+  only by the implementation stack size; this driver uses statically cloned
+  callable frames, so deeper chains must not be used.
+* Every ray recursion level owns a 64-entry BVH traversal stack and a separate
+  hit state.  The stack is dynamically indexed and therefore remains in local
+  memory; the other traversal scalars are promoted to SSA.  A pathologically
+  deep BVH that overflows the 64-entry stack can miss geometry, although
+  Turnip's BVH builder keeps normal trees well below this limit.
+* AABB intersection shaders are expected to report one intersection per
+  invocation.  The return value of ``reportIntersectionEXT`` and the any-hit
+  feedback for multiple reports in one intersection-shader invocation are not
+  fully modeled; the last reported candidate is used.
+* Compressed triangle and AABB leaves are enumerated with the hardware node
+  mask.  Compressed TLAS nodes, which would contain more than one instance in
+  a single node, are not enumerated; Turnip's BVH encoder emits one instance
+  per TLAS leaf, so this only affects imported acceleration structures that
+  use that encoding.
+* There is no hardware tree traversal unit (TTU) path yet.  All node and
+  primitive tests are issued from the shader, which is slower than the
+  closed-source driver's traversal shader on complex scenes.  This is the main
+  remaining performance gap for ray tracing.
+* Motion blur and pipeline binaries are not exposed.  The
+  ``VK_EXT_pipeline_library_group_handles`` name is enumerated; its
+  ``VK_KHR_`` alias is hidden by the Android strict extension whitelist.

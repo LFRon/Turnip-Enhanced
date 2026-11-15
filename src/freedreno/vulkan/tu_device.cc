@@ -279,6 +279,7 @@ get_device_extensions(const struct tu_physical_device *device,
       .KHR_performance_query = (TU_DEBUG(PERFC) || TU_DEBUG(PERFCRAW)) && device->is_perf_cntr_selectable,
       .KHR_pipeline_executable_properties = true,
       .KHR_pipeline_library = true,
+      .EXT_pipeline_library_group_handles = has_raytracing,
 #ifdef TU_USE_WSI_PLATFORM
       .KHR_present_id = true,
       .KHR_present_id2 = true,
@@ -288,6 +289,8 @@ get_device_extensions(const struct tu_physical_device *device,
       .KHR_push_descriptor = true,
       .KHR_ray_query = has_raytracing,
       .KHR_ray_tracing_maintenance1 = has_raytracing,
+      .KHR_ray_tracing_pipeline = has_raytracing,
+      .KHR_ray_tracing_position_fetch = has_raytracing,
       .KHR_relaxed_block_layout = true,
       .KHR_robustness2 = true,
       .KHR_sampler_mirror_clamp_to_edge = true,
@@ -874,8 +877,21 @@ tu_get_features(struct tu_physical_device *pdevice,
    /* VK_KHR_ray_query */
    features->rayQuery = true;
 
+   /* VK_KHR_ray_tracing_pipeline */
+   features->rayTracingPipeline = true;
+   features->rayTracingPipelineTraceRaysIndirect = true;
+   features->rayTracingPipelineShaderGroupHandleCaptureReplay = true;
+   features->rayTracingPipelineShaderGroupHandleCaptureReplayMixed = true;
+   features->rayTraversalPrimitiveCulling = true;
+   features->pipelineLibraryGroupHandles =
+      pdevice->vk.supported_extensions.EXT_pipeline_library_group_handles;
+
    /* VK_KHR_ray_tracing_maintenance1 */
    features->rayTracingMaintenance1 = true;
+   features->rayTracingPipelineTraceRaysIndirect2 = true;
+
+   /* VK_KHR_ray_tracing_position_fetch */
+   features->rayTracingPositionFetch = true;
 
    /* VK_KHR_robustness2 */
    features->robustBufferAccess2 = true;
@@ -1642,6 +1658,17 @@ tu_get_properties(struct tu_physical_device *pdevice,
    props->maxDescriptorSetAccelerationStructures = max_descriptor_set_size;
    props->maxDescriptorSetUpdateAfterBindAccelerationStructures = max_descriptor_set_size;
    props->minAccelerationStructureScratchOffsetAlignment = 128;
+
+   /* VK_KHR_ray_tracing_pipeline */
+   props->shaderGroupHandleSize = TU_RT_HANDLE_SIZE;
+   props->shaderGroupHandleAlignment = TU_RT_HANDLE_SIZE;
+   props->shaderGroupBaseAlignment = 64;
+   props->maxRayRecursionDepth = TU_RT_MAX_RECURSION_DEPTH;
+   props->maxShaderGroupStride = 4096;
+   props->shaderGroupHandleCaptureReplaySize = TU_RT_HANDLE_SIZE;
+   props->maxRayDispatchInvocationCount = 1 << 20;
+   props->maxRayHitAttributeSize = 64;
+   props->maxRecursionDepth = TU_RT_MAX_RECURSION_DEPTH;
 
    /* VK_EXT_conservative_rasterization */
    props->primitiveOverestimationSize = 0.5 + 1 / 256.;

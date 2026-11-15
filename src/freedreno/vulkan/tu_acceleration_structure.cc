@@ -153,6 +153,19 @@ static void
 tu_get_build_config(VkDevice device,
                     struct vk_acceleration_structure_build_state *state)
 {
+   /* Match RADV's TLAS build policy: use the hierarchical PLOC variant with
+    * 64-bit Morton keys so large instance sets do not lose clustering
+    * precision.  Keep the default PLOC/LBVH choice for fast builds and for
+    * tiny trees, where the extra hierarchy would only add build time.
+    */
+   if (state->build_info->type ==
+          VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR &&
+       state->leaf_node_count > 4 &&
+       !(state->build_info->flags &
+         VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR)) {
+      state->config.internal_type = VK_INTERNAL_BUILD_TYPE_HPLOC;
+      state->config.u64_keys = true;
+   }
 }
 
 static void

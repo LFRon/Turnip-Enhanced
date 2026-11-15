@@ -19,6 +19,7 @@
 #include "tu_lrz.h"
 #include "tu_pass.h"
 #include "tu_pipeline.h"
+#include "tu_ray_tracing_pipeline.h"
 #include "tu_tile_config.h"
 
 enum tu_draw_state_group_id
@@ -496,6 +497,9 @@ struct tu_cmd_state
 
    struct tu_shader *shaders[MESA_SHADER_STAGES];
 
+   struct tu_ray_tracing_pipeline *rt;
+   uint32_t rt_stack_size;
+
    struct tu_program_state program;
 
    struct tu_render_pass_state rp;
@@ -877,6 +881,15 @@ void tu_cmd_render(struct tu_cmd_buffer *cmd, const VkOffset2D *fdm_offsets);
 
 void tu_dispatch_unaligned(VkCommandBuffer commandBuffer,
                            uint32_t x, uint32_t y, uint32_t z);
+
+void tu_dispatch_rt_trace(VkCommandBuffer commandBuffer,
+                          uint32_t x, uint32_t y, uint32_t z);
+
+void tu_dispatch_rt_trace_indirect(VkCommandBuffer commandBuffer,
+                                   VkDeviceAddress indirect_addr);
+
+void tu_dispatch_rt_trace_indirect2(VkCommandBuffer commandBuffer,
+                                    VkDeviceAddress indirect_addr);
 
 void tu_dispatch_unaligned_indirect(VkCommandBuffer commandBuffer,
                                     VkDeviceAddress size_addr);

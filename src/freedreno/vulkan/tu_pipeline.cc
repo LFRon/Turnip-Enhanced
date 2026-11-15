@@ -5133,6 +5133,134 @@ fail:
    return result;
 }
 
+static void
+tu_hash_compute_nir(unsigned char *hash,
+                    VkPipelineCreateFlags2KHR flags,
+                    const struct tu_pipeline_layout *layout,
+                    nir_shader *nir)
+{
+   struct blob blob;
+   blob_init(&blob);
+   nir_serialize(&blob, nir, true);
+
+   blake3_hasher ctx;
+   _mesa_blake3_init(&ctx);
+   _mesa_blake3_update(&ctx, blob.data, blob.size);
+   blob_finish(&blob);
+
+   if (layout)
+      _mesa_blake3_update(&ctx, layout->blake3, sizeof(layout->blake3));
+
+   /* These flags only control what the caller does when a cache entry is
+    * missing; they must not prevent an existing entry from being found.
+    */
+   VkPipelineCreateFlags2KHR shader_flags =
+      flags &
+      ~(VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR |
+        VK_PIPELINE_CREATE_2_EARLY_RETURN_ON_FAILURE_BIT_KHR);
+   _mesa_blake3_update(&ctx, &shader_flags, sizeof(shader_flags));
+
+   enum ir3_shader_debug ir3_debug_key = ir3_shader_debug_hash_key();
+   _mesa_blake3_update(&ctx, &ir3_debug_key, sizeof(ir3_debug_key));
+
+   _mesa_blake3_final(&ctx, hash);
+}
+
+VkResult
+tu_compute_pipeline_create_from_nir(struct tu_device *dev,
+                                    VkPipelineCache pipeline_cache,
+                                    struct tu_pipeline_layout *layout,
+                                    VkPipelineCreateFlags2KHR flags,
+                                    const VkAllocationCallbacks *alloc,
+                                    nir_shader *nir,
+                                    struct tu_compute_pipeline **out_pipeline)
+{
+   struct tu_pipeline_layout empty_layout = {};
+   if (layout == NULL)
+      layout = &empty_layout;
+
+   struct tu_compute_pipeline *pipeline = static_cast<struct tu_compute_pipeline *>(
+      vk_object_zalloc(&dev->vk, alloc, sizeof(*pipeline), VK_OBJECT_TYPE_PIPELINE));
+   if (!pipeline)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+   pipeline->base.type = TU_PIPELINE_COMPUTE;
+   pipeline->base.executables_mem_ctx = ralloc_context(NULL);
+   util_dynarray_init(&pipeline->base.executables, pipeline->base.executables_mem_ctx);
+   pipeline->base.active_stages = VK_SHADER_STAGE_COMPUTE_BIT;
+
+   VK_FROM_HANDLE(vk_pipeline_cache, cache, pipeline_cache);
+   if (!cache)
+      cache = dev->mem_cache;
+
+   unsigned char pipeline_blake3[BLAKE3_KEY_LEN];
+   tu_hash_compute_nir(pipeline_blake3, flags, layout, nir);
+
+   const bool executable_info =
+      flags & VK_PIPELINE_CREATE_2_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR;
+   bool application_cache_hit = false;
+   struct tu_shader *shader = NULL;
+
+   if (!executable_info) {
+      shader = tu_pipeline_cache_lookup(cache, pipeline_blake3,
+                                        sizeof(pipeline_blake3),
+                                        &application_cache_hit);
+   }
+   (void) application_cache_hit;
+
+   VkResult result = VK_SUCCESS;
+   const struct ir3_shader_variant *v = NULL;
+   if (!shader) {
+      if (flags &
+          VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT_KHR) {
+         result = VK_PIPELINE_COMPILE_REQUIRED;
+         goto fail;
+      }
+
+      struct tu_shader_key key = {};
+      struct ir3_shader_key ir3_key = {};
+      struct tu_shader_info info = {};
+
+      tu_lower_nir(dev, nir, &key, &ir3_key, &info);
+
+      result = tu_shader_create(dev, &shader, nir, &key, &info, &ir3_key,
+                                pipeline_blake3, sizeof(pipeline_blake3),
+                                layout, executable_info);
+      if (result != VK_SUCCESS)
+         goto fail;
+
+      shader = tu_pipeline_cache_insert(cache, shader);
+   }
+
+   pipeline->base.active_desc_sets = shader->active_desc_sets;
+
+   v = shader->variant;
+   tu_pipeline_set_linkage(&pipeline->base.program.link[MESA_SHADER_COMPUTE],
+                           &shader->const_state, v);
+
+   result = tu_pipeline_allocate_cs(dev, &pipeline->base, layout, NULL, v);
+   if (result != VK_SUCCESS) {
+      vk_pipeline_cache_object_unref(&dev->vk, &shader->base);
+      shader = NULL;
+      goto fail;
+   }
+
+   for (int i = 0; i < 3; i++)
+      pipeline->local_size[i] = v->local_size[i];
+   pipeline->instrlen = v->instrlen;
+   pipeline->base.shaders[MESA_SHADER_COMPUTE] = shader;
+
+   *out_pipeline = pipeline;
+   return VK_SUCCESS;
+
+fail:
+   if (shader)
+      vk_pipeline_cache_object_unref(&dev->vk, &shader->base);
+   ralloc_free(pipeline->base.executables_mem_ctx);
+   vk_object_free(&dev->vk, alloc, pipeline);
+   return result;
+}
+
 template <chip CHIP>
 VKAPI_ATTR VkResult VKAPI_CALL
 tu_CreateComputePipelines(VkDevice device,
@@ -5183,6 +5311,9 @@ tu_DestroyPipeline(VkDevice _device,
       return;
 
    TU_RMV(resource_destroy, dev, pipeline);
+
+   if (pipeline->rt)
+      tu_ray_tracing_pipeline_destroy(dev, pipeline->rt);
 
    tu_pipeline_finish(pipeline, dev, pAllocator);
    vk_object_free(&dev->vk, pAllocator, pipeline);

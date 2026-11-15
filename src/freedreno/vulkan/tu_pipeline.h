@@ -181,10 +181,18 @@ enum tu_pipeline_type {
    TU_PIPELINE_COMPUTE,
 };
 
+struct tu_ray_tracing_pipeline;
+
 struct tu_pipeline
 {
    struct vk_object_base base;
    enum tu_pipeline_type type;
+
+   /* Non-NULL only for VK_KHR_ray_tracing_pipeline objects.  The VkPipeline
+    * itself is a normal compute pipeline; this carries the group/SBT data
+    * needed by vkCmdTraceRays*.
+    */
+   struct tu_ray_tracing_pipeline *rt;
 
    struct tu_cs cs;
    struct tu_suballoc_bo bo;
@@ -277,6 +285,24 @@ struct tu_compute_pipeline {
    uint32_t local_size[3];
    uint32_t instrlen;
 };
+
+/* Compile an already-lowered compute-like NIR shader into a compute pipeline.
+ * This is used by the ray-tracing pipeline compiler, which links all ray
+ * tracing stages into one compute shader and then hands it to the normal
+ * compute backend.
+ */
+VkResult
+tu_compute_pipeline_create_from_nir(struct tu_device *dev,
+                                    VkPipelineCache pipeline_cache,
+                                    struct tu_pipeline_layout *layout,
+                                    VkPipelineCreateFlags2KHR flags,
+                                    const VkAllocationCallbacks *alloc,
+                                    nir_shader *nir,
+                                    struct tu_compute_pipeline **out_pipeline);
+
+void
+tu_ray_tracing_pipeline_destroy(struct tu_device *dev,
+                                struct tu_ray_tracing_pipeline *rt);
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(tu_pipeline, base, VkPipeline,
                                VK_OBJECT_TYPE_PIPELINE)

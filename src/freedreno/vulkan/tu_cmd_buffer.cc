@@ -4983,6 +4983,15 @@ tu6_emit_descriptor_sets(struct tu_cmd_buffer *cmd,
  * batch together multiple tu_CmdBindDescriptorSets() calls.  ANGLE and zink
  * will often emit multiple bind calls in a draw.
  */
+/* Ray tracing stages all map onto the compute pipeline state. */
+static const VkShaderStageFlags tu_rt_shader_stages =
+   VK_SHADER_STAGE_RAYGEN_BIT_KHR |
+   VK_SHADER_STAGE_ANY_HIT_BIT_KHR |
+   VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR |
+   VK_SHADER_STAGE_MISS_BIT_KHR |
+   VK_SHADER_STAGE_INTERSECTION_BIT_KHR |
+   VK_SHADER_STAGE_CALLABLE_BIT_KHR;
+
 static void
 tu_dirty_desc_sets(struct tu_cmd_buffer *cmd,
                    VkPipelineBindPoint pipelineBindPoint)
@@ -5155,7 +5164,8 @@ tu_CmdBindDescriptorSets2KHR(
 {
    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
 
-   if (pBindDescriptorSetsInfo->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT) {
+   if (pBindDescriptorSetsInfo->stageFlags &
+       (VK_SHADER_STAGE_COMPUTE_BIT | tu_rt_shader_stages)) {
       tu_bind_descriptor_sets<CHIP>(cmd, pBindDescriptorSetsInfo,
                                     VK_PIPELINE_BIND_POINT_COMPUTE);
    }
@@ -5219,7 +5229,7 @@ tu_CmdSetDescriptorBufferOffsets2EXT(
    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
 
    if (pSetDescriptorBufferOffsetsInfo->stageFlags &
-       VK_SHADER_STAGE_COMPUTE_BIT) {
+       (VK_SHADER_STAGE_COMPUTE_BIT | tu_rt_shader_stages)) {
       tu_set_descriptor_buffer_offsets(cmd, pSetDescriptorBufferOffsetsInfo,
                                        VK_PIPELINE_BIND_POINT_COMPUTE);
    }
@@ -5263,7 +5273,7 @@ tu_CmdBindDescriptorBufferEmbeddedSamplers2EXT(
    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
 
    if (pBindDescriptorBufferEmbeddedSamplersInfo->stageFlags &
-       VK_SHADER_STAGE_COMPUTE_BIT) {
+       (VK_SHADER_STAGE_COMPUTE_BIT | tu_rt_shader_stages)) {
       tu_bind_descriptor_buffer_embedded_samplers(
          cmd, pBindDescriptorBufferEmbeddedSamplersInfo,
          VK_PIPELINE_BIND_POINT_COMPUTE);
@@ -5350,7 +5360,8 @@ tu_CmdPushDescriptorSet2KHR(
 {
    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
 
-   if (pPushDescriptorSetInfo->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT) {
+   if (pPushDescriptorSetInfo->stageFlags &
+       (VK_SHADER_STAGE_COMPUTE_BIT | tu_rt_shader_stages)) {
       tu_push_descriptor_set<CHIP>(cmd, pPushDescriptorSetInfo,
                                    VK_PIPELINE_BIND_POINT_COMPUTE);
    }
@@ -5757,12 +5768,16 @@ tu_CmdBindPipeline(VkCommandBuffer commandBuffer,
    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
    VK_FROM_HANDLE(tu_pipeline, pipeline, _pipeline);
 
-   if (pipelineBindPoint == VK_PIPELINE_BIND_POINT_COMPUTE) {
+   cmd->state.rt = NULL;
+
+   if (pipelineBindPoint == VK_PIPELINE_BIND_POINT_COMPUTE ||
+       pipelineBindPoint == VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR) {
       cmd->state.shaders[MESA_SHADER_COMPUTE] =
          pipeline->shaders[MESA_SHADER_COMPUTE];
       tu_cs_emit_state_ib(&cmd->cs,
                           pipeline->shaders[MESA_SHADER_COMPUTE]->state);
       cmd->state.compute_load_state = pipeline->load_state;
+      cmd->state.rt = pipeline->rt;
       return;
    }
 
@@ -10516,6 +10531,68 @@ tu_CmdDispatchIndirect(VkCommandBuffer commandBuffer,
    tu_dispatch<CHIP>(cmd_buffer, &info);
 }
 TU_GENX(tu_CmdDispatchIndirect);
+
+void
+tu_dispatch_rt_trace(VkCommandBuffer commandBuffer,
+                     uint32_t x, uint32_t y, uint32_t z)
+{
+   VK_FROM_HANDLE(tu_cmd_buffer, cmd_buffer, commandBuffer);
+   struct tu_dispatch_info info = {};
+
+   info.blocks[0] = x;
+   info.blocks[1] = y;
+   info.blocks[2] = z;
+   TU_CALLX(cmd_buffer->device, tu_dispatch)(cmd_buffer, &info);
+}
+
+void
+tu_dispatch_rt_trace_indirect(VkCommandBuffer commandBuffer,
+                              VkDeviceAddress indirect_addr)
+{
+   VK_FROM_HANDLE(tu_cmd_buffer, cmd_buffer, commandBuffer);
+   struct tu_dispatch_info info = {};
+
+   info.indirect = indirect_addr;
+   TU_CALLX(cmd_buffer->device, tu_dispatch)(cmd_buffer, &info);
+}
+
+
+void
+tu_dispatch_rt_trace_indirect2(VkCommandBuffer commandBuffer,
+                               VkDeviceAddress indirect_addr)
+{
+   VK_FROM_HANDLE(tu_cmd_buffer, cmd_buffer, commandBuffer);
+   struct tu_cs *cs = &cmd_buffer->cs;
+   /* CP_EXEC_CS_INDIRECT has to read width/height/depth back from GPU memory,
+    * but the VkTraceRaysIndirectCommand2KHR is only guaranteed to be 8 byte
+    * aligned. Copy the three dimensions into a 16 byte aligned scratch BO.
+    * The BO has to be allocated as GPU-writeable, otherwise KGSL maps it
+    * read-only for the GPU and the CP_MEM_TO_MEM writes are dropped.
+    */
+   struct tu_cs_memory dims;
+   tu_cs_set_writeable(&cmd_buffer->sub_cs, true);
+   VkResult result = tu_cs_alloc(&cmd_buffer->sub_cs, 1, 4, &dims);
+   tu_cs_set_writeable(&cmd_buffer->sub_cs, false);
+   if (result != VK_SUCCESS) {
+      vk_command_buffer_set_error(&cmd_buffer->vk, result);
+      return;
+   }
+
+   for (uint32_t i = 0; i < 3; i++) {
+      tu_cs_emit_pkt7(cs, CP_MEM_TO_MEM, 5);
+      tu_cs_emit(cs, 0);
+      tu_cs_emit_qw(cs, dims.iova + i * sizeof(uint32_t));
+      tu_cs_emit_qw(cs, indirect_addr +
+                        offsetof(VkTraceRaysIndirectCommand2KHR, width) +
+                        i * sizeof(uint32_t));
+   }
+   tu_cs_emit_pkt7(cs, CP_WAIT_MEM_WRITES, 0);
+   tu_cs_emit_wfi(cs);
+
+   struct tu_dispatch_info info = {};
+   info.indirect = dims.iova;
+   TU_CALLX(cmd_buffer->device, tu_dispatch)(cmd_buffer, &info);
+}
 
 void
 tu_dispatch_unaligned(VkCommandBuffer commandBuffer,
