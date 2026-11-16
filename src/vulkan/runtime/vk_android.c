@@ -1365,6 +1365,24 @@ vk_alloc_ahardware_buffer(const VkMemoryAllocateInfo *pAllocateInfo)
    return ahb;
 }
 
+bool
+vk_android_ahb_usage_has_gpu_usage(uint64_t usage)
+{
+   /* VUID-vkGetAndroidHardwareBufferPropertiesANDROID-buffer-01884 requires
+    * at least one AHARDWAREBUFFER_USAGE_GPU_* flag.  GPU_CUBE_MAP and
+    * GPU_MIPMAP_COMPLETE are additional GPU usage flags; do not apply the
+    * stricter dedicated-image import rule from
+    * VUID-VkMemoryAllocateInfo-pNext-02386 here, because that is an
+    * application-side requirement and rejecting the query would also reject
+    * otherwise valid AHB imports.
+    */
+   return usage & (AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
+                   AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT |
+                   AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER |
+                   AHARDWAREBUFFER_USAGE_GPU_CUBE_MAP |
+                   AHARDWAREBUFFER_USAGE_GPU_MIPMAP_COMPLETE);
+}
+
 static VkResult
 get_ahb_buffer_format_properties2(
    struct vk_device *device, const struct AHardwareBuffer *buffer,
@@ -1375,14 +1393,7 @@ get_ahb_buffer_format_properties2(
    AHardwareBuffer_describe(buffer, &desc);
 
    /* Verify description. */
-   bool gpu_usage = desc.usage & (AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
-                                  AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT |
-                                  AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER);
-
-   /* "Buffer must be a valid Android hardware buffer object with at least
-    * one of the AHARDWAREBUFFER_USAGE_GPU_* usage flags."
-    */
-   if (!gpu_usage) {
+   if (!vk_android_ahb_usage_has_gpu_usage(desc.usage)) {
       mesa_loge("AHB (format=%u,usage=0x%" PRIx64 ") has no GPU usage",
                 desc.format, desc.usage);
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;

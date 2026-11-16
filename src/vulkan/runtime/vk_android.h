@@ -179,6 +179,8 @@ uint64_t vk_image_usage_to_ahb_usage(const VkImageCreateFlags2KHR vk_create,
 struct AHardwareBuffer *vk_alloc_ahardware_buffer(
    const VkMemoryAllocateInfo *pAllocateInfo);
 
+bool vk_android_ahb_usage_has_gpu_usage(uint64_t usage);
+
 VkResult vk_android_get_ahb_layout(
    struct AHardwareBuffer *ahardware_buffer,
    VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
